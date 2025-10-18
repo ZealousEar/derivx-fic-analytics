@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "derivx"
+version = "0.1.0"
+description = "Derivatives analytics platform (FIC): BS, SVI/SABR, term structure, Black IR, DV01/PV01"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Farhad" }
+]
+keywords = [
+  "term structure",
+  "OIS",
+  "IRS",
+  "bootstrapping",
+  "Black IR",
+  "SABR",
+  "SVI",
+  "DV01",
+  "PV01",
+  "Greeks",
+  "Monte Carlo",
+  "calibration",
+  "no-arbitrage"
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "plotly",
+  "streamlit",
+  "yfinance"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "ruff",
+  "mypy"
+]
+
+[tool.black]
+line-length = 80
+target-version = ["py39", "py310", "py311"]
+
+[tool.ruff]
+line-length = 80
+target-version = "py39"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+
