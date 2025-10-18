@@ -1,4 +1,5 @@
 # DerivX — Fixed Income & Currencies Analytics (v1)
+# https://derivx.streamlit.app/
 
 DerivX is a portfolio-ready analytics platform showcasing quantitative engineering for Fixed Income & Currencies roles. The project combines Financial Mathematics theory with a friendly UX that highlights:
 
@@ -30,6 +31,8 @@ streamlit run src/derivx/ui/streamlit_app.py
 # Run unit tests
 pytest tests/ -v
 ```
+
+or go to https://derivx.streamlit.app/
 
 The project targets Python 3.9+ and has been validated on macOS and Ubuntu. The Streamlit app uses caching, so the initial load calibrates surfaces once and subsequent interactions remain responsive.
 
