@@ -14,7 +14,7 @@ The app is built in Streamlit with a production-grade package layout, unit tests
 
 ```bash
 # Clone & enter
-git clone https://github.com/<your-account>/derivx.git
+git clone https://github.com/zealousear/derivx.git
 cd derivx/release/v1
 
 # Optional: create virtualenv
