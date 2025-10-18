@@ -1,0 +1,8 @@
+instrument,tenor,rate
+OIS,1W,0.0512
+OIS,1M,0.0520
+IRS,2Y,0.0530
+IRS,5Y,0.0550
+IRS,10Y,0.0560
+
+
