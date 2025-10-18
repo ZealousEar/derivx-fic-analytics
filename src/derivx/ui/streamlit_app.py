@@ -291,7 +291,7 @@ if mode in ("EQUITY", "FX"):
     
     # Fixed Z range based on typical price range at current params
     P_center, *_ = bs_price_greeks(S, K, T, r, sigma, call=True, q=q)
-    z_range = [0, float(P_center) * 3]
+    z_range = [0.0, max(1e-6, float(P_center) * 3.0)]
 
     fig_3d = go.Figure(data=[go.Surface(
         z=P, x=S_grid, y=K_grid,
@@ -314,21 +314,27 @@ if mode in ("EQUITY", "FX"):
     )])
 
     scene_settings = dict(
-        xaxis_title='SPOT (S)',
-        yaxis_title='STRIKE (K)',
-        zaxis_title='VALUE',
         bgcolor='#000000',
         xaxis=dict(
-            backgroundcolor="#000000", gridcolor="#333333", showbackground=True,
-            titlefont=dict(color='#FFFFFF'), range=S_range
+            title=dict(text='SPOT (S)', font=dict(color='#FFFFFF')),
+            backgroundcolor="#000000",
+            gridcolor="#333333",
+            showbackground=True,
+            range=S_range,
         ),
         yaxis=dict(
-            backgroundcolor="#000000", gridcolor="#333333", showbackground=True,
-            titlefont=dict(color='#FFFFFF'), range=K_range
+            title=dict(text='STRIKE (K)', font=dict(color='#FFFFFF')),
+            backgroundcolor="#000000",
+            gridcolor="#333333",
+            showbackground=True,
+            range=K_range,
         ),
         zaxis=dict(
-            backgroundcolor="#000000", gridcolor="#333333", showbackground=True,
-            titlefont=dict(color='#FFFFFF'), range=z_range
+            title=dict(text='VALUE', font=dict(color='#FFFFFF')),
+            backgroundcolor="#000000",
+            gridcolor="#333333",
+            showbackground=True,
+            range=z_range,
         ),
     )
     if st.session_state.get("force_camera", False):
