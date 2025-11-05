@@ -1,0 +1,33 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    # Run every 6 hours (at 00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allows manual trigger from Actions tab
+
+jobs:
+  ping-app:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Ping Streamlit App
+        run: |
+          echo "Pinging derivx.streamlit.app at $(date)"
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
+          echo "HTTP Response Code: $response"
+          
+          if [ $response -eq 200 ] || [ $response -eq 301 ] || [ $response -eq 302 ]; then
+            echo "✅ App is alive and responding!"
+          else
+            echo "⚠️ App returned unexpected status code: $response"
+            exit 1
+          fi
+      
+      - name: Send Success Notification
+        if: success()
+        run: echo "App pinged successfully at $(date)"
+      
+      - name: Send Failure Notification
+        if: failure()
+        run: echo "Failed to ping app at $(date)"
