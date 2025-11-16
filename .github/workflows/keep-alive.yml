@@ -14,7 +14,17 @@ jobs:
       - name: Ping Streamlit App
         run: |
           echo "Pinging derivx.streamlit.app at $(date)"
-          response=$(curl -L -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
+          
+          set +e
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
+          curl_exit=$?
+          set -e
+          
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "❌ curl failed with exit code $curl_exit"
+            exit "$curl_exit"
+          fi
+          
           echo "HTTP Response Code: $response"
           
           if [ "$response" -ge 200 ] && [ "$response" -lt 400 ]; then
