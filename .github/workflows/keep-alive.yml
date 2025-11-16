@@ -14,10 +14,10 @@ jobs:
       - name: Ping Streamlit App
         run: |
           echo "Pinging derivx.streamlit.app at $(date)"
-          response=$(curl -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
+          response=$(curl -L -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
           echo "HTTP Response Code: $response"
           
-          if [ $response -eq 200 ] || [ $response -eq 301 ] || [ $response -eq 302 ]; then
+          if [ "$response" -ge 200 ] && [ "$response" -lt 400 ]; then
             echo "✅ App is alive and responding!"
           else
             echo "⚠️ App returned unexpected status code: $response"
