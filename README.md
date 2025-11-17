@@ -113,12 +113,26 @@ The project is configured for:
 - **Local runs** via `streamlit run`
 - **Render/Heroku-style deployments** via the included `Procfile` and `setup.sh`
 - **Continuous integration** (pytest) through `.github/workflows/ci.yaml`
+- **Streamlit wake-up automation** via `.github/workflows/wake-streamlit.yml`
 
 To package the library (optional):
 
 ```bash
 python -m build
 ```
+
+---
+
+## Streamlit keep-alive workflow
+
+Streamlit Community Cloud now hibernates apps after ~12 hours of inactivity. To reduce downtime, this repository includes `.github/workflows/wake-streamlit.yml`, which runs every 4 hours (and on manual dispatch) to visit the app and click the “Yes, get this app back up” button if it’s present.
+
+- The workflow installs Chrome, the minimal Selenium dependencies in `tools/keep_alive/requirements.txt`, and runs `tools/keep_alive/main.py`.
+- Override the target app by setting `STREAMLIT_APP_URL` in the workflow (defaults to `https://derivx.streamlit.app/`).
+- Optionally pin a ChromeDriver version by setting `CHROMEDRIVER_VERSION` or a major version via `CHROMEDRIVER_MAJOR_VERSION`.
+- The workflow will fail if Selenium cannot dismiss the wake-up button, which makes troubleshooting easier from the Actions tab.
+
+This automation is best-effort only—manual wake-ups may still be required if Streamlit applies additional limits.
 
 ---
 
