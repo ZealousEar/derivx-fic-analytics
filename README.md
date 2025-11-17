@@ -1,7 +1,15 @@
 # DerivX — Fixed Income & Currencies Analytics (v2)
 # https://derivx.streamlit.app/
 
-DerivX is a portfolio-ready analytics platform showcasing quantitative engineering for Fixed Income & Currencies roles. The project combines Financial Mathematics theory with a friendly UX that highlights:
+DerivX is a portfolio-ready analytics platform showcasing quantitative engineering for Fixed Income & Currencies roles. The project combines Financial Mathematics theory with a friendly UX and production-style data plumbing.
+
+### Recruiter Snapshot
+- **Real market data**: 24 trading days of SPY chains ingested automatically via yfinance + Selenium keep-alive workflow.
+- **Quantified edge**: Constrained SVI calibration averages **0.052 RMSE** (median 0.040) and beats spline baselines across **32 expiries**.
+- **Robust validation**: Walk-forward lab posts **71.8% directional hit-rate** with live regime segmentation and model benchmarking (SVI vs SABR vs local-vol).
+- **Deployment-ready**: Streamlit UI + GitHub Actions + wake-up automation keep the demo live for hiring managers.
+
+The platform highlights:
 
 - **Equity mode** — vectorised Black–Scholes with dividend/carry, Greeks dashboard, 3D price surface, implied-vol and SVI calibration.
 - **FX mode** — Black–Scholes with foreign/domestic rates, SABR calibration and smile diagnostics.
@@ -15,15 +23,14 @@ The app is built in Streamlit with a production-grade package layout, unit tests
 
 ```bash
 # Clone & enter
-git clone https://github.com/zealousear/derivx.git
-cd derivx/release/v1
+git clone https://github.com/ZealousEar/derivx-fic-analytics.git
+cd derivx-fic-analytics
 
 # Optional: create virtualenv
 python -m venv .venv && source .venv/bin/activate
 
 # Install requirements and package
 pip install -r requirements.txt
-pip install -e .
 
 # Launch Streamlit app
 streamlit run src/derivx/ui/streamlit_app.py
@@ -32,7 +39,7 @@ streamlit run src/derivx/ui/streamlit_app.py
 pytest tests/ -v
 ```
 
-or go to https://derivx.streamlit.app/
+Prefer to skip setup? Launch the hosted demo at https://derivx.streamlit.app/.
 
 The project targets Python 3.9+ and has been validated on macOS and Ubuntu. The Streamlit app uses caching, so the initial load calibrates surfaces once and subsequent interactions remain responsive.
 
@@ -41,38 +48,34 @@ The project targets Python 3.9+ and has been validated on macOS and Ubuntu. The 
 ## Repository tour
 
 ```
-release/v1/
-├── README.md                  # This file
-├── LICENSE                    # MIT
-├── requirements.txt           # Runtime dependencies
-├── pyproject.toml             # Package metadata & dev extras
-├── Procfile                   # Streamlit launch command (Heroku/Render)
-├── setup.sh                   # Streamlit server bootstrap
+.
+├── README.md                  # Recruiter-ready overview + metrics
+├── requirements.txt           # Runtime dependencies (numpy<2, pandas<2.2, yfinance>=0.2.66)
 ├── src/derivx/                # Python package
-│   ├── core/                  # Black–Scholes engine + utilities
-│   ├── vol/                   # Implied vol, SVI, SABR modules
-│   ├── rates/                 # Curve bootstrapping & Black IR pricing
-│   ├── risk/                  # Scenario shocks, DV01/PV01 helpers
-│   ├── data/                  # Data ingestion stubs (CSV, yfinance)
-│   └── ui/streamlit_app.py    # Streamlit interface (Equity/FX/Rates)
-├── data/examples/             # Sample rates & equity chain data
-├── notebooks/                 # Calibration walkthroughs (SVI/SABR/curve)
-├── tests/                     # Pytest suite covering maths & calibration
-└── .github/workflows/ci.yaml  # GitHub Actions (pytest, optional lint)
+│   ├── ui/streamlit_app.py    # Streamlit interface (Equity/FX/Rates + Analytics)
+│   ├── data/                  # Market data ingestion + filters
+│   ├── calibration/           # Production SVI toolkit
+│   ├── validation/            # Walk-forward backtesting utilities
+│   ├── models/                # SABR/local-vol benchmarking
+│   └── surface/ + rates/ + core/ etc.
+├── tools/
+│   ├── download_spy_chains.py # CLI helper to pull Yahoo option chains
+│   └── compute_metrics.py     # Resume metrics generator
+├── tests/                     # Pytest suite (calibration, data, backtests)
+└── data/
+    ├── examples/              # Sample CSVs for the UI
+    └── metrics/               # Gitignored Parquet + CSV outputs
 ```
 
 ---
 
-## Features
+## What’s inside
 
-- **Term structure:** OIS/IRS bootstrap, forward rates, and discount factors.
-
-- **Volatility**: SVI and SABR calibration with basic diagnostics.
-- **Vol analytics lab**: dedicated Streamlit pages for market-data ingestion, constrained SVI calibration vs spline baselines, walk-forward validation, and model comparison (SVI/SABR/local-vol).
-
-- **Pricing and risk**: Black IR caps/floors, PV, DV01/PV01, and simple scenarios.
-
-- **Implementation**: packaged under `src/derivx`, typed functions, NumPy-style docstrings, notebooks, tests, and CI.
+- **Market data ingestion**: yfinance downloader + CLI utility (`tools/download_spy_chains.py`) with liquidity filters, moneyness tagging, and gitignored Parquet cache.
+- **Production calibration**: constrained SVI engine with spline benchmarking, diagnostics, and headless metrics pipeline (`tools/compute_metrics.py`).
+- **Walk-forward + model lab**: regime-aware validation, SVI/SABR/local-vol comparison utilities, and Streamlit Analytics tabs that surface the full pipeline.
+- **Fixed-income/rates stack**: OIS/IRS curve building, cap/floor analytics, PV/DV01/PV01 sensitivities, and scenario shocks (parallel/twist).
+- **Deployment plumbing**: Streamlit UI, GitHub Actions CI, Selenium wake-up workflow, and a README aimed at recruiters/hiring managers.
 
 ---
 
