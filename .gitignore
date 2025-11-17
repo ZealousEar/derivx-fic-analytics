@@ -28,4 +28,7 @@ data/**/*.parquet
 data/**/*.feather
 data/**/*.pkl
 
+# Metrics (generated, can be recomputed)
+data/metrics/
+
 

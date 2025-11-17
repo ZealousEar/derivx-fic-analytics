@@ -1,4 +1,4 @@
-# DerivX — Fixed Income & Currencies Analytics (v1)
+# DerivX — Fixed Income & Currencies Analytics (v2)
 # https://derivx.streamlit.app/
 
 DerivX is a portfolio-ready analytics platform showcasing quantitative engineering for Fixed Income & Currencies roles. The project combines Financial Mathematics theory with a friendly UX that highlights:
@@ -68,6 +68,7 @@ release/v1/
 - **Term structure:** OIS/IRS bootstrap, forward rates, and discount factors.
 
 - **Volatility**: SVI and SABR calibration with basic diagnostics.
+- **Vol analytics lab**: dedicated Streamlit pages for market-data ingestion, constrained SVI calibration vs spline baselines, walk-forward validation, and model comparison (SVI/SABR/local-vol).
 
 - **Pricing and risk**: Black IR caps/floors, PV, DV01/PV01, and simple scenarios.
 
@@ -133,6 +134,45 @@ Streamlit Community Cloud now hibernates apps after ~12 hours of inactivity. To 
 - The workflow will fail if Selenium cannot dismiss the wake-up button, which makes troubleshooting easier from the Actions tab.
 
 This automation is best-effort only—manual wake-ups may still be required if Streamlit applies additional limits.
+
+---
+
+## Market data + analytics lab
+
+The new **Analytics** mode in `streamlit_app.py` exposes the end-to-end pipeline you built for real option chains:
+
+1. **Market Data tab** – upload a Parquet chain or click “Pull from Yahoo Finance”. The app runs liquidity filters, shows summary metrics, and lets you download a cleaned CSV.
+2. **Production Calibration tab** – pick expiries, enforce moneyness bands/no-arb checks, and visualise fitted SVI smiles vs a cubic-spline baseline (with RMSE/diagnostics tables).
+3. **Walk-Forward Validation tab** – either upload a folder of daily chains or fetch a short window (≤20 business days) from Yahoo Finance, reapply filters, and run `walk_forward_test` with regime-level summaries.
+4. **Model Comparison tab** – load a single expiry slice and compare in-sample RMSE for SVI/SABR/local-vol with an overlayed smile plot.
+
+> **Yahoo Finance caveats:** the public options endpoint only returns *current* chains and occasionally responds with “Invalid Crumb”/empty payloads. Each download attempt now retries 3× and surfaces a per-date status table. When a window keeps failing, run the offline helper and upload the files instead:
+
+```bash
+# Download a few SPY sessions into data/market/manual
+python tools/download_spy_chains.py \
+    --ticker SPY \
+    --start 2025-11-10 \
+    --end 2025-11-14 \
+    --outdir data/market/manual
+```
+
+The Parquet files are gitignored; keep your historical downloads locally and use the upload flow whenever Yahoo throttles the live API.
+
+---
+
+## Key Metrics & Performance
+
+Quantified results from production calibration and backtesting on 24 trading days of SPY option chains (768 expiry slices):
+
+- **SVI Calibration**: Achieved mean RMSE of 0.0520 (median 0.0401) across 32 unique expiries, with constrained no-arbitrage diagnostics enforced on all slices.
+- **Walk-Forward Validation**: Out-of-sample backtest achieved 71.8% directional hit rate with mean RMSE of 0.0558 across 416 predictions in mid-volatility regimes (10-day calibration window).
+- **Model Comparison**: SVI outperformed SABR by 25.3% in mean RMSE (0.2892 vs 0.3869) across 24 representative smile calibrations, demonstrating superior fit to equity option market data.
+
+Metrics computed via `tools/compute_metrics.py`; full results available in `data/metrics/`. Regenerate with:
+```bash
+python tools/compute_metrics.py --chain-dir data/metrics/chains --outdir data/metrics
+```
 
 ---
 
