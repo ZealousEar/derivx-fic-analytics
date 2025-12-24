@@ -115,9 +115,35 @@ pytest tests/ -v
 The project is configured for:
 
 - **Local runs** via `streamlit run`
-- **Render/Heroku-style deployments** via the included `Procfile` and `setup.sh`
+- **Docker deployments** via the included `Dockerfile`
+- **Render** via `render.yaml` (one-click deploy)
+- **Heroku-style deployments** via the included `Procfile` and `setup.sh`
 - **Continuous integration** (pytest) through `.github/workflows/ci.yaml`
 - **Streamlit wake-up automation** via `.github/workflows/wake-streamlit.yml`
+
+### Deploy to Render (recommended)
+
+1. Fork this repository
+2. Go to [render.com](https://render.com) and create a new Web Service
+3. Connect your GitHub repo — Render auto-detects `render.yaml`
+4. Click **Deploy** — the app will be live at `https://derivx.onrender.com`
+
+### Deploy with Docker
+
+```bash
+# Build and run locally
+docker build -t derivx .
+docker run -p 8501:8501 derivx
+
+# Or deploy to any container platform (Railway, Fly.io, Google Cloud Run, etc.)
+```
+
+### Deploy to Hugging Face Spaces
+
+1. Create a new Space at [huggingface.co/spaces](https://huggingface.co/spaces)
+2. Select **Streamlit** as the SDK
+3. Upload the `src/` folder and `requirements.txt`
+4. Set the app file to `src/derivx/ui/streamlit_app.py`
 
 To package the library (optional):
 
@@ -184,7 +210,6 @@ python tools/compute_metrics.py --chain-dir data/metrics/chains --outdir data/me
 - Add VaR/ES analytics and backtesting notebook
 - Integrate QuantLib pricing engines (guarded import)
 - Provide REST/CLI endpoints (FastAPI or Typer)
-- Ship a Dockerfile for containerised demos
 
 ---
 
