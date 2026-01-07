@@ -41,7 +41,7 @@ pytest tests/ -v
 
 Prefer to skip setup? Launch the hosted demo at https://derivx.streamlit.app/.
 
-The project targets Python 3.9+ and has been validated on macOS and Ubuntu. The Streamlit app uses caching, so the initial load calibrates surfaces once and subsequent interactions remain responsive.
+The project targets Python 3.10+ and has been validated on macOS and Ubuntu. The Streamlit app uses caching, so the initial load calibrates surfaces once and subsequent interactions remain responsive.
 
 ---
 
@@ -49,7 +49,7 @@ The project targets Python 3.9+ and has been validated on macOS and Ubuntu. The 
 
 ```
 .
-├── README.md                  # Recruiter-ready overview + metrics
+├── README.md                  # Overview + metrics
 ├── requirements.txt           # Runtime dependencies (numpy<2, pandas<2.2, yfinance>=0.2.66)
 ├── src/derivx/                # Python package
 │   ├── ui/streamlit_app.py    # Streamlit interface (Equity/FX/Rates + Analytics)
@@ -121,7 +121,7 @@ The project is configured for:
 - **Continuous integration** (pytest) through `.github/workflows/ci.yaml`
 - **Streamlit wake-up automation** via `.github/workflows/wake-streamlit.yml`
 
-### Deploy to Render (recommended)
+### Deploy to Render
 
 1. Fork this repository
 2. Go to [render.com](https://render.com) and create a new Web Service
@@ -153,22 +153,9 @@ python -m build
 
 ---
 
-## Streamlit keep-alive workflow
-
-Streamlit Community Cloud now hibernates apps after ~12 hours of inactivity. To reduce downtime, this repository includes `.github/workflows/wake-streamlit.yml`, which runs every 4 hours (and on manual dispatch) to visit the app and click the “Yes, get this app back up” button if it’s present.
-
-- The workflow installs Chrome, the minimal Selenium dependencies in `tools/keep_alive/requirements.txt`, and runs `tools/keep_alive/main.py`.
-- Override the target app by setting `STREAMLIT_APP_URL` in the workflow (defaults to `https://derivx.streamlit.app/`).
-- Optionally pin a ChromeDriver version by setting `CHROMEDRIVER_VERSION` or a major version via `CHROMEDRIVER_MAJOR_VERSION`.
-- The workflow will fail if Selenium cannot dismiss the wake-up button, which makes troubleshooting easier from the Actions tab.
-
-This automation is best-effort only—manual wake-ups may still be required if Streamlit applies additional limits.
-
----
-
 ## Market data + analytics lab
 
-The new **Analytics** mode in `streamlit_app.py` exposes the end-to-end pipeline you built for real option chains:
+The new **Analytics** mode in `streamlit_app.py` exposes the end-to-end pipeline built for real option chains:
 
 1. **Market Data tab** – upload a Parquet chain or click “Pull from Yahoo Finance”. The app runs liquidity filters, shows summary metrics, and lets you download a cleaned CSV.
 2. **Production Calibration tab** – pick expiries, enforce moneyness bands/no-arb checks, and visualise fitted SVI smiles vs a cubic-spline baseline (with RMSE/diagnostics tables).
@@ -202,18 +189,4 @@ Metrics computed via `tools/compute_metrics.py`; full results available in `data
 ```bash
 python tools/compute_metrics.py --chain-dir data/metrics/chains --outdir data/metrics
 ```
-
----
-
-## Next steps (optional roadmap)
-
-- Add VaR/ES analytics and backtesting notebook
-- Integrate QuantLib pricing engines (guarded import)
-- Provide REST/CLI endpoints (FastAPI or Typer)
-
----
-
-## License
-
-Released under the MIT License. See `LICENSE` for details.
 
