@@ -173,6 +173,7 @@ python tools/download_spy_chains.py \
     --outdir data/market/manual
 ```
 
+
 The Parquet files are gitignored; keep your historical downloads locally and use the upload flow whenever Yahoo throttles the live API.
 
 ---
