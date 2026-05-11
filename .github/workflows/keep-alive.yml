@@ -9,35 +9,65 @@ on:
 jobs:
   ping-app:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write
+
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Ping Streamlit App
         run: |
           echo "Pinging derivx.streamlit.app at $(date)"
-          
+
           set +e
           response=$(curl -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
           curl_exit=$?
           set -e
-          
+
           if [ "$curl_exit" -ne 0 ]; then
             echo "❌ curl failed with exit code $curl_exit"
             exit "$curl_exit"
           fi
-          
+
           echo "HTTP Response Code: $response"
-          
+
           if [ "$response" -ge 200 ] && [ "$response" -lt 400 ]; then
             echo "✅ App is alive and responding!"
           else
             echo "⚠️ App returned unexpected status code: $response"
             exit 1
           fi
-      
+
+      - name: Refresh repo activity (monthly)
+        if: success()
+        run: |
+          STAMP_FILE=.github/last-ping.txt
+          THIS_MONTH=$(date -u +%Y-%m)
+          LAST_MONTH=""
+          if [ -f "$STAMP_FILE" ]; then
+            LAST_MONTH=$(head -c 7 "$STAMP_FILE" 2>/dev/null || true)
+          fi
+          if [ "$THIS_MONTH" = "$LAST_MONTH" ]; then
+            echo "Activity stamp already refreshed this month ($LAST_MONTH); skipping commit."
+            exit 0
+          fi
+          mkdir -p .github
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAMP_FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STAMP_FILE"
+          if git diff --cached --quiet; then
+            echo "No staged changes; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(keepalive): refresh activity timestamp"
+          git push
+
       - name: Send Success Notification
         if: success()
         run: echo "App pinged successfully at $(date)"
-      
+
       - name: Send Failure Notification
         if: failure()
         run: echo "Failed to ping app at $(date)"
