@@ -13,13 +13,16 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 STREAMLIT_URL = os.environ.get("STREAMLIT_APP_URL", "https://derivx.streamlit.app/")
 WAKE_BUTTON_XPATH = "//button[contains(text(),'Yes, get this app back up')]"
 WAIT_SECONDS = int(os.environ.get("STREAMLIT_WAKE_WAIT", "20"))
-CHROMEDRIVER_VERSION = os.environ.get("CHROMEDRIVER_VERSION")
-CHROMEDRIVER_MAJOR_VERSION = os.environ.get("CHROMEDRIVER_MAJOR_VERSION")
+# Paths optionally provided by the CI setup-chrome step so the chromedriver
+# always matches the installed browser. When unset, Selenium Manager (bundled
+# with Selenium >= 4.6) resolves a matching driver automatically.
+CHROME_BINARY = os.environ.get("CHROME_BINARY")
+CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH")
+PAGE_LOAD_TIMEOUT = int(os.environ.get("STREAMLIT_PAGE_LOAD_TIMEOUT", "60"))
 
 
 @dataclass
@@ -35,14 +38,14 @@ def configure_driver() -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    if CHROMEDRIVER_VERSION:
-        driver_manager = ChromeDriverManager(version=CHROMEDRIVER_VERSION)
-    elif CHROMEDRIVER_MAJOR_VERSION:
-        driver_manager = ChromeDriverManager(version=CHROMEDRIVER_MAJOR_VERSION)
-    else:
-        driver_manager = ChromeDriverManager()
-    service = Service(driver_manager.install())
-    return webdriver.Chrome(service=service, options=options)
+    if CHROME_BINARY:
+        options.binary_location = CHROME_BINARY
+    # Prefer an explicit chromedriver path (from CI); otherwise let Selenium
+    # Manager download a driver that matches the installed Chrome.
+    service = Service(executable_path=CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
 
 
 def wake_streamlit_app() -> WakeResult:
