@@ -20,7 +20,11 @@ jobs:
           python-version: "3.10"
 
       - name: Install Chrome
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
 
       - name: Install keep-alive dependencies
         run: |
@@ -30,4 +34,6 @@ jobs:
       - name: Wake Streamlit app
         env:
           STREAMLIT_APP_URL: https://derivx.streamlit.app/
+          CHROME_BINARY: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: python tools/keep_alive/main.py
