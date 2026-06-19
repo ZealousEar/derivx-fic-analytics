@@ -49,7 +49,11 @@ def configure_driver() -> webdriver.Chrome:
 
 
 def wake_streamlit_app() -> WakeResult:
-    driver = configure_driver()
+    try:
+        driver = configure_driver()
+    except Exception as exc:  # pylint: disable=broad-except
+        return WakeResult(1, f"Failed to start Chrome WebDriver: {exc}")
+
     try:
         print(f"Opening {STREAMLIT_URL}")
         driver.get(STREAMLIT_URL)
