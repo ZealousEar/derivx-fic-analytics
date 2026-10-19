@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Dict, Iterable
 
 import numpy as np
@@ -25,7 +26,19 @@ def price_cap_floor(
     tenors: Iterable[float],
     vol_curve: ZeroCurve,
 ) -> Dict[str, object]:
-    """Price a cap (sum of caplets) under Black; return PV, DV01, PV01, buckets."""
+    """Deprecated approximation kept for old notebooks; use
+    :class:`derivx.rates.capfloor.CapFloor`.
+
+    It prices one caplet per entry of ``tenors`` on the instantaneous forward
+    with no accrual fraction, and its DV01 freezes forwards and is per unit of
+    rate (not per bp), so its numbers do not match a real cap.
+    """
+
+    warnings.warn(
+        "price_cap_floor is a deprecated approximation; use derivx.rates.capfloor.CapFloor",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     ts = np.asarray(list(tenors), dtype=float)
     ts = ts[ts > 0]

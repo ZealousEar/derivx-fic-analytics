@@ -17,9 +17,10 @@ from derivx.core.bs import bs_price_greeks, put_call_parity_residual
 from derivx.data.market_data import apply_liquidity_filters, compute_moneyness, fetch_option_chain
 from derivx.models.comparison import compare_models
 from derivx.rates.black_ir import price_cap_floor
-from derivx.rates.term_structure import build_zero_curve
+from derivx.rates.term_structure import ZeroCurve, build_zero_curve
 from derivx.risk.metrics import scen_shift_curve
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene, mount_zoom_guard
+from derivx.ui.theme import PLOTLY_2D_CONFIG
 from derivx.validation.backtest import walk_forward_test
 from derivx.vol.sabr import calibrate_sabr_smile, hagan_sabr_iv
 from derivx.vol.svi import fit_svi_strike_slice, svi_iv
@@ -173,17 +174,6 @@ PLOTLY_3D_CONFIG = {
     ] + ([] if GUARD_AVAILABLE else ["pan3d"]),
     "modeBarButtonsToAdd": ["orbitRotation", "resetCameraDefault3d"]
     + (["pan3d"] if GUARD_AVAILABLE else []),
-}
-PLOTLY_2D_CONFIG = {
-    "displaylogo": False,
-    "scrollZoom": GUARD_AVAILABLE,
-    "modeBarButtonsToRemove": [
-        "toImage",
-        "lasso2d",
-        "select2d",
-        "hoverClosestCartesian",
-        "hoverCompareCartesian",
-    ],
 }
 ANALYTICS_TABS = [
     "Market Data",
@@ -1182,7 +1172,7 @@ elif mode == "RATES":
     
     max_t = float(curve.ts.max())
     tenors = np.linspace(0.5, max(0.5, max_t), num=6)
-    vol_curve = type(curve)(ts=curve.ts, dfs=np.full_like(curve.dfs, flat_sigma))
+    vol_curve = ZeroCurve(ts=curve.ts, dfs=np.full_like(curve.dfs, flat_sigma))
     res = price_cap_floor(curve, K, tenors, vol_curve)
     
     # Display metrics
