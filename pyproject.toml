@@ -7,7 +7,7 @@ name = "derivx"
 version = "0.1.0"
 description = "Derivatives analytics platform (FIC): BS, SVI/SABR, term structure, Black IR, DV01/PV01"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
   { name = "Farhad" }
@@ -44,6 +44,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "QuantLib",
   "black",
   "ruff",
   "mypy"
@@ -51,11 +52,11 @@ dev = [
 
 [tool.black]
 line-length = 80
-target-version = ["py39", "py310", "py311"]
+target-version = ["py310", "py311"]
 
 [tool.ruff]
 line-length = 80
-target-version = "py39"
+target-version = "py310"
 
 [tool.pytest.ini_options]
 addopts = "-q"
