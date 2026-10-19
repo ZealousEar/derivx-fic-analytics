@@ -13,6 +13,7 @@ so charts are bounded in two layers:
    wheel zooms the chart. Without components v2 the app turns wheel zoom off
    and relies on layer 1 alone.
 """
+
 from __future__ import annotations
 
 import logging
@@ -146,6 +147,7 @@ export default function () {
   };
 }
 """
+
 
 def _register_guard():
     return _components_v2.component("derivx_zoom_guard", js=_GUARD_JS)
