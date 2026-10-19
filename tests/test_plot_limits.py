@@ -139,3 +139,15 @@ def test_every_analytics_chart_is_zoom_bounded():
     assert len(charts) == 3  # calibration smile, walk-forward, model comparison
     for spec, config in charts:
         _assert_bounded(spec, config)
+
+
+def test_failed_guard_mount_falls_back_instead_of_raising(monkeypatch):
+    from derivx.ui import plot_limits
+
+    def broken(**_):
+        raise TypeError("components v2 regression")
+
+    monkeypatch.setattr(plot_limits, "_GUARD", broken)
+    monkeypatch.setattr(plot_limits, "GUARD_AVAILABLE", True)
+    assert plot_limits.mount_zoom_guard() is False
+    assert plot_limits.GUARD_AVAILABLE is False  # next run uses safe configs

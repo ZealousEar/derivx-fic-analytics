@@ -15,12 +15,14 @@ so charts are bounded in two layers:
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 try:  # Streamlit >= 1.51
     from streamlit.components import v2 as _components_v2
@@ -145,11 +147,11 @@ export default function () {
 }
 """
 
-_GUARD = (
-    _components_v2.component("derivx_zoom_guard", js=_GUARD_JS)
-    if _components_v2 is not None
-    else None
-)
+def _register_guard():
+    return _components_v2.component("derivx_zoom_guard", js=_GUARD_JS)
+
+
+_GUARD = _register_guard() if _components_v2 is not None else None
 GUARD_AVAILABLE = _GUARD is not None
 
 
@@ -237,10 +239,28 @@ def bound_scene(
 
 
 def mount_zoom_guard() -> bool:
-    """Mount the relayout guard once per script run; False if unavailable."""
+    """Mount the guard once per script run; False if it is unavailable.
 
-    if _GUARD is None:
+    A failed mount turns the guard off for the rest of the process, so later
+    runs fall back to the declarative limits instead of breaking the page.
+    """
+
+    global _GUARD, GUARD_AVAILABLE
+    if _GUARD is None or not GUARD_AVAILABLE:
         return False
-    with st.sidebar:
-        _GUARD(key="derivx_zoom_guard")
+    try:
+        try:
+            with st.sidebar:
+                _GUARD(key="derivx_zoom_guard")
+        except (ValueError, StreamlitAPIException):
+            # Older Streamlit releases keep registrations per runtime and
+            # report a missing one as either error, so a new runtime (e.g.
+            # another AppTest) needs the guard registered again.
+            _GUARD = _register_guard()
+            with st.sidebar:
+                _GUARD(key="derivx_zoom_guard")
+    except Exception:  # Streamlit's rerun/stop signals are BaseExceptions
+        logging.getLogger(__name__).warning("Zoom guard disabled", exc_info=True)
+        GUARD_AVAILABLE = False
+        return False
     return True
