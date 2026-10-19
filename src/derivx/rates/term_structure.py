@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 
 
 @dataclass
@@ -33,34 +33,30 @@ def build_zero_curve(
     quotes: Dict[str, float],
     day_count: str = "ACT/365",
     compounding: str = "cont",
-) -> ZeroCurve:
-    """Build a simple zero curve with PCHIP ensuring monotone dfs.
+    asof: Optional[dt.date] = None,
+    conventions: str = "USD SOFR",
+    interpolation: str = "loglinear",
+):
+    """Bootstrap a curve from ``{tenor: OIS par rate}`` quotes.
 
-    quotes: mapping tenor->rate (years as floats preferred; supports '1W','1M','2Y',...)
-    rates are decimals (0.05 = 5%).
+    Kept for the original API: every quote is treated as an OIS par rate (an
+    ``ON``/``TN``/``SN`` quote as a deposit), the curve is bootstrapped so each
+    one reprices, and the result is a :class:`derivx.rates.curves.Curve`
+    (which also offers ``ts``, ``dfs``, ``discount``, ``df`` and ``fwd_rate``).
+    Rates may be decimals, percent or bp. ``day_count`` and ``compounding``
+    are ignored: the instrument conventions come from ``conventions``. For
+    mixed instruments use :func:`derivx.rates.curves.bootstrap`.
     """
 
-    def tenor_to_years(tenor: str) -> float:
-        tenor = tenor.upper().strip()
-        if tenor.endswith("W"):
-            return float(7 * int(tenor[:-1])) / 365.0
-        if tenor.endswith("M"):
-            return float(30 * int(tenor[:-1])) / 365.0
-        if tenor.endswith("Y"):
-            return float(int(tenor[:-1]))
-        return float(tenor)
+    from .curves import bootstrap
+    from .quotes import clean_quotes
 
-    items = sorted(((tenor_to_years(k), v) for k, v in quotes.items()), key=lambda x: x[0])
-    ts = np.array([t for t, _ in items], dtype=float)
-    rs = np.array([r for _, r in items], dtype=float)
-
-    # Continuous compounding => df = exp(-r t)
-    dfs_raw = np.exp(-rs * ts)
-    # Enforce monotonicity via PCHIP smoothing
-    interp = PchipInterpolator(ts, dfs_raw, extrapolate=True)
-    ts_dense = np.linspace(0.0, float(ts[-1]), num=max(5, len(ts)))
-    dfs_dense = interp(ts_dense)
-    dfs_dense = np.clip(dfs_dense, 1e-8, 1.0)
-    return ZeroCurve(ts=ts_dense, dfs=dfs_dense)
-
-
+    rows = [
+        {"kind": "DEPO" if str(t).strip().upper() in ("ON", "O/N", "TN", "T/N", "SN", "S/N") else "OIS", "tenor": t, "rate": r}
+        for t, r in quotes.items()
+    ]
+    clean, issues, _ = clean_quotes(rows)
+    errors = [i.message for i in issues if i.level == "error"]
+    if errors:
+        raise ValueError("; ".join(errors))
+    return bootstrap(asof or dt.date.today(), clean, conventions, interpolation)
