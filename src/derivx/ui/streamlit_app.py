@@ -19,6 +19,7 @@ from derivx.models.comparison import compare_models
 from derivx.rates.black_ir import price_cap_floor
 from derivx.rates.term_structure import build_zero_curve
 from derivx.risk.metrics import scen_shift_curve
+from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene, mount_zoom_guard
 from derivx.validation.backtest import walk_forward_test
 from derivx.vol.sabr import calibrate_sabr_smile, hagan_sabr_iv
 from derivx.vol.svi import fit_svi_strike_slice, svi_iv
@@ -154,21 +155,28 @@ mode = mode.replace("[", "").replace("]", "").strip()  # Extract mode name
 
 DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "examples"
 DEFAULT_CAMERA = dict(eye=dict(x=1.6, y=1.6, z=1.2))
+# Zoom and pan are bounded by derivx.ui.plot_limits. Wheel zoom (pinch or
+# Ctrl/Cmd + wheel) and 3D pan need its in-page guard, so both are off without
+# it. The 3D zoom tool only moves the camera, which an orthographic view does
+# not show, so it is dropped.
+ZOOM_HINT = "Pinch or Ctrl/⌘ + scroll to zoom (bounded) · home icon resets the view"
 PLOTLY_3D_CONFIG = {
     "displaylogo": False,
-    "scrollZoom": True,
+    "scrollZoom": GUARD_AVAILABLE,
     "modeBarButtonsToRemove": [
         "toImage",
         "lasso3d",
         "resetScale2d",
         "hoverClosestCartesian",
         "hoverCompareCartesian",
-    ],
-    "modeBarButtonsToAdd": ["orbitRotation", "zoom3d", "pan3d", "resetCameraDefault3d"],
+        "zoom3d",
+    ] + ([] if GUARD_AVAILABLE else ["pan3d"]),
+    "modeBarButtonsToAdd": ["orbitRotation", "resetCameraDefault3d"]
+    + (["pan3d"] if GUARD_AVAILABLE else []),
 }
 PLOTLY_2D_CONFIG = {
     "displaylogo": False,
-    "scrollZoom": True,
+    "scrollZoom": GUARD_AVAILABLE,
     "modeBarButtonsToRemove": [
         "toImage",
         "lasso2d",
@@ -370,6 +378,11 @@ def _plot_calibration_smile(cal_slice: CalibratedSlice) -> go.Figure:
         height=400,
         margin=dict(l=40, r=20, t=40, b=40),
     )
+    bound_axes(
+        fig,
+        xaxis=axis_limits(strikes, floor=0.0),
+        yaxis=axis_limits(np.concatenate([cal_slice.observed_ivs, fitted]), floor=0.0),
+    )
     return fig
 
 
@@ -393,6 +406,13 @@ def _plot_walkforward(metrics: pd.DataFrame) -> go.Figure:
         yaxis=dict(title="RMSE", gridcolor="#333333"),
         height=350,
         margin=dict(l=40, r=20, t=40, b=40),
+    )
+    dates = pd.to_datetime(metrics["next_date"])
+    pad = max((dates.max() - dates.min()) * 0.05, pd.Timedelta(days=1))
+    bound_axes(
+        fig,
+        xaxis={"min": (dates.min() - pad).isoformat(), "max": (dates.max() + pad).isoformat()},
+        yaxis=axis_limits(metrics["rmse"], floor=0.0),
     )
     return fig
 
@@ -456,6 +476,11 @@ def _plot_model_comparison(slice_df: pd.DataFrame, models: Iterable[str]) -> go.
         yaxis=dict(title="Implied Vol", gridcolor="#333333"),
         height=400,
         margin=dict(l=40, r=20, t=40, b=40),
+    )
+    bound_axes(
+        fig,
+        xaxis=axis_limits(strikes, floor=0.0),
+        yaxis=axis_limits(df["implied_vol"], pad=0.25, floor=0.0),
     )
     return fig
 
@@ -994,10 +1019,13 @@ if mode in ("EQUITY", "FX"):
         uirevision=surface_revision,
     )
     fig_3d.update_scenes(camera_projection_type="orthographic")
+    bound_scene(fig_3d, eye=DEFAULT_CAMERA["eye"])
     if st.session_state.get("force_camera", False):
         st.session_state["force_camera"] = False
 
     st.plotly_chart(fig_3d, use_container_width=True, key="surface_3d", config=PLOTLY_3D_CONFIG)
+    if GUARD_AVAILABLE:
+        st.caption(ZOOM_HINT)
 
     # Volatility Smile - minimalist line chart
     model_name = "SVI" if mode == "EQUITY" else "SABR"
@@ -1055,9 +1083,14 @@ if mode in ("EQUITY", "FX"):
         dragmode="zoom",
         uirevision=smile_revision,
     )
-    fig_smile.update_xaxes(autorange=True)
-    fig_smile.update_yaxes(autorange=True)
-    st.plotly_chart(fig_smile, use_container_width=True, config=PLOTLY_2D_CONFIG)
+    bound_axes(
+        fig_smile,
+        xaxis=axis_limits(Ks, floor=0.0),
+        yaxis=axis_limits(np.concatenate([ivs, iv_fit, [sigma]]), floor=0.0),
+    )
+    st.plotly_chart(fig_smile, use_container_width=True, key="smile_2d", config=PLOTLY_2D_CONFIG)
+    if GUARD_AVAILABLE:
+        st.caption(ZOOM_HINT)
     
     # Model parameters - always visible below smile
     st.markdown(f"**[ {model_name} CALIBRATED PARAMS ]**")
@@ -1114,6 +1147,13 @@ elif mode == "RATES":
     fig_curve.update_yaxes(title_text="DF", gridcolor='#333333', row=1, col=1)
     fig_curve.update_yaxes(title_text="RATE", gridcolor='#333333', row=1, col=2)
     
+    bound_axes(
+        fig_curve,
+        xaxis=axis_limits(curve.ts, floor=0.0),
+        xaxis2=axis_limits(curve.ts[curve.ts > 0], floor=0.0),
+        yaxis=axis_limits(curve.dfs, floor=0.0),
+        yaxis2=axis_limits(fwd_rates),
+    )
     fig_curve.update_layout(
         height=350,
         paper_bgcolor='#000000',
@@ -1169,6 +1209,11 @@ elif mode == "RATES":
         xaxis=dict(gridcolor='#333333'),
         yaxis=dict(gridcolor='#333333'),
     )
+    bound_axes(
+        fig_buckets,
+        xaxis={"min": -0.5, "max": len(bucket_values) - 0.5, "min_span": 1.0},
+        yaxis=axis_limits([0.0, *bucket_values], pad=0.15, floor=min(0.0, *bucket_values)),
+    )
     st.plotly_chart(fig_buckets, use_container_width=True, config=PLOTLY_2D_CONFIG)
 
     # Scenario analysis
@@ -1212,3 +1257,5 @@ elif mode == "ANALYTICS":
         _render_walkforward_tab()
     with tabs[3]:
         _render_model_comparison_tab()
+
+mount_zoom_guard()
