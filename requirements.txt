@@ -5,6 +5,6 @@ pandas<2.2
 pyarrow<14
 numexpr>=2.8.5,<3
 plotly
-streamlit
+streamlit>=1.59,<2
 yfinance>=0.2.66,<0.3
 pytest

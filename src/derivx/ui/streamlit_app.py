@@ -506,7 +506,7 @@ def _render_market_data_tab():
         trade_date = st.date_input("Trade date label", value=dt.date.today(), max_value=dt.date.today())
         expiry_limit = st.number_input("Max expiries", min_value=1, max_value=15, value=4)
         st.caption("Yahoo returns the latest chain only. The date above is stored with the rows for reference.")
-        if st.button("Pull from Yahoo Finance", use_container_width=True):
+        if st.button("Pull from Yahoo Finance", width="stretch"):
             st.session_state["chain_fetch_nonce"] += 1
             with st.spinner("Fetching live chain…"):
                 df, meta = _cached_fetch_chain(
@@ -568,7 +568,7 @@ def _render_market_data_tab():
         else "n/a",
     )
 
-    st.dataframe(filtered, use_container_width=True)
+    st.dataframe(filtered, width="stretch")
     if not filtered.empty:
         csv_bytes = filtered.to_csv(index=False).encode("utf-8")
         st.download_button("Download filtered CSV", csv_bytes, file_name="filtered_chain.csv")
@@ -591,7 +591,7 @@ def _render_calibration_tab():
     band = st.slider("Moneyness band", 0.7, 1.3, (0.85, 1.15), step=0.01)
     enforce = st.checkbox("Enforce no-arbitrage diagnostics", value=True)
 
-    run = st.button("Calibrate slices", use_container_width=True)
+    run = st.button("Calibrate slices", width="stretch")
     if run:
         if sel_exp:
             mask = pd.to_datetime(chain["expiry"]).dt.date.isin(sel_exp)
@@ -628,16 +628,16 @@ def _render_calibration_tab():
                 "RMSE (spline)": bench.get("rmse_spline"),
             }
         )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch")
 
     options = [f"{slc.expiry.date()}" for slc in results]
     selected = st.selectbox("Visualize expiry", options) if options else None
     if selected:
         slc = next(s for s in results if str(s.expiry.date()) == selected)
-        st.plotly_chart(_plot_calibration_smile(slc), use_container_width=True, config=PLOTLY_2D_CONFIG)
+        st.plotly_chart(_plot_calibration_smile(slc), width="stretch", config=PLOTLY_2D_CONFIG)
         params_df = pd.DataFrame([slc.params])
         st.markdown("#### / CALIBRATED PARAMS")
-        st.dataframe(params_df, use_container_width=True)
+        st.dataframe(params_df, width="stretch")
         st.markdown("#### / DIAGNOSTICS")
         st.json(slc.diagnostics)
         if slc.benchmark:
@@ -678,7 +678,7 @@ def _render_walkforward_tab():
         max_days = (end_date - start_date).days + 1
         if max_days > 20:
             st.warning("Limit the window to <= 20 days to keep the test fast.")
-        if st.button("Download history", use_container_width=True):
+        if st.button("Download history", width="stretch"):
             all_dates = pd.date_range(start_date, end_date, freq="B")  # business days
             st.session_state["walk_fetch_nonce"] += 1
             with st.spinner("Downloading historical chains…"):
@@ -737,13 +737,21 @@ def _render_walkforward_tab():
     st.caption(f"{len(prepared)} of {len(stored)} uploaded/downloaded days survived the liquidity filters.")
 
     dates_sorted = sorted(prepared.keys())
-    window = st.slider(
-        "Calibration window (days)",
-        min_value=3,
-        max_value=max(3, len(dates_sorted) - 1),
-        value=min(10, max(3, len(dates_sorted) - 1)),
-    )
-    run = st.button("Run walk-forward test", use_container_width=True)
+    # walk_forward_test needs window + 2 days: the window, the day it
+    # calibrates on and the next day it is scored against.
+    max_window = len(dates_sorted) - 2
+    min_window = min(3, max_window)
+    if min_window == max_window:
+        window = max_window
+        st.caption(f"Calibration window: {window} day(s). Load more days to widen it.")
+    else:
+        window = st.slider(
+            "Calibration window (days)",
+            min_value=min_window,
+            max_value=max_window,
+            value=min(10, max_window),
+        )
+    run = st.button("Run walk-forward test", width="stretch")
     if run:
         with st.spinner("Running walk-forward backtest…"):
             metrics = walk_forward_test(prepared, window=window)
@@ -758,8 +766,8 @@ def _render_walkforward_tab():
     if metrics.empty:
         return
 
-    st.plotly_chart(_plot_walkforward(metrics), use_container_width=True, config=PLOTLY_2D_CONFIG)
-    st.dataframe(metrics, use_container_width=True)
+    st.plotly_chart(_plot_walkforward(metrics), width="stretch", config=PLOTLY_2D_CONFIG)
+    st.dataframe(metrics, width="stretch")
 
     regime_summary = (
         metrics.dropna(subset=["regime"])
@@ -768,7 +776,7 @@ def _render_walkforward_tab():
     )
     if not regime_summary.empty:
         st.markdown("#### / REGIME BREAKDOWN")
-        st.dataframe(regime_summary, use_container_width=True)
+        st.dataframe(regime_summary, width="stretch")
 
 
 def _render_model_comparison_tab():
@@ -789,7 +797,7 @@ def _render_model_comparison_tab():
         st.warning("Select at least one model.")
         return
 
-    run = st.button("Compare models", use_container_width=True)
+    run = st.button("Compare models", width="stretch")
     if run:
         slice_df = chain[pd.to_datetime(chain["expiry"]).dt.date == expiry]
         if slice_df.empty:
@@ -804,11 +812,11 @@ def _render_model_comparison_tab():
     if metrics.empty:
         return
 
-    st.dataframe(metrics, use_container_width=True)
+    st.dataframe(metrics, width="stretch")
     slice_df = st.session_state.get("model_comp_slice", pd.DataFrame())
     models = st.session_state.get("model_comp_models", [])
     if not slice_df.empty:
-        st.plotly_chart(_plot_model_comparison(slice_df, models), use_container_width=True, config=PLOTLY_2D_CONFIG)
+        st.plotly_chart(_plot_model_comparison(slice_df, models), width="stretch", config=PLOTLY_2D_CONFIG)
 
 if "preset_last" not in st.session_state:
     st.session_state["preset_last"] = "DEFAULT"
@@ -1023,7 +1031,7 @@ if mode in ("EQUITY", "FX"):
     if st.session_state.get("force_camera", False):
         st.session_state["force_camera"] = False
 
-    st.plotly_chart(fig_3d, use_container_width=True, key="surface_3d", config=PLOTLY_3D_CONFIG)
+    st.plotly_chart(fig_3d, width="stretch", key="surface_3d", config=PLOTLY_3D_CONFIG)
     if GUARD_AVAILABLE:
         st.caption(ZOOM_HINT)
 
@@ -1088,7 +1096,7 @@ if mode in ("EQUITY", "FX"):
         xaxis=axis_limits(Ks, floor=0.0),
         yaxis=axis_limits(np.concatenate([ivs, iv_fit, [sigma]]), floor=0.0),
     )
-    st.plotly_chart(fig_smile, use_container_width=True, key="smile_2d", config=PLOTLY_2D_CONFIG)
+    st.plotly_chart(fig_smile, width="stretch", key="smile_2d", config=PLOTLY_2D_CONFIG)
     if GUARD_AVAILABLE:
         st.caption(ZOOM_HINT)
     
@@ -1162,7 +1170,7 @@ elif mode == "RATES":
         showlegend=False,
         margin=dict(l=50, r=50, t=50, b=50),
     )
-    st.plotly_chart(fig_curve, use_container_width=True, config=PLOTLY_2D_CONFIG)
+    st.plotly_chart(fig_curve, width="stretch", config=PLOTLY_2D_CONFIG)
 
     # Cap/Floor pricing
     st.markdown("### / CAP PRICING")
@@ -1214,7 +1222,7 @@ elif mode == "RATES":
         xaxis={"min": -0.5, "max": len(bucket_values) - 0.5, "min_span": 1.0},
         yaxis=axis_limits([0.0, *bucket_values], pad=0.15, floor=min(0.0, *bucket_values)),
     )
-    st.plotly_chart(fig_buckets, use_container_width=True, config=PLOTLY_2D_CONFIG)
+    st.plotly_chart(fig_buckets, width="stretch", config=PLOTLY_2D_CONFIG)
 
     # Scenario analysis
     st.markdown("### / SCENARIOS")
