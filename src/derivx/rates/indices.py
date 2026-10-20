@@ -244,7 +244,8 @@ def overnight_futures_rate(
 
     ``df(date)`` is the curve's discount factor. A fixing missing for a
     past business day raises ``ValueError``; a fixing for ``asof`` itself is
-    used when present, otherwise the day is projected.
+    used when present, otherwise the day is projected. A period that ended
+    before ``asof`` is its final settlement rate, all from fixings.
     """
 
     fixings = fixings or {}
@@ -275,12 +276,12 @@ def overnight_futures_rate(
         raise ValueError(f"{kind} is not an overnight future")
     prod, forward_start = 1.0, start
     if asof > start:
-        today = cal.adjust(asof, "F")
+        today = min(cal.adjust(asof, "F"), end)  # a period that has ended is all fixings
         forward_start = today
         d1, fixing_day = start, cal.adjust(start, "P")
         while d1 < today:
             d2 = cal.add_business_days(d1, 1)
-            prod *= 1.0 + past(fixing_day) * year_fraction(d1, d2, day_count)
+            prod *= 1.0 + past(fixing_day) * year_fraction(d1, min(d2, end), day_count)
             fixing_day = d1 = d2
         if today < end and today in fixings:
             accrual_end = min(cal.add_business_days(today, 1), end)

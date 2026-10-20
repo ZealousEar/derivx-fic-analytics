@@ -191,10 +191,15 @@ class RateFuture:
 
     def _overnight_fixings(self, market: Market, start: Date) -> Dict[Date, float]:
         """SOFR fixings for the days of the period before the valuation
-        date: published ones (``index_fixings['SOFR']``), else daily
-        forwards of the fixings curve on or after its own date."""
+        date: published ones (``index_fixings['SOFR']``, else the fixings the
+        curves were bootstrapped with), else daily forwards of the fixings
+        curve on or after its own date."""
 
-        published = dict(market.index_fixings.get("SOFR", {}))
+        published = {
+            **market.fixing_curve.overnight_fixings,
+            **market.curve.overnight_fixings,
+            **market.index_fixings.get("SOFR", {}),
+        }
         if market.fixings is None or start >= market.asof:
             return published
         cal = market.curve.conventions.cal
@@ -208,11 +213,12 @@ class RateFuture:
         return published
 
     def forward(self, market: Market) -> float:
-        """Curve rate for the reference period (before convexity)."""
+        """Curve rate for the reference period (before convexity). Once the
+        rate is set (a ``FUT`` past its fixing, an ``SR1``/``SR3`` past its
+        period) it is the final settlement rate, from fixings, so a position
+        keeps its variation margin to the horizon of a carry scenario."""
 
         start, end = self.period(market.asof)
-        if end <= market.asof:
-            raise ValueError(f"{self.kind} {self.contract} expired on {end}")
         if self.kind == "FUT":
             index = get_index(self.index)
             return market.index_rate(index.name, start, end, index.day_count, index.fixing_date(start))
@@ -230,13 +236,14 @@ class RateFuture:
         if self.convexity is None:
             return 0.0
         start, end = self.period(market.asof)
+        fixed = get_index(self.index).fixing_date(start) < market.asof if self.kind == "FUT" else end <= market.asof
+        if fixed:
+            return 0.0  # the rate is set: no more convexity
         forward = self.forward(market) if forward is None else forward
         t1, t2 = (start - market.asof).days / 365.0, (end - market.asof).days / 365.0
         a, sigma = self.convexity.mean_reversion, self.convexity.sigma
         if self.kind == "FUT":
-            if t1 <= 0:
-                return 0.0  # fixed: no more convexity
-            ca = lambda r: hw_term_futures_convexity(r, t1, t2, sigma, a)  # noqa: E731
+            ca = lambda r: hw_term_futures_convexity(r, max(t1, 0.0), t2, sigma, a)  # noqa: E731
         else:
             averaging = "compound" if self.kind == "SR3" else "average"
             ca = lambda r: hw_overnight_futures_convexity(r, t1, t2, sigma, a, averaging)  # noqa: E731

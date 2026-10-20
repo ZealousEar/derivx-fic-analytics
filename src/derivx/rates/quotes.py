@@ -28,6 +28,7 @@ from .indices import FUTURES_KINDS, contract_label, futures_rate_from_price, par
 _FRA_LABEL = re.compile(r"^\s*(\d{1,3})\s*[Xx\u00d7]\s*(\d{1,3})\s*$")
 
 RATE_RANGE = (-0.05, 0.30)  # accepted after unit conversion
+SPREAD_RANGE = (-0.02, 0.02)  # tenor basis spreads: a few bp to tens of bp; 200bp would be a units slip
 UNIT_SCALE = {"decimal": 1.0, "percent": 0.01, "bp": 1e-4}
 
 
@@ -156,6 +157,16 @@ def clean_quotes(
             if not RATE_RANGE[0] <= value <= RATE_RANGE[1]:
                 issues.append(
                     Issue("error", f"row {n}: {value:.4%} is outside {RATE_RANGE[0]:.0%} to {RATE_RANGE[1]:.0%}")
+                )
+                continue
+            if kind in SPREAD_KINDS and not SPREAD_RANGE[0] <= value <= SPREAD_RANGE[1]:
+                issues.append(
+                    Issue(
+                        "error",
+                        f"row {n}: a {value * 1e4:,.1f}bp basis spread is outside {SPREAD_RANGE[0] * 1e4:+.0f} to "
+                        f"{SPREAD_RANGE[1] * 1e4:+.0f}bp: spreads are in the table's units ({units}; 8bp is "
+                        f"{8e-4 / scale:g})",
+                    )
                 )
                 continue
             if isinstance(tenor, str):  # FRA label

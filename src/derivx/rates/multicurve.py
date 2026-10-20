@@ -192,6 +192,7 @@ class ProjectionInstrument:
         basis: Optional[Curve] = None,
         basis_index: Optional[TermIndex] = None,
         convexity: Optional[HullWhite] = None,
+        _dfs: Optional[Tuple[Mapping[Date, float], Mapping[Date, float]]] = None,
     ):
         kind = quote.kind.strip().upper()
         if kind not in PROJECTION_KINDS:
@@ -214,28 +215,35 @@ class ProjectionInstrument:
             self.convexity_adjustment = hw_term_futures_convexity(
                 quote.rate, t1, t2, convexity.sigma, convexity.mean_reversion
             )
-        self._cache()
+        self._cache(*(_dfs or ({}, {})))
 
-    def _cache(self) -> None:
+    def _cache(self, discount_dfs: Mapping[Date, float], basis_dfs: Mapping[Date, float]) -> None:
         """Times (ACT/365F) and discount-curve factors, fixed while the
-        projection curve is solved, as arrays for vectorised valuation."""
+        projection curve is solved, as arrays for vectorised valuation
+        (``discount_dfs`` / ``basis_dfs``: factors already looked up for
+        these dates, see :func:`_prefetch`)."""
+
+        def on(curve: Curve, table: Mapping[Date, float], dates: List[Date]) -> np.ndarray:
+            if dates and all(d in table for d in dates):
+                return np.array([table[d] for d in dates], dtype=float)
+            return np.asarray(curve.df(dates), dtype=float)
 
         to_t = lambda d: (d - self.asof).days / 365.0  # noqa: E731
         self._t = np.array([to_t(self.start), to_t(self.end)])
         self._tau = self.index.accrual(self.start, self.end)
         if self.fixed:
-            fixed_df = np.asarray(self.discount.df([e for _, e, _ in self.fixed]), dtype=float)
+            fixed_df = on(self.discount, discount_dfs, [e for _, e, _ in self.fixed])
             self._fixed_annuity = float(np.dot([tau for _, _, tau in self.fixed], fixed_df))
         self._flt_s = np.array([to_t(s) for s, _, _ in self.floating])
         self._flt_e = np.array([to_t(e) for _, e, _ in self.floating])
         self._flt_tau = np.array([tau for _, _, tau in self.floating])
-        self._flt_df = np.asarray(self.discount.df([e for _, e, _ in self.floating]), dtype=float)
+        self._flt_df = on(self.discount, discount_dfs, [e for _, e, _ in self.floating])
         self._flt_annuity = float(np.dot(self._flt_tau, self._flt_df)) if self.floating else 0.0
         if self.other:
             # The other leg is fixed while this curve is solved: value it once.
             starts, ends = [s for s, _, _ in self.other], [e for _, e, _ in self.other]
-            growth = np.asarray(self.basis.df(starts)) / np.asarray(self.basis.df(ends))
-            self._other_pv = float(np.dot(growth - 1.0, np.asarray(self.discount.df(ends))))
+            growth = on(self.basis, basis_dfs, starts) / on(self.basis, basis_dfs, ends)
+            self._other_pv = float(np.dot(growth - 1.0, on(self.discount, discount_dfs, ends)))
 
     @property
     def years(self) -> float:
@@ -331,9 +339,15 @@ class ProjectionCurve(Curve):
         basis: Optional[Curve] = None,
     ) -> "ProjectionCurve":
         """Rebuild from the same quotes bumped in bp, on ``discount`` (and
-        ``basis``) when given, else on the curves it was built on."""
+        ``basis``) when given, else on the curves it was built on. On a later
+        ``asof`` (carry, roll-down) a future that has fixed by then is
+        dropped: its rate is a fixing, no longer a quote of the curve."""
 
         quotes = self.bumped_quotes(bumps_bp)
+        if asof is not None and asof > self.asof:
+            quotes = [q for q, inst in zip(quotes, self.instruments) if not _fixed_by(inst, asof)]
+            if not quotes:
+                raise ValueError(f"every quote of the {self.index.name} curve has fixed by {asof}")
         discount = discount if discount is not None else self.discount
         basis = basis if basis is not None else self.basis
         same_inputs = (asof is None or asof == self.asof) and discount is self.discount and basis is self.basis
@@ -347,6 +361,7 @@ class ProjectionCurve(Curve):
             convexity=self.convexity,
             _known=self.unchanged_pillars(quotes) if same_inputs else (),
             _guess=self.dfs[1:] if asof is None or asof == self.asof else (),
+            _jacobian=self.solver_jacobian() if asof is None or asof == self.asof else None,
         )
 
     def forward(self, start: Date, end: Optional[Date] = None) -> float:
@@ -355,6 +370,47 @@ class ProjectionCurve(Curve):
 
         end = end or self.index.maturity_date(start)
         return self.forward_rate(start, end, self.index.day_count)
+
+
+def _prefetch(
+    quotes: Sequence[CurveQuote],
+    asof: Date,
+    index: TermIndex,
+    discount: Curve,
+    basis: Optional[Curve],
+    basis_index: Optional[TermIndex],
+) -> Tuple[Dict[Date, float], Dict[Date, float]]:
+    """Discount (and basis curve) factors at every payment date the quotes'
+    instruments use, each curve interpolated once (a rebuild of a bumped
+    curve set builds every instrument again). Quotes that do not resolve are
+    skipped: building their instrument raises the error."""
+
+    pay, other = set(), set()
+    for quote in quotes:
+        kind = quote.kind.strip().upper()
+        if kind not in PROJECTION_KINDS:
+            continue
+        try:
+            dates = _resolve_dates(kind, str(quote.tenor).strip().upper(), asof, index, basis_index)
+        except ValueError:
+            continue
+        pay.update(e for _, e, _ in dates.fixed + dates.floating + dates.other)
+        other.update(d for s, e, _ in dates.other for d in (s, e))
+
+    def table(curve: Optional[Curve], days: set) -> Dict[Date, float]:
+        if curve is None or not days:
+            return {}
+        days = sorted(days)
+        return dict(zip(days, np.asarray(curve.df(days), dtype=float)))
+
+    return table(discount, pay), table(basis, other)
+
+
+def _fixed_by(inst: ProjectionInstrument, asof: Date) -> bool:
+    """Whether a futures quote has fixed before ``asof`` (and so cannot be
+    an instrument of a curve dated ``asof``)."""
+
+    return inst.kind == "FUT" and inst.index.fixing_date(inst.start) < asof
 
 
 def bootstrap_projection(
@@ -369,6 +425,7 @@ def bootstrap_projection(
     max_passes: int = 50,
     _known: Sequence[float] = (),
     _guess: Sequence[float] = (),
+    _jacobian: Optional[np.ndarray] = None,
 ) -> ProjectionCurve:
     """Dual-curve bootstrap of ``index``'s projection curve given the
     ``discount`` curve (and ``basis``, the other index's curve, for
@@ -390,8 +447,9 @@ def bootstrap_projection(
             raise ValueError(f"the {basis_index.name} curve is dated {basis.asof}, the projection curve {asof}")
     if not quotes:
         raise ValueError(f"the {index.name} curve needs at least one quote")
-    built = [ProjectionInstrument(q, asof, index, discount, basis, basis_index, convexity) for q in quotes]
-    instruments, times, dfs = solve_pillars(asof, built, interpolation, tol, max_passes, _known, _guess)
+    looked_up = _prefetch(quotes, asof, index, discount, basis, basis_index)
+    built = [ProjectionInstrument(q, asof, index, discount, basis, basis_index, convexity, looked_up) for q in quotes]
+    instruments, times, dfs = solve_pillars(asof, built, interpolation, tol, max_passes, _known, _guess, _jacobian)
     return ProjectionCurve(
         asof,
         times,
