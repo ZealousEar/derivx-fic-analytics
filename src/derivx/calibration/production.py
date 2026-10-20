@@ -35,7 +35,7 @@ ACT/365F years; SVI parameters are total-variance parameters for ``tau``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -166,6 +166,68 @@ def spread_weights(quotes: pd.DataFrame, floor: float = 1e-4) -> np.ndarray:
     return np.where(finite, w, w[finite].min())
 
 
+def clean_chain(
+    chain: pd.DataFrame,
+    *,
+    trade_date=None,
+    rate: float = 0.0,
+    div_yield: float = 0.0,
+    min_days: float = 1.0,
+    hygiene: Optional[Dict[str, object]] = None,
+) -> Tuple[List[Tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame, CleanSlice]], List[SkippedSlice]]:
+    """Step 1 of the module pipeline for every (trade_date, expiry) group:
+    :func:`clean_option_slice`, then, for a slice whose put-call parity
+    failed, the forward interpolated (ln F linear in T) from the parity
+    forwards of the same trade date. Returns ``[(trade_date, expiry, rows,
+    clean)]`` and the groups that could not be cleaned (with the reason).
+    Expired and too-short slices are returned (``clean.days < min_days``)
+    for the caller to report."""
+
+    if chain is None or chain.empty:
+        return [], []
+    if "expiry" not in chain.columns:
+        raise ValueError("Chain must contain 'expiry' column")
+    skipped: List[SkippedSlice] = []
+    hyg = dict(hygiene or {})
+    cleaned = []
+    for (td, exp), group in _groups(chain, trade_date):
+        try:
+            clean = clean_option_slice(group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, **hyg)
+        except ValueError as exc:
+            skipped.append(SkippedSlice(td, exp, str(exc), len(group)))
+            continue
+        cleaned.append((td, exp, group, clean))
+    # Parity failed (too few consistent call/put pairs, typical for long expiries after liquidity
+    # filters)? Interpolate that forward from the parity forwards of the same trade date instead of
+    # assuming spot exp((rate - div_yield) T), which with unknown rates is the spot itself.
+    parity: Dict[pd.Timestamp, List[tuple]] = {}
+    for td, _, _, clean in cleaned:
+        if clean.forward_method == "parity" and clean.tau > 0:
+            parity.setdefault(td, []).append((clean.tau, clean.forward))
+    for i, (td, exp, group, clean) in enumerate(cleaned):
+        known = parity.get(td, [])
+        if clean.forward_method != "carry" or clean.tau <= 0 or not known or "forward" in hyg:
+            continue
+        fwd = interpolate_forward(clean.tau, clean.spot, known)
+        source = (
+            f"interpolated from {len(known)} parity forward(s) of this trade date (ln F linear in T); "
+            f"parity here: {clean.forward_source}"
+        )
+        clean = clean_option_slice(
+            group,
+            trade_date=td,
+            rate=rate,
+            div_yield=div_yield,
+            min_days=min_days,
+            forward=fwd,
+            forward_source=source,
+            **hyg,
+        )
+        clean.forward_method = "interpolated"
+        cleaned[i] = (td, exp, group, clean)
+    return cleaned, skipped
+
+
 def calibrate_chain(
     chain: pd.DataFrame,
     *,
@@ -210,44 +272,9 @@ def calibrate_chain(
     if "expiry" not in chain.columns:
         raise ValueError("Chain must contain 'expiry' column")
     slices: List[CalibratedSlice] = []
-    skipped: List[SkippedSlice] = []
-    hyg = dict(hygiene or {})
-    cleaned = []
-    for (td, exp), group in _groups(chain, trade_date):
-        try:
-            clean = clean_option_slice(group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, **hyg)
-        except ValueError as exc:
-            skipped.append(SkippedSlice(td, exp, str(exc), len(group)))
-            continue
-        cleaned.append((td, exp, group, clean))
-    # Parity failed (too few consistent call/put pairs, typical for long expiries after liquidity
-    # filters)? Interpolate that forward from the parity forwards of the same trade date instead of
-    # assuming spot exp((rate - div_yield) T), which with unknown rates is the spot itself.
-    parity: Dict[pd.Timestamp, List[tuple]] = {}
-    for td, _, _, clean in cleaned:
-        if clean.forward_method == "parity" and clean.tau > 0:
-            parity.setdefault(td, []).append((clean.tau, clean.forward))
-    for i, (td, exp, group, clean) in enumerate(cleaned):
-        known = parity.get(td, [])
-        if clean.forward_method != "carry" or clean.tau <= 0 or not known or "forward" in hyg:
-            continue
-        fwd = interpolate_forward(clean.tau, clean.spot, known)
-        source = (
-            f"interpolated from {len(known)} parity forward(s) of this trade date (ln F linear in T); "
-            f"parity here: {clean.forward_source}"
-        )
-        clean = clean_option_slice(
-            group,
-            trade_date=td,
-            rate=rate,
-            div_yield=div_yield,
-            min_days=min_days,
-            forward=fwd,
-            forward_source=source,
-            **hyg,
-        )
-        clean.forward_method = "interpolated"
-        cleaned[i] = (td, exp, group, clean)
+    cleaned, skipped = clean_chain(
+        chain, trade_date=trade_date, rate=rate, div_yield=div_yield, min_days=min_days, hygiene=hygiene
+    )
     for td, exp, group, clean in cleaned:
         if clean.days < min_days:
             skipped.append(SkippedSlice(td, exp, f"expired or same-day (tau = {clean.tau:.4f}y)", len(group)))
