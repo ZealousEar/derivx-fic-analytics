@@ -21,9 +21,10 @@ def golden():
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch, tmp_path_factory):
-    """Tests never touch the network or the developer's download cache:
-    fetchers run offline against an empty temporary cache unless a test
-    serves recorded fixtures through ``rates_sources._urlopen`` itself."""
+    """Tests never touch the network, the developer's download cache or
+    their API keys: fetchers run offline against an empty temporary cache,
+    without a FRED key, unless a test serves recorded fixtures through
+    ``rates_sources._urlopen`` (or sets a key) itself."""
 
     from derivx.data import rates_sources
 
@@ -31,5 +32,6 @@ def no_network(monkeypatch, tmp_path_factory):
         raise urllib.error.URLError(f"network disabled in tests ({request.full_url})")
 
     monkeypatch.setattr(rates_sources, "_urlopen", blocked)
+    monkeypatch.delenv(rates_sources.FRED_KEY_ENV, raising=False)  # a developer's FRED key switches the endpoint
     monkeypatch.setenv("DERIVX_OFFLINE", "1")
     monkeypatch.setenv("DERIVX_CACHE_DIR", str(tmp_path_factory.mktemp("derivx-cache")))
