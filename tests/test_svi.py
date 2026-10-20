@@ -249,3 +249,47 @@ def test_multi_start_is_never_worse_than_a_single_start():
     many = fit_svi_strike_slice(K, vols, F, T, loss="linear", n_starts=6)
     assert many.n_starts > one.n_starts == 1
     assert many.rmse <= one.rmse * (1 + 1e-9)
+
+
+def test_short_dated_small_b_is_not_flagged_at_its_bound():
+    """Review: b = 0.002 on a 1-day slice was flagged 'at bound' because the
+    tolerance was 0.1% of the [0, 4] box (0.004)."""
+
+    T = 1 / 365
+    true = {"a": 0.15**2 * T * 0.5, "b": 0.002, "rho": -0.6, "m": 0.002, "sigma": 0.004}
+    F = 765.0
+    K = F * np.exp(np.linspace(-0.02, 0.015, 25))
+    fit = fit_svi_strike_slice(K, svi_iv(K, true, F, T), F, T, loss="linear")
+    assert fit.b == pytest.approx(0.002, rel=1e-4)
+    assert not fit.at_bound["b"] and not any(fit.at_bound.values())
+    flat = fit_svi_strike_slice(K, np.full(K.size, 0.15), F, T, loss="linear")
+    assert flat.at_bound["b"]  # a flat smile really has b at 0
+
+
+def test_ssvi_slice_start_is_butterfly_free_by_construction():
+    """The enforcement fallback/start: SSVI slices with theta phi (1 + |rho|)
+    < 4 and theta phi^2 (1 + |rho|) <= 4 have g >= 0 (Gatheral-Jacquier
+    2014, Theorem 4.2), whatever the data."""
+
+    from derivx.vol.svi import SVI_PARAMS, _fit_ssvi_slice, _x_to_raw
+
+    rng = np.random.default_rng(5)
+    for _ in range(20):
+        T = rng.uniform(0.01, 3.0)
+        k = np.sort(rng.uniform(-0.6, 0.4, 15))
+        vols = np.abs(0.2 + 0.3 * rng.standard_normal(15) * np.abs(k)) + 0.05
+        x, _ = _fit_ssvi_slice(k, vols, T, np.ones(15), "linear", None)
+        p = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(x))))
+        assert check_butterfly(p).ok and lee_wing_check(p)["lee_ok"]
+
+
+def test_enforcement_reports_how_the_arbitrage_was_removed():
+    K = np.exp(np.linspace(-1.0, 1.4, 25))
+    vols = svi_iv(K, VOGT, 1.0, 1.0)
+    fixed = fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="linear", enforce_no_arbitrage=True)
+    assert fixed.arbitrage_repair in ("constrained", "ssvi_slice") and fixed.success
+    assert fixed.rmse_bp < 70  # Vogt's smile is itself arbitrageable: some error is the price of removing it
+    free = fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="linear")
+    assert free.arbitrage_repair == "none" and not free.penalised
+    with pytest.raises(ValueError, match="loss"):
+        fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="l1")

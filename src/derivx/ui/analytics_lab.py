@@ -410,9 +410,12 @@ def _render_calibration_tab():
     )
     band = st.slider("Moneyness band", 0.7, 1.3, (0.85, 1.15), step=0.01)
     enforce = st.checkbox(
-        "Enforce no-arbitrage (penalise butterfly / Lee violations)",
+        "Enforce no-arbitrage (constrained refit: butterfly g(k) >= 0, Lee wings)",
         value=True,
-        help="Butterfly (Gatheral g(k) >= 0), Lee wing and calendar checks are always reported.",
+        help=(
+            "An arbitrageable fit is replaced by a constrained SVI fit (or an arbitrage-free SSVI slice). "
+            "Butterfly (Gatheral g(k) >= 0), Lee wing and calendar checks are always reported."
+        ),
     )
 
     run = st.button("Calibrate slices", width="stretch")
@@ -450,6 +453,9 @@ def _render_calibration_tab():
         rows.append(
             {
                 "Expiry": slc.expiry.date(),
+                "Forward": slc.forward,
+                "Forward from": diag.get("forward_method"),
+                "IVs": diag.get("iv_source"),
                 "Points": slc.n_points,
                 "RMSE (vol bp)": slc.rmse * 1e4,
                 "CV RMSE (vol bp)": bench.get("rmse_svi_cv", np.nan) * 1e4,
@@ -463,6 +469,12 @@ def _render_calibration_tab():
             }
         )
     st.dataframe(pd.DataFrame(rows), width="stretch")
+    st.caption(
+        "Forward from: 'parity' = put-call parity on the slice's own mids; 'interpolated' = ln F linear in T between "
+        "the parity forwards of the other selected expiries; 'carry' = spot (no rate or dividend input here). "
+        "IVs: 'mid' = re-inverted from bid/ask mids with Black-76 on that forward at a 0% discount rate (the chain "
+        "carries no rate, so levels are biased low by roughly rate x T in price terms); 'quoted' = the vendor's vols."
+    )
 
     options = [f"{slc.expiry.date()}" for slc in results]
     selected = st.selectbox("Visualize expiry", options) if options else None

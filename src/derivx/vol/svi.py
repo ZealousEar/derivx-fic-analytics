@@ -21,6 +21,16 @@ Conventions
   and ``b (1 + rho)`` (right), must be <= 2.
 * Calendar arbitrage: w(k, T) must be non-decreasing in T at every k
   (slices compared at the same forward log-moneyness).
+* Enforcing no arbitrage (``fit_svi_strike_slice(enforce_no_arbitrage=
+  True)``): when the free fit fails the butterfly or Lee check, it is
+  replaced by a constrained fit (SLSQP with ``g(k) >= 1e-4`` on the check
+  grid and both Lee slopes <= 2), started from the free fit and from an
+  SSVI slice ``w = theta/2 (1 + rho phi k + sqrt((phi k + rho)^2 + 1 -
+  rho^2))`` with ``theta phi (1 + |rho|) < 4`` and ``theta phi^2 (1 + |rho|)
+  <= 4``, which is free of butterfly arbitrage by construction
+  (Gatheral-Jacquier 2014, Theorem 4.2). The best start that passes the
+  final checks is kept; if the constrained fit fails, the SSVI slice itself
+  is returned (``arbitrage_repair`` says which).
 """
 
 from __future__ import annotations
@@ -30,14 +40,14 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 
 SVI_PARAMS = ("a", "b", "rho", "m", "sigma")
 LEE_MAX_SLOPE = 2.0
 _RHO_MAX = 0.999
-_PENALTY = 10.0  # weight (vol units per unit of g) of the arbitrage penalties
-_G_MARGIN = 1e-3  # penalised fits aim for g >= 1e-3 on the penalty grid
-_PENALISED_MAX_NFEV = 300  # the penalty is not smooth: cap the refit; the final check reports what remains
+_G_MARGIN = 1e-4  # constrained fits keep g >= 1e-4 on their constraint grid
+_LEE_MARGIN = 1e-6
+LOSSES = ("linear", "soft_l1", "huber", "cauchy", "arctan")
 
 
 def _get(params: Mapping, name: str) -> float:
@@ -336,7 +346,8 @@ class SviFit(Mapping):
     market_vols: np.ndarray = field(repr=False)
     model_vols: np.ndarray = field(repr=False)
     weights: np.ndarray = field(repr=False)
-    penalised: bool = False  # True when the arbitrage penalties were applied (enforce and the free fit failed)
+    penalised: bool = False  # True when enforce_no_arbitrage replaced an arbitrageable free fit
+    arbitrage_repair: str = "none"  # 'none', 'constrained', 'ssvi_slice' or 'failed' (see module docs)
 
     def __getitem__(self, key: str) -> float:
         if key not in SVI_PARAMS:
@@ -395,6 +406,7 @@ class SviFit(Mapping):
             "butterfly_min_g": self.butterfly.min_g,
             "butterfly_ok": self.butterfly.ok,
             **self.lee,
+            "arbitrage_repair": self.arbitrage_repair,
             "at_bound": ", ".join(k for k, v in self.at_bound.items() if v),
             "success": self.success,
         }
@@ -473,12 +485,15 @@ def fit_svi_strike_slice(
         loss down-weights a quote (``n_downweighted`` reports how many).
         ``loss='linear'`` is plain least squares.
     enforce_no_arbitrage : when the free fit has butterfly or Lee arbitrage,
-        refit with penalties for g(k) < 1e-3 on the checked k range
-        (``check_grid``, default that of :func:`default_k_grid`) and for Lee
-        slopes above 2; the result's ``butterfly`` / ``lee`` checks report
-        what remains (penalties do not guarantee exactness).
+        replace it with a constrained fit (see module docs: g(k) >= 1e-4 on
+        a dense grid around m and the quotes, or on ``check_grid`` when
+        given, and Lee slopes <= 2), or with an arbitrage-free SSVI slice
+        if that fails; ``penalised`` / ``arbitrage_repair`` say what
+        happened and the ``butterfly`` / ``lee`` checks report the result.
     n_starts : start points (from a quasi-explicit linear fit over (m,
-        sigma)); ``x0`` (params) replaces them with one warm start.
+        sigma), best-seeded first); the search stops early once two starts
+        reach the same optimum (``n_starts`` of the result counts the runs).
+        ``x0`` (params) replaces them with one warm start.
 
     The constraint ``a + b sigma sqrt(1-rho^2) >= 0`` is imposed exactly by
     fitting the minimum variance instead of ``a`` (``a`` may be negative).
@@ -493,6 +508,8 @@ def fit_svi_strike_slice(
     ivs = np.asarray(list(ivs) if not isinstance(ivs, np.ndarray) else ivs, dtype=float).ravel()
     if Ks.shape != ivs.shape:
         raise ValueError(f"Ks and ivs must have the same length ({Ks.size} vs {ivs.size})")
+    if loss not in LOSSES:
+        raise ValueError(f"loss must be one of {LOSSES}, got {loss!r}")
     if F is None or not np.isfinite(F) or F <= 0:
         raise ValueError("F (the forward, > 0) is required: SVI is fitted in k = ln(K/F)")
     if T is None or not np.isfinite(T) or T <= 0:
@@ -532,33 +549,18 @@ def fit_svi_strike_slice(
     if f_scale is None:
         f_scale = 0.005
     fixed_grid = None if check_grid is None else np.asarray(check_grid, dtype=float)
-    quoted = np.linspace(kmin, kmax, 41)
-
-    def penalty_grid(m: float, sigma: float) -> np.ndarray:
-        """The range :func:`default_k_grid` checks (fixed length)."""
-
-        if fixed_grid is not None:
-            return fixed_grid
-        return np.concatenate([m + np.linspace(-3.0, 3.0, 241), m + sigma * np.linspace(-10.0, 10.0, 81), quoted])
-
     big = 10.0 * float(vols.max())
 
-    def resid(x: np.ndarray, penalise: bool = False) -> np.ndarray:
+    def resid(x: np.ndarray) -> np.ndarray:
         a, b, rho, m, sigma = _x_to_raw(x)
         w = _raw_w(k, a, b, rho, m, sigma)
         out = wts * (np.sqrt(np.maximum(w, 0.0) / T) - vols)
         if not np.all(np.isfinite(out)):
             out = np.full(K.size, big)
-        if not penalise:
-            return out
-        p = {"a": a, "b": b, "rho": rho, "m": m, "sigma": sigma}
-        g = butterfly_density(penalty_grid(m, sigma), p)
-        pen_g = np.where(np.isfinite(g), np.maximum(_G_MARGIN - g, 0.0), 1.0)
-        pen_lee = max(0.0, b * (1.0 + abs(rho)) - (LEE_MAX_SLOPE - _G_MARGIN))
-        return np.concatenate([out, _PENALTY * pen_g, [_PENALTY * pen_lee]])
+        return out
 
     def jac(x: np.ndarray) -> np.ndarray:
-        """Analytic Jacobian of the unpenalised residuals in (min_variance,
+        """Analytic Jacobian of the weighted vol residuals in (min_variance,
         b, rho, m, sigma), with a = min_variance - b sigma sqrt(1 - rho^2)."""
 
         wmin, b, rho, m, sigma = x
@@ -583,38 +585,43 @@ def fit_svi_strike_slice(
     else:
         omega = wts / (2.0 * np.maximum(vols, 1e-4) * T)
         starts = _seeds(k, w_obs, omega, lb, ub, max(1, int(n_starts)))
-    best = None
+    best, runs = None, 0
     for xs in starts:
         res = least_squares(
             resid, x0=xs, jac=jac, bounds=(lb, ub), loss=loss, f_scale=f_scale, x_scale="jac", max_nfev=3000
         )
+        runs += 1
+        agree = best is not None and abs(res.cost - best.cost) <= 1e-6 * max(res.cost, best.cost, 1e-300)
         if best is None or res.cost < best.cost:
             best = res
-    penalised = False
+        if agree:  # two starts reached the same optimum: the remaining (worse-seeded) starts are not run
+            break
+    x_fit, success, message, nfev = best.x, bool(best.success), str(best.message), int(best.nfev)
+    penalised, repair = False, "none"
     if enforce_no_arbitrage:
-        p_free = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(best.x))))
+        p_free = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(x_fit))))
         free_ok = check_butterfly(p_free, default_k_grid(p_free, (kmin, kmax))).ok and lee_wing_check(p_free)["lee_ok"]
-        if not free_ok:  # refit from the unconstrained optimum with the arbitrage penalties
-            best = least_squares(
-                lambda x: resid(x, True),
-                x0=best.x,
-                bounds=(lb, ub),
-                loss=loss,
-                f_scale=f_scale,
-                x_scale="jac",
-                max_nfev=_PENALISED_MAX_NFEV,
+        if not free_ok:
+            repaired = _arbitrage_free_refit(
+                x_fit, k, vols, T, wts, loss, f_scale, lb, ub, (kmin, kmax), resid, jac, fixed_grid
             )
-            penalised = True
-    a, b, rho, m, sigma = _x_to_raw(best.x)
+            x_fit, repair, ok, extra_nfev, message = repaired
+            penalised, success, nfev = True, ok, nfev + extra_nfev
+    a, b, rho, m, sigma = _x_to_raw(x_fit)
     params = {"a": float(a), "b": float(b), "rho": float(rho), "m": float(m), "sigma": float(sigma)}
     model = np.sqrt(np.maximum(_raw_w(k, a, b, rho, m, sigma), 0.0) / T)
     err = model - vols
     n = K.size
-    J = best.jac[:n]
+    J = jac(np.asarray(x_fit, dtype=float))  # weighted residual Jacobian (vol units) at the solution
+    # A parameter is at a bound when it sits within 0.1% of the box width of it; for b's lower bound the
+    # tolerance is 0.1% of its natural size (max total variance per unit of quoted k), so a short-dated
+    # slice's small but real b (e.g. 0.002 at 1 day) is not flagged against a box of width 4.
+    b_scale = float(w_obs.max()) / span
     at_bound = {}
     for i, name in enumerate(_X_NAMES):
         width = ub[i] - lb[i]
-        at_bound[name] = bool(best.x[i] - lb[i] <= 1e-3 * width or ub[i] - best.x[i] <= 1e-3 * width)
+        tol_lo = 1e-3 * (min(width, b_scale) if name == "b" else width)
+        at_bound[name] = bool(x_fit[i] - lb[i] <= tol_lo or ub[i] - x_fit[i] <= 1e-3 * width)
     try:
         sv = np.linalg.svd(J, compute_uv=False)
         cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
@@ -626,7 +633,7 @@ def fit_svi_strike_slice(
         se = {name: float(np.sqrt(max(cov[i, i], 0.0))) for i, name in enumerate(_X_NAMES)}
     except np.linalg.LinAlgError:
         se = dict.fromkeys(_X_NAMES, float("inf"))
-    grid = default_k_grid(params, (kmin, kmax))
+    grid = default_k_grid(params, (kmin, kmax)) if fixed_grid is None else fixed_grid
     return SviFit(
         **params,
         T=T,
@@ -636,10 +643,10 @@ def fit_svi_strike_slice(
         n_points=int(n),
         n_dropped=n_dropped,
         at_bound=at_bound,
-        success=bool(best.success),
-        message=str(best.message),
-        nfev=int(best.nfev),
-        n_starts=len(starts),
+        success=bool(success),
+        message=message,
+        nfev=int(nfev),
+        n_starts=runs,
         jacobian_condition=cond,
         param_se=se,
         butterfly=check_butterfly(params, grid),
@@ -653,4 +660,184 @@ def fit_svi_strike_slice(
         model_vols=model,
         weights=wts,
         penalised=penalised,
+        arbitrage_repair=repair,
     )
+
+
+# ---------------------------------------------------------------------------
+# Arbitrage-free refit
+# ---------------------------------------------------------------------------
+
+
+def _loss_rho(z: np.ndarray, loss: str) -> Tuple[np.ndarray, np.ndarray]:
+    """scipy.optimize.least_squares' ``rho(z)`` and ``rho'(z)`` for ``z =
+    (r / f_scale)^2``."""
+
+    if loss == "linear":
+        return z, np.ones_like(z)
+    if loss == "soft_l1":
+        t = np.sqrt(1.0 + z)
+        return 2.0 * (t - 1.0), 1.0 / t
+    if loss == "huber":
+        small = z <= 1.0
+        root = np.sqrt(np.maximum(z, 1.0))
+        return np.where(small, z, 2.0 * root - 1.0), np.where(small, 1.0, 1.0 / root)
+    if loss == "cauchy":
+        return np.log1p(z), 1.0 / (1.0 + z)
+    if loss == "arctan":
+        return np.arctan(z), 1.0 / (1.0 + z * z)
+    raise ValueError(f"loss must be one of {LOSSES}, got {loss!r}")
+
+
+def _g_raw(k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float) -> np.ndarray:
+    """Gatheral's g(k) without parameter validation (NaN where w <= 0)."""
+
+    u = k - m
+    R = np.sqrt(u * u + sigma * sigma)
+    w = a + b * (rho * u + R)
+    w1 = b * (rho + u / R)
+    w2 = b * sigma * sigma / R**3
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = (1.0 - k * w1 / (2.0 * w)) ** 2 - 0.25 * w1 * w1 * (1.0 / w + 0.25) + 0.5 * w2
+    return np.where(w > 0, g, np.nan)
+
+
+def _ssvi_slice_x(theta: float, rho: float, phi: float) -> np.ndarray:
+    """(min_variance, b, rho, m, sigma) of the SSVI slice (theta, rho, phi)."""
+
+    c = np.sqrt(1.0 - rho * rho)
+    a, b, m, sigma = 0.5 * theta * (1.0 - rho * rho), 0.5 * theta * phi, -rho / phi, c / phi
+    return _raw_to_x(a, b, rho, m, sigma)
+
+
+def _fit_ssvi_slice(k, vols, T, wts, loss, f_scale) -> Tuple[np.ndarray, int]:
+    """Best SSVI slice in the Gatheral-Jacquier butterfly-free region,
+    parameterised by (theta, rho, u) with ``phi = u * min(4 / c, sqrt(4 / c))``,
+    ``c = theta (1 + |rho|)`` and ``0 < u < 1``."""
+
+    w_obs = vols * vols * T
+    order = np.argsort(k)
+    theta0 = float(max(np.interp(0.0, k[order], w_obs[order]), 1e-12))
+
+    def phi_of(theta, rho, u):
+        c = theta * (1.0 + abs(rho))
+        return u * min(4.0 / c, np.sqrt(4.0 / c))
+
+    def resid(y):
+        theta, rho, u = y
+        phi = phi_of(theta, rho, u)
+        w = 0.5 * theta * (1.0 + rho * phi * k + np.sqrt((phi * k + rho) ** 2 + 1.0 - rho * rho))
+        return wts * (np.sqrt(np.maximum(w, 0.0) / T) - vols)
+
+    lb = np.array([1e-12, -_RHO_MAX, 1e-4])
+    ub = np.array([4.0 * float(w_obs.max()) + 1e-12, _RHO_MAX, 1.0 - 1e-6])
+    best, nfev = None, 0
+    for rho0, u0 in ((-0.6, 0.5), (-0.2, 0.2), (0.2, 0.5)):
+        y0 = np.clip(np.array([theta0, rho0, u0]), lb + 1e-15, ub - 1e-15)
+        res = least_squares(resid, y0, bounds=(lb, ub), loss=loss, f_scale=f_scale, x_scale="jac", max_nfev=500)
+        nfev += int(res.nfev)
+        if best is None or res.cost < best.cost:
+            best = res
+    theta, rho, u = best.x
+    return _ssvi_slice_x(theta, rho, phi_of(theta, rho, u)), nfev
+
+
+def _passes_checks(x: np.ndarray, k_range: Tuple[float, float], grid: Optional[np.ndarray]) -> Tuple[bool, float]:
+    p = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(x))))
+    try:
+        bf = check_butterfly(p, default_k_grid(p, k_range) if grid is None else grid)
+        lee = lee_wing_check(p)["lee_ok"]
+    except ValueError:
+        return False, -np.inf
+    return bool(bf.ok and lee), float(bf.min_g)
+
+
+def _constraint_grid(xs: Sequence[np.ndarray], k_range: Tuple[float, float]) -> np.ndarray:
+    """Moderate grid for the SLSQP constraints (the dense check grid is added
+    only where a solution dips below zero between these points)."""
+
+    lo, hi = k_range
+    parts = [np.linspace(lo - 1.5, hi + 1.5, 151), np.linspace(lo, hi, 41)]
+    for x in xs:
+        _, _, _, m, sigma = _x_to_raw(x)
+        parts += [np.linspace(m - 3.0, m + 3.0, 61), m + sigma * np.linspace(-6.0, 6.0, 41)]
+    return np.unique(np.concatenate(parts))
+
+
+def _arbitrage_free_refit(x_free, k, vols, T, wts, loss, f_scale, lb, ub, k_range, resid, jac, fixed_grid):
+    """Replace an arbitrageable fit; returns ``(x, repair, ok, nfev, message)``
+    with ``repair`` in {'constrained', 'ssvi_slice', 'failed'} (see module
+    docs). The objective is the same robust loss on the weighted vol
+    residuals as the free fit; among the candidates that pass the final
+    butterfly and Lee checks (SLSQP from the SSVI slice, SLSQP from the free
+    fit only when the first fails, and the SSVI slice itself) the
+    lowest-cost one is kept."""
+
+    x_ssvi, nfev = _fit_ssvi_slice(k, vols, T, wts, loss, f_scale)
+    f2 = 1.0 if loss == "linear" else float(f_scale) ** 2
+
+    def cost_x(x):
+        r = resid(x)
+        rho_z, drho = _loss_rho((r * r) / f2, loss)
+        return 0.5 * f2 * float(np.sum(rho_z)), (drho * r) @ jac(x)
+
+    norm = max(cost_x(x_free)[0], cost_x(x_ssvi)[0], 1e-300)  # SLSQP needs an O(1) objective
+    scale = np.maximum(np.maximum(np.abs(x_free), np.abs(x_ssvi)), np.array([1e-8, 1e-8, 0.1, 1e-3, 1e-4]))
+    lo = lb.copy()
+    lo[0] = max(lo[0], 1e-9 * float(np.max(vols * vols * T)))  # keep w > 0 so g is defined
+    y_lo, y_hi = lo / scale, ub / scale
+    bounds = list(zip(y_lo, y_hi))
+
+    def cost(y):
+        c, grad = cost_x(y * scale)
+        return c / norm, grad * scale / norm
+
+    def constraints(grid):
+        def fun(yy):
+            x = yy * scale
+            g = np.nan_to_num(_g_raw(grid, *_x_to_raw(x)), nan=-1.0) - _G_MARGIN
+            b, rho = x[1], x[2]
+            return np.r_[
+                g, (LEE_MAX_SLOPE - _LEE_MARGIN) - b * (1.0 + rho), (LEE_MAX_SLOPE - _LEE_MARGIN) - b * (1.0 - rho)
+            ]
+
+        return [{"type": "ineq", "fun": fun}]
+
+    candidates = []
+    ok_ssvi, _ = _passes_checks(x_ssvi, k_range, fixed_grid)
+    if ok_ssvi:
+        candidates.append((cost_x(x_ssvi)[0], x_ssvi, "ssvi_slice"))
+    for x_start in (x_ssvi, x_free):
+        if any(c[2] == "constrained" for c in candidates):
+            break  # the start from the (feasible) SSVI slice worked: the free start rarely beats it
+        grid = _constraint_grid([x_free, x_ssvi], k_range) if fixed_grid is None else fixed_grid
+        y = np.clip(x_start, lo, ub) / scale
+        ok = False
+        for _ in range(3):  # add the dense check grid where a solution dipped between constraint points
+            with np.errstate(all="ignore"):
+                res = minimize(
+                    cost,
+                    y,
+                    jac=True,
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=constraints(grid),
+                    options={"maxiter": 500, "ftol": 1e-10},
+                )
+            nfev += int(res.nfev)
+            y = np.clip(res.x, y_lo, y_hi)
+            ok, _ = _passes_checks(y * scale, k_range, fixed_grid)
+            if ok or fixed_grid is not None:
+                break
+            p = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(y * scale))))
+            grid = np.unique(np.r_[grid, default_k_grid(p, k_range)])
+        if ok:
+            candidates.append((cost_x(y * scale)[0], y * scale, "constrained"))
+    if candidates:
+        _, x_best, how = min(candidates, key=lambda c: c[0])
+        message = {
+            "constrained": "constrained SLSQP fit (g(k) >= 1e-4, Lee slopes <= 2): butterfly and Lee checks pass",
+            "ssvi_slice": "arbitrage-free SSVI slice (the constrained fits were not better)",
+        }[how]
+        return x_best, how, True, nfev, message
+    return x_free, "failed", False, nfev, "no arbitrage-free fit found: the free fit is returned and flagged"
