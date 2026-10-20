@@ -87,14 +87,23 @@ class VolGrid:
             raise ValueError("the quotes' shift must be zero or a positive decimal")
         if not self.rows:
             raise ValueError("the vol grid has no quotes")
+        for what, labels in (("option expiry", self.expiries), ("swap tenor", self.tenors)):
+            years: Dict[float, str] = {}
+            for label in labels:
+                y = parse_tenor(label).years
+                if y in years:
+                    raise ValueError(
+                        f"{years[y]} and {label} are the same {what}: quote it once (one label per {what})"
+                    )
+                years[y] = label
 
     @property
     def expiries(self) -> Tuple[str, ...]:
-        return tuple(sorted({r[0] for r in self.rows}, key=lambda t: parse_tenor(t).years))
+        return tuple(sorted({r[0] for r in self.rows}, key=lambda t: (parse_tenor(t).years, t)))
 
     @property
     def tenors(self) -> Tuple[str, ...]:
-        return tuple(sorted({r[1] for r in self.rows}, key=lambda t: parse_tenor(t).years))
+        return tuple(sorted({r[1] for r in self.rows}, key=lambda t: (parse_tenor(t).years, t)))
 
     def smile(self, expiry: str, tenor: str) -> Tuple[np.ndarray, np.ndarray]:
         """(offsets in bp, vols) quoted at one point, by offset."""
@@ -123,12 +132,29 @@ def _offset_label(offset: float) -> str:
 
 
 def _offset_value(label: object) -> float:
-    text = str(label).strip().upper().replace("BP", "")
+    """Strike offset in bp from a label: ``-50``, ``+25bp``, ``ATM``,
+    ``ATM+25`` (a typographic minus counts as a minus)."""
+
+    if isinstance(label, (int, float, np.integer, np.floating)) and not isinstance(label, bool):
+        return float(label)
+    text = str(label).strip().upper().replace("BP", "").replace("\u2212", "-").replace(" ", "")
     if text in ("ATM", "0", "+0", "-0"):
         return 0.0
     if text.startswith("ATM"):
         text = text[3:]
     return float(text)
+
+
+def tenor_label(text: object) -> str:
+    """Canonical label of an option expiry or swap tenor: whole years as
+    ``Y`` (``12M`` -> ``1Y``, ``1.5Y`` -> ``18M``), other months as ``M``,
+    weeks as ``W``, so one point cannot be quoted under two names."""
+
+    tenor = parse_tenor(str(text))
+    months = tenor.months
+    if months is None:
+        return str(tenor)
+    return f"{months // 12}Y" if months % 12 == 0 else f"{months}M"
 
 
 @dataclass(frozen=True)
@@ -157,6 +183,13 @@ def parse_vol_grid(
     cube interpolates between them)."""
 
     issues: List[GridIssue] = []
+    seen: set = set()
+
+    def problem(message: str) -> None:
+        if message not in seen:  # a wide row repeats a bad expiry or tenor once per offset column
+            seen.add(message)
+            issues.append(GridIssue("error", message))
+
     if vol_type not in FITS:
         return None, [GridIssue("error", f"vol type must be one of {FITS}, got {vol_type!r}")]
     allowed = {"normal": ("bp", "decimal"), "lognormal": ("percent", "decimal")}[vol_type]
@@ -165,16 +198,17 @@ def parse_vol_grid(
     scale = {"bp": 1e-4, "percent": 0.01, "decimal": 1.0}[units]
     if raw is None or raw.empty:
         return None, [GridIssue("error", "the vol table is empty")]
-    frame = raw.copy()
+    frame = raw.copy().reset_index(drop=True)
     frame.columns = [str(c).strip() for c in frame.columns]
     lower = {c.lower(): c for c in frame.columns}
     if "expiry" not in lower or "tenor" not in lower:
         return None, [GridIssue("error", "the vol table needs 'expiry' and 'tenor' columns (e.g. 1Y and 10Y)")]
+    table_row = pd.Series(np.arange(1, len(frame) + 1), index=frame.index)  # row number in the user's table
     offset_col = lower.get("offset_bp") or lower.get("offset")
     if offset_col is not None and "vol" in lower:
         long = pd.DataFrame(
-            {"expiry": frame[lower["expiry"]], "tenor": frame[lower["tenor"]], "offset": frame[offset_col],
-             "vol": frame[lower["vol"]]}
+            {"row": table_row, "expiry": frame[lower["expiry"]], "tenor": frame[lower["tenor"]],
+             "offset": frame[offset_col], "vol": frame[lower["vol"]]}
         )  # fmt: skip
     else:
         value_cols = [c for c in frame.columns if c.lower() not in ("expiry", "tenor", "source")]
@@ -187,16 +221,19 @@ def parse_vol_grid(
                 offsets[col] = _offset_value(col)
             except ValueError:
                 return None, [GridIssue("error", f"column {col!r} is not a strike offset in bp (e.g. -50, ATM, +100)")]
-        long = frame.melt(id_vars=[lower["expiry"], lower["tenor"]], value_vars=value_cols, var_name="offset",
-                          value_name="vol")  # fmt: skip
-        long = long.rename(columns={lower["expiry"]: "expiry", lower["tenor"]: "tenor"})
+        wide = frame.assign(_table_row=table_row)
+        long = wide.melt(id_vars=["_table_row", lower["expiry"], lower["tenor"]], value_vars=value_cols,
+                         var_name="offset", value_name="vol")  # fmt: skip
+        long = long.rename(columns={"_table_row": "row", lower["expiry"]: "expiry", lower["tenor"]: "tenor"})
         long["offset"] = long["offset"].map(offsets)
     rows: Dict[Tuple[str, str, float], float] = {}
+    typed_as: Dict[Tuple[str, str], str] = {}  # point -> labels as first entered
     lo, hi = (NORMAL_BP_RANGE[0] * 1e-4, NORMAL_BP_RANGE[1] * 1e-4) if vol_type == "normal" else (
         LOGNORMAL_PCT_RANGE[0] * 0.01, LOGNORMAL_PCT_RANGE[1] * 0.01)  # fmt: skip
     shown = "bp" if vol_type == "normal" else "%"
     show = 1e4 if vol_type == "normal" else 100.0
-    for n, row in enumerate(long.itertuples(index=False), start=1):
+    for row in long.itertuples(index=False):
+        n = int(row.row)
         vol_cell = row.vol
         if vol_cell is None or (isinstance(vol_cell, float) and math.isnan(vol_cell)) or str(vol_cell).strip() == "":
             continue  # blank cell: no quote at this offset
@@ -204,37 +241,45 @@ def parse_vol_grid(
             expiry = parse_tenor(str(row.expiry))
             tenor = parse_tenor(str(row.tenor))
         except ValueError as exc:
-            issues.append(GridIssue("error", f"row {n}: {exc}"))
+            problem(f"row {n}: {exc}")
             continue
         if expiry.unit not in ("W", "M", "Y"):
-            issues.append(GridIssue("error", f"row {n}: option expiry {row.expiry!r} must be weeks, months or years"))
+            problem(f"row {n}: option expiry {row.expiry!r} must be weeks, months or years")
             continue
         if tenor.months is None:
-            issues.append(GridIssue("error", f"row {n}: swap tenor {row.tenor!r} must be months or years"))
+            problem(f"row {n}: swap tenor {row.tenor!r} must be months or years")
+            continue
+        point = f"{tenor_label(row.expiry)}x{tenor_label(row.tenor)}"
+        try:
+            offset = _offset_value(row.offset)
+        except ValueError:
+            problem(f"row {n} ({point}): strike offset {row.offset!r} is not a number of bp (e.g. -50, ATM, +100)")
             continue
         try:
-            offset = float(str(row.offset).strip().upper().replace("BP", "")) if not isinstance(
-                row.offset, (int, float)) else float(row.offset)  # fmt: skip
             vol = float(str(vol_cell).replace("%", "").strip()) * scale
         except ValueError:
-            issues.append(GridIssue("error", f"row {n}: offset {row.offset!r} or vol {vol_cell!r} is not a number"))
+            problem(f"row {n} ({point} {_offset_label(offset)}): vol {vol_cell!r} is not a number")
             continue
         if not math.isfinite(offset) or abs(offset) > MAX_OFFSET_BP:
-            issues.append(GridIssue("error", f"row {n}: strike offset {offset} bp is outside +/-{MAX_OFFSET_BP:.0f}bp"))
+            problem(f"row {n} ({point}): strike offset {offset} bp is outside +/-{MAX_OFFSET_BP:.0f}bp")
             continue
-        if not math.isfinite(vol) or not lo <= vol <= hi:
-            issues.append(
-                GridIssue(
-                    "error",
-                    f"row {n} ({expiry}x{tenor} {_offset_label(offset)}): vol {vol * show:.4g}{shown} is outside "
-                    f"{lo * show:g}-{hi * show:g}{shown}; check the units ({units})",
-                )
+        if not math.isfinite(vol):
+            problem(f"row {n} ({point} {_offset_label(offset)}): vol {vol_cell!r} is not a finite number")
+            continue
+        if not lo <= vol <= hi:
+            problem(
+                f"row {n} ({point} {_offset_label(offset)}): vol {vol * show:.4g}{shown} is outside "
+                f"{lo * show:g}-{hi * show:g}{shown}; check the units ({units})"
             )
             continue
-        key = (str(expiry), str(tenor), offset)
+        key = (tenor_label(row.expiry), tenor_label(row.tenor), offset)
+        typed = f"{str(row.expiry).strip().upper()}x{str(row.tenor).strip().upper()}"
         if key in rows:
-            issues.append(GridIssue("error", f"row {n}: a second quote for {key[0]}x{key[1]} {_offset_label(offset)}"))
+            first = typed_as[key[:2]]
+            alias = f" ({first} and {typed} are the same point)" if typed != first else ""
+            problem(f"row {n}: a second quote for {key[0]}x{key[1]} {_offset_label(offset)}{alias}")
             continue
+        typed_as.setdefault(key[:2], typed)
         rows[key] = vol
     if not rows and not issues:
         issues.append(GridIssue("error", "the vol table has no quotes"))
@@ -570,7 +615,11 @@ class SwaptionVolCube:
 
         K_arr = np.asarray(K, dtype=float)
         if np.any(K_arr + self.shift <= 0):
-            raise ValueError(f"strike below -shift ({-self.shift:.2%}): the SABR cube has no vol there")
+            low = float(np.min(K_arr))
+            raise ValueError(
+                f"strike {low:.3%} is below -shift ({-self.shift:.2%}): the SABR cube has no vol there; raise the "
+                "SABR shift or price at a flat vol"
+            )
         out = smile_vol(F, K_arr, T, self.params_at(T, L, F), self.fit, "normal")
         return float(out) if np.ndim(out) == 0 else np.asarray(out)
 

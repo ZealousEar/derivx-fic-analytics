@@ -30,8 +30,14 @@ following on the underlying's calendar; the underlying swap starts its spot
 lag of business days after the expiry and runs ``tenor`` from there.
 Option time is ACT/365F from the valuation date to the expiry. On the
 expiry date a swaption is worth its intrinsic value (it is exercised into
-the swap if in the money); after it, it is no longer a swaption and pricing
-raises.
+the swap if in the money). On a market dated after the expiry (a scenario
+horizon, a one-day theta) its value is the swap it was exercised into, or
+zero: the exercise decision uses the forward swap rate at the expiry read
+on the market's fixing curves, which on a rolled market are today's curves
+(forwards are assumed to realise up to the horizon, as for a caplet fixing
+in the window). A market dated after the expiry without fixing curves from
+on or before it cannot tell whether the option was exercised, and raises;
+Greeks and implied vols always raise after the expiry.
 
 Signs and units: every value is in currency for the notional, signed to the
 holder (``notional < 0`` is a sold swaption). Risk is P&L for a + move:
@@ -99,6 +105,9 @@ class Swaption:
     expiry fixed as the market moves on. ``tenor`` is the underlying swap
     tenor. ``strike`` and ``shift`` are decimal rates; ``vol`` is in the
     model's units (normal: rate units, 0.0085 = 85bp; lognormal: decimal).
+    ``shift`` is the displacement of ``shifted_black``; on a ``bachelier``
+    trade it is the shift of the lognormal-equivalent vol and vega it
+    reports; ``black`` has none (a non-zero shift raises).
     ``index`` names the float leg's term index (multi-curve); ``None`` is an
     OIS swap on ``conventions`` (default: the market's discount curve's).
     """
@@ -130,6 +139,10 @@ class Swaption:
             raise ValueError(f"vol must be a non-negative number in the model's units, got {self.vol!r}")
         if not math.isfinite(self.shift) or self.shift < 0.0:
             raise ValueError("shift must be zero or a positive decimal")
+        if self.model == "black" and self.shift != 0.0:
+            raise ValueError(
+                f"Black has no shift (got {self.shift:.4%}): use the shifted_black model, or a shift of zero"
+            )
         if self.model == "black" and self.strike <= 0.0:
             raise ValueError(
                 f"Black needs a positive strike (got {self.strike:.4%}); use the normal or shifted Black model"
@@ -194,26 +207,71 @@ class Swaption:
             return self
         return replace(self, expiry_date=self.expiry_on(market), expiry=None)
 
-    def underlying(self, market: Market) -> VanillaSwap:
-        """The swap entered on exercise (payer swap for a payer swaption),
-        for the notional's size, starting spot from the expiry."""
+    def underlying(self, market: Market, receive_fixed: Optional[bool] = None) -> VanillaSwap:
+        """The swap entered on exercise (payer swap for a payer swaption or
+        a straddle, unless ``receive_fixed`` says which side), for the
+        notional's size, starting spot from the expiry."""
 
         conv = self._conventions(market) if self.index is None else None
-        return _underlying(abs(self.notional), self.kind == "receiver", self.tenor, self.strike, self.index, conv,
+        side = self.kind == "receiver" if receive_fixed is None else bool(receive_fixed)
+        return _underlying(abs(self.notional), side, self.tenor, self.strike, self.index, conv,
                            self.expiry_on(market))  # fmt: skip
+
+    def _expired_message(self, expiry: Date, market: Market) -> str:
+        return (
+            f"the swaption expired on {expiry} (valuation date {market.asof}); physically settled, it is now the "
+            "underlying swap if it was exercised: value that on the SWAP tab"
+        )
+
+    def exercised_into(self, market: Market) -> Optional[VanillaSwap]:
+        """On a market dated after the expiry: the swap the holder is in
+        (for the notional's size; a sold swaption holds the opposite side,
+        see :meth:`pv`), or None when the option expired out of the money.
+
+        The decision uses the forward swap rate at the expiry on the
+        market's fixing curves (``market.fixings`` and, for a term-index
+        swap, ``market.projection_fixings``): on a rolled market these are
+        today's curves, so forwards are assumed to realise. Raises when the
+        market is not after the expiry or has no fixing curve dated on or
+        before it."""
+
+        expiry = self.expiry_on(market)
+        if expiry >= market.asof:
+            raise ValueError(f"the swaption expires on {expiry}, on or after the valuation date {market.asof}")
+        fixing = market.fixings
+        if fixing is None or fixing.asof > expiry:
+            raise ValueError(
+                self._expired_message(expiry, market) + " (the market has no curves from on or before the expiry "
+                "to tell whether it was exercised)"
+            )
+        projections = {}
+        if self.index is not None:
+            if self.index in market.projection_fixings:
+                projections[self.index] = market.projection_fixings[self.index]
+            elif self.index in market.projections and market.projections.is_discount(self.index):
+                projections[self.index] = fixing
+            else:
+                raise ValueError(
+                    self._expired_message(expiry, market) + f" (no {self.index} curve from before the expiry)"
+                )
+        then = Market(curve=fixing, projections=projections)
+        forward, _ = forward_and_annuity(self.underlying(market), then)
+        if forward > self.strike and self.kind in ("payer", "straddle"):
+            return self.underlying(market, receive_fixed=False)
+        if forward < self.strike and self.kind in ("receiver", "straddle"):
+            return self.underlying(market, receive_fixed=True)
+        return None
 
     # -- valuation ------------------------------------------------------------
 
     def inputs(self, market: Market) -> SwaptionInputs:
         """Expiry, forward swap rate and annuity on ``market``. Raises once
-        the swaption has expired."""
+        the swaption has expired (its value is then :meth:`pv`'s exercised
+        swap)."""
 
         expiry = self.expiry_on(market)
         if expiry < market.asof:
-            raise ValueError(
-                f"the swaption expired on {expiry} (valuation date {market.asof}); physically settled, it is now the "
-                "underlying swap if it was exercised: value that on the SWAP tab"
-            )
+            raise ValueError(self._expired_message(expiry, market))
         swap = self.underlying(market)
         forward, annuity = forward_and_annuity(swap, market)
         periods = _periods(swap, market.asof)
@@ -249,8 +307,13 @@ class Swaption:
         return self.notional * inputs.annuity * self.unit_value(inputs, vol)
 
     def pv(self, market: Market) -> float:
-        """Present value to the holder, in currency."""
+        """Present value to the holder, in currency. After the expiry: the
+        value of the swap it was exercised into (zero if it was not), see
+        :meth:`exercised_into`."""
 
+        if self.expiry_on(market) < market.asof:
+            swap = self.exercised_into(market)
+            return 0.0 if swap is None else math.copysign(1.0, self.notional) * swap.pv(market)
         return self.value(self.inputs(market), self.market_vol(market))
 
     def premium_bp(self, market: Market) -> float:
@@ -265,10 +328,14 @@ class Swaption:
         return self.inputs(market).forward
 
     def cash(self, market: Market, start: Date, end: Date) -> float:
-        """A swaption pays nothing before expiry (the premium is paid at
-        trade); valuing it after expiry raises (see :meth:`inputs`)."""
+        """Cash paid to the holder with pay dates in (start, end]: nothing
+        before the expiry (the premium is paid at trade); on a market after
+        the expiry, the flows of the swap it was exercised into."""
 
-        return 0.0
+        if self.expiry_on(market) >= market.asof:
+            return 0.0
+        swap = self.exercised_into(market)
+        return 0.0 if swap is None else math.copysign(1.0, self.notional) * swap.cash(market, start, end)
 
     # -- vols -----------------------------------------------------------------
 
