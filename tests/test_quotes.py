@@ -63,7 +63,7 @@ def test_clean_slice_keeps_one_otm_quote_per_strike_and_reports_removals():
     chain.loc[i[42], "lastTradeDate"] = TRADE_DATE - pd.Timedelta(days=300)  # stale
     dup = chain.iloc[[30]].assign(bid=chain.iloc[30]["bid"] - 0.2)  # wider duplicate
     chain = pd.concat([chain, dup], ignore_index=True)
-    clean = clean_option_slice(chain, rate=RATE)
+    clean = clean_option_slice(chain, rate=RATE, recompute_iv=False)  # the quoted-vol path
     q = clean.quotes
     assert q["strike"].is_unique and q["strike"].is_monotonic_increasing
     F = clean.forward
@@ -154,4 +154,72 @@ def test_spread_weights_in_the_pipeline():
     assert s.fit.weights.mean() == pytest.approx(1.0)
     assert s.diagnostics["rmse_bp"] < 5
     with pytest.raises(ValueError, match="recompute_iv"):
-        calibrate_chain(chain, weights="spread")
+        calibrate_chain(chain, weights="spread", hygiene={"recompute_iv": False})
+
+
+# --- review fixes -------------------------------------------------------------------------------
+
+
+def test_parity_forward_survives_one_bad_strike():
+    """One stale pair near the money used to push the 5-strike range over 1%
+    and drop the whole expiry to the carry forward (the spot when r = q = 0)."""
+
+    T = 182 / 365
+    chain = _slice(182)
+    true_F = SPOT * np.exp((RATE - DIV) * T)
+    k_bad = chain["strike"].iloc[(chain["strike"] - true_F).abs().argsort().iloc[0]]
+    bad = (chain["strike"] == k_bad) & (chain["option_type"] == "call")
+    chain.loc[bad, ["bid", "ask"]] += 10.0  # a stale call quote: its parity estimate is 1.7% off
+    F, source, n = infer_forward(chain, SPOT, T, rate=RATE)
+    assert F == pytest.approx(true_F, rel=1e-6)
+    assert source.startswith("put-call parity") and "1 inconsistent" in source and n == 4
+
+
+def test_default_recomputes_vols_from_mids_and_says_so():
+    """Yahoo's quoted vols disagree between the call and the put at the same
+    strike (by 1 to 10 vol points on a real SPY chain); with bid/ask in the
+    chain the default re-inverts the mids, so the smile does not jump at F."""
+
+    from _vol_chains import true_vol
+
+    chain = _slice(91)
+    chain["implied_vol"] += np.where(chain["option_type"] == "call", 0.03, -0.03)  # inconsistent quotes
+    clean = clean_option_slice(chain, rate=RATE)
+    q = clean.quotes
+    assert clean.iv_source == "mid" and clean.summary()["iv_source"] == "mid"
+    assert np.max(np.abs(q["implied_vol"] - true_vol(q["strike"], clean.forward, clean.tau))) < 5e-4
+    quoted = clean_option_slice(chain, rate=RATE, recompute_iv=False)
+    assert quoted.iv_source == "quoted"
+    err = quoted.quotes["implied_vol"] - true_vol(quoted.quotes["strike"], quoted.forward, quoted.tau)
+    assert np.max(np.abs(err)) > 0.02
+    no_quotes = clean_option_slice(chain.drop(columns=["bid", "ask", "mid"]), rate=RATE)
+    assert no_quotes.iv_source == "quoted"  # 'auto' needs executable quotes
+    with pytest.raises(ValueError, match="recompute_iv"):
+        clean_option_slice(chain, recompute_iv="always")
+
+
+def test_min_days_counts_whole_days():
+    """(3 / 365) * 365 < 3 in floating point: a 3-day expiry was dropped by min_days=3."""
+
+    from derivx.models.comparison import select_expiry
+
+    chain = _slice(3)
+    assert not clean_option_slice(chain, min_days=3).quotes.empty
+    assert clean_option_slice(chain, min_days=4).quotes.empty
+    assert select_expiry(chain, target_days=3, min_days=3) == TRADE_DATE + pd.Timedelta(days=3)
+
+
+def test_timezone_aware_trade_date_keeps_its_local_day():
+    evening = pd.Timestamp("2026-10-19 21:30", tz="US/Eastern")  # already the 20th in UTC
+    assert year_fraction(evening, "2026-10-20") == pytest.approx(1 / 365)
+
+
+def test_interpolate_forward_is_log_linear_with_flat_carry_beyond():
+    from derivx.vol.quotes import interpolate_forward
+
+    S, c = 100.0, 0.03
+    known = [(0.25, S * np.exp(c * 0.25)), (1.0, S * np.exp(c * 1.0))]
+    for T in (0.1, 0.5, 2.0):
+        assert interpolate_forward(T, S, known) == pytest.approx(S * np.exp(c * T), rel=1e-12)
+    with pytest.raises(ValueError, match="known forward"):
+        interpolate_forward(1.0, S, [])

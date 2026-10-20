@@ -44,7 +44,8 @@ def _synthetic_chain(trade_date: dt.date, days_to_expiry: int = 30) -> pd.DataFr
 def test_calibrate_with_constraints_recovers_params():
     trade_date = dt.date(2024, 1, 2)
     chain = _synthetic_chain(trade_date)
-    results = calibrate_with_constraints(chain, enforce_arbitrage=False)
+    # quoted vols: the constant bid/ask of this helper are placeholders, not prices
+    results = calibrate_with_constraints(chain, enforce_arbitrage=False, hygiene={"recompute_iv": False})
     assert len(results) == 1
     result = results[0]
     assert result.n_points == len(chain)
@@ -55,7 +56,7 @@ def test_calibrate_with_constraints_recovers_params():
 def test_benchmark_vs_baseline_reports_metrics():
     trade_date = dt.date(2024, 1, 2)
     chain = _synthetic_chain(trade_date)
-    result = calibrate_with_constraints(chain, enforce_arbitrage=False)[0]
+    result = calibrate_with_constraints(chain, enforce_arbitrage=False, hygiene={"recompute_iv": False})[0]
     metrics = benchmark_vs_baseline(result, chain)
     assert {"rmse_svi_in_sample", "rmse_svi_cv", "rmse_spline_cv", "relative_improvement"} <= set(metrics)
     assert metrics["rmse_svi_cv"] >= 0 and metrics["rmse_spline_cv"] > 0
@@ -185,8 +186,9 @@ def test_jacobian_condition_depends_on_the_quotes():
 
     base = synth_chain(days=(91,))
     noisy = synth_chain(days=(91,), iv_noise=0.02, seed=9)
-    c1 = calibrate_with_constraints(base)[0].diagnostics["condition_number"]
-    c2 = calibrate_with_constraints(noisy)[0].diagnostics["condition_number"]
+    quoted = {"recompute_iv": False}  # the noise is in the quoted vols
+    c1 = calibrate_with_constraints(base, hygiene=quoted)[0].diagnostics["condition_number"]
+    c2 = calibrate_with_constraints(noisy, hygiene=quoted)[0].diagnostics["condition_number"]
     assert np.isfinite(c1) and np.isfinite(c2) and abs(np.log(c1 / c2)) > 0.05
 
 
@@ -200,7 +202,8 @@ def test_itm_junk_does_not_move_the_fit():
         (chain["option_type"] == "put") & (chain["strike"] > F)
     )
     chain.loc[itm, "implied_vol"] += np.random.default_rng(0).normal(0, 0.03, int(itm.sum()))
-    s = calibrate_with_constraints(chain, rate=0.04, div_yield=0.012)[0]
+    s = calibrate_with_constraints(chain, rate=0.04, div_yield=0.012, hygiene={"recompute_iv": False})[0]
+    assert s.diagnostics["iv_source"] == "quoted"
     assert np.max(np.abs(s.iv(s.strikes) - true_vol(s.strikes, s.forward, T))) < 1e-3
 
 
@@ -209,7 +212,7 @@ def test_spline_baseline_is_out_of_sample_and_finite():
     improvement -3.7e15) or failed on duplicate strikes (NaN)."""
 
     chain = synth_chain(days=(30,), iv_noise=0.001, seed=2)
-    s = calibrate_with_constraints(chain, rate=0.04, div_yield=0.012)[0]
+    s = calibrate_with_constraints(chain, rate=0.04, div_yield=0.012, hygiene={"recompute_iv": False})[0]
     b = s.benchmark
     assert b["n_scored"] == s.n_points - 2
     assert 0 < b["rmse_spline_cv"] < 0.01 and 0 < b["rmse_svi_cv"] < 0.01
@@ -230,3 +233,102 @@ def test_moneyness_band_is_on_forward_moneyness():
 def test_surface_truth_is_arbitrage_free():
     report = SURFACE.arbitrage_report()
     assert report["butterfly_ok"] and report["calendar_ok"] and report["eta_condition_ok"]
+
+
+# --- review fixes -------------------------------------------------------------------------------
+
+
+def test_forward_is_interpolated_when_parity_fails_for_an_expiry():
+    """On a real SPY chain after liquidity filters, the long expiries lost
+    their call/put pairs and fell back to spot exp((r - q) T) = spot (no rate
+    input), 4-8% below the market forward, with spurious calendar
+    violations. The forward is now interpolated from the parity forwards of
+    the other expiries."""
+
+    chain = synth_chain(days=(30, 91, 182, 365))
+    T = 365 / 365
+    F_true = 580.0 * np.exp((0.04 - 0.012) * T)
+    last = pd.to_datetime(chain["expiry"]) == chain["expiry"].max()
+    itm = ((chain["option_type"] == "call") & (chain["strike"] < F_true)) | (
+        (chain["option_type"] == "put") & (chain["strike"] > F_true)
+    )
+    chain = chain[~(last & itm)]  # only OTM quotes left: no pair for parity
+    run = calibrate_chain(chain, cv_folds=0)  # rate unknown: 0, as in the app
+    s = run.slices[-1]
+    assert s.diagnostics["forward_method"] == "interpolated" and "parity forward" in s.diagnostics["forward_source"]
+    assert s.forward == pytest.approx(F_true, rel=2e-4)  # the spot is 2.8% away
+    assert all(x.diagnostics["forward_method"] == "parity" for x in run.slices[:-1])
+    assert run.calendar["calendar_ok"].all()
+
+
+def test_pipeline_fits_mid_vols_by_default():
+    chain = synth_chain(days=(91,))
+    chain["implied_vol"] += np.where(chain["option_type"] == "call", 0.02, -0.02)  # quoted vols jump at F
+    s = calibrate_with_constraints(chain, rate=0.04, div_yield=0.012)[0]
+    assert s.diagnostics["iv_source"] == "mid" and s.diagnostics["rate"] == 0.04
+    assert np.max(np.abs(s.iv(s.strikes) - true_vol(s.strikes, s.forward, s.tau))) < 5e-4
+    assert run_table_has_sources(calibrate_chain(chain, rate=0.04, div_yield=0.012, cv_folds=0).table())
+
+
+def run_table_has_sources(table: pd.DataFrame) -> bool:
+    return {"forward_method", "iv_source"} <= set(table.columns) and (table["iv_source"] == "mid").all()
+
+
+def _spy_fixture():
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "spy_2026-10-20_otm_slices.json"
+    return json.loads(path.read_text())["slices"]
+
+
+def test_enforcement_on_real_spy_slices_is_arbitrage_free_and_costs_little():
+    """Real SPY smiles (fixture) whose free SVI fit has butterfly arbitrage.
+    The old penalised refit turned an 11.7 vol bp fit of the 2026-11-13
+    slice into 35.6 vol bp and still left g < 0; in cross-validation some
+    folds ended near 450 vol bp."""
+
+    from derivx.vol.svi import fit_svi_strike_slice
+
+    for sl in _spy_fixture():
+        K, iv = np.array(sl["strikes"]), np.array(sl["implied_vols"])
+        free = fit_svi_strike_slice(K, iv, sl["F"], sl["T"])
+        assert not free.arbitrage_free, sl["expiry"]
+        fixed = fit_svi_strike_slice(K, iv, sl["F"], sl["T"], enforce_no_arbitrage=True)
+        assert fixed.arbitrage_free and fixed.butterfly.min_g >= 0, sl["expiry"]
+        assert fixed.arbitrage_repair in ("constrained", "ssvi_slice") and fixed.penalised
+        assert fixed.rmse_bp < free.rmse_bp + 1.5, (sl["expiry"], free.rmse_bp, fixed.rmse_bp)
+
+
+def test_cross_validation_with_enforcement_stays_close_to_in_sample_on_real_slice():
+    sl = next(s for s in _spy_fixture() if s["expiry"] == "2026-11-13")
+    K = np.array(sl["strikes"])
+    chain = pd.DataFrame(
+        {
+            "trade_date": pd.Timestamp("2026-10-20"),
+            "expiry": pd.Timestamp(sl["expiry"]),
+            "strike": K,
+            "implied_vol": sl["implied_vols"],
+            "underlying_price": sl["F"],  # no option_type: the carry forward (r = q = 0) is this F
+        }
+    )
+    s = calibrate_with_constraints(chain, std_band=None, enforce_arbitrage=True)[0]
+    assert s.forward == pytest.approx(sl["F"]) and s.diagnostics["butterfly_ok"]
+    b = s.benchmark
+    assert b["rmse_svi_cv"] < 1.5 * b["rmse_svi_in_sample"]  # was 347 vs 35.6 vol bp
+
+
+def test_cross_validation_refits_never_start_from_the_full_sample_fit(monkeypatch):
+    import derivx.calibration.production as prod
+
+    calls = []
+    real = prod.fit_svi_strike_slice
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(prod, "fit_svi_strike_slice", spy)
+    calibrate_chain(synth_chain(days=(30,)), rate=0.04, div_yield=0.012, cv_folds=3)
+    assert len(calls) == 4  # the fit plus one refit per fold
+    assert all(c.get("x0") is None for c in calls[1:]) and all(c["n_starts"] == prod.CV_STARTS for c in calls[1:])

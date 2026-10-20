@@ -14,7 +14,8 @@ Models (:data:`MODELS`):
 
 Every model is scored on the same quotes: the slice is cleaned with
 :func:`derivx.vol.quotes.clean_option_slice` (expired/same-day expiries
-rejected, OTM quotes only, one quote per strike, put-call-parity forward)
+rejected, OTM quotes only, one quote per strike, put-call-parity forward,
+vols recomputed from bid/ask mids when the slice has them)
 and restricted to ``|k| <= std_band * atm_vol * sqrt(tau)``. Scores are
 decimal vols (``*_bp`` columns: vol bp): ``rmse`` in sample and
 ``rmse_cv`` from k-fold cross-validation on interior strikes, which is the
@@ -30,8 +31,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 
-from derivx.calibration.production import kfold_errors, spline_predict
-from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice, year_fraction
+from derivx.calibration.production import CV_STARTS, kfold_errors, spline_predict
+from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice, day_count
 from derivx.vol.sabr import calibrate_sabr_smile, hagan_sabr_iv
 from derivx.vol.svi import fit_svi_strike_slice
 
@@ -112,9 +113,9 @@ def prepare_slice(
     clean = clean_option_slice(
         chain, trade_date=trade_date, rate=rate, div_yield=div_yield, min_days=min_days, **(hygiene or {})
     )
-    if clean.tau * 365.0 < min_days:
+    if clean.days < min_days:
         raise ValueError(
-            f"expiry {clean.expiry.date()} is {clean.tau * 365:.0f} day(s) after the trade date "
+            f"expiry {clean.expiry.date()} is {clean.days} day(s) after the trade date "
             f"{clean.trade_date.date()}: expired or too short to score (min_days={min_days:g})"
         )
     if std_band is not None:
@@ -153,15 +154,15 @@ def fit_models(
                 fit = fit_svi_strike_slice(K, vols, F=F, T=T)
                 fitted = fit.vol(K)
 
-                def predict(train, test, fit=fit):
-                    refit = fit_svi_strike_slice(K[train], vols[train], F=F, T=T, x0=fit)
+                def predict(train, test):  # starts from the training quotes only (no full-sample warm start)
+                    refit = fit_svi_strike_slice(K[train], vols[train], F=F, T=T, n_starts=CV_STARTS)
                     return refit.vol(K[test])
 
             elif name == "sabr":
                 fit = calibrate_sabr_smile(K, vols, T=T, F=F, beta=sabr_beta)
                 fitted = fit.model_vols
 
-                def predict(train, test, fit=fit):
+                def predict(train, test):
                     refit = calibrate_sabr_smile(K[train], vols[train], T=T, F=F, beta=sabr_beta, n_starts=3)
                     return hagan_sabr_iv(F, K[test], T, **refit)
 
@@ -234,7 +235,7 @@ def select_expiry(chain: pd.DataFrame, target_days: float = 30.0, min_days: floa
             raise ValueError("chain has several trade dates: pass trade_date or filter first")
         trade_date = dates[0]
     expiries = pd.to_datetime(chain["expiry"]).dt.normalize().unique()
-    days = np.array([year_fraction(trade_date, e) * 365.0 for e in expiries])
+    days = np.array([day_count(trade_date, e) for e in expiries], dtype=float)
     valid = days >= min_days
     if not valid.any():
         raise ValueError(f"no expiry at least {min_days:g} days after the trade date")

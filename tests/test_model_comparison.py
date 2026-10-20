@@ -47,7 +47,7 @@ def _slice(days=30, **kw):
 
 def test_every_model_gets_finite_scores_on_a_cleaned_otm_slice():
     _, slc = _slice(30)
-    comp = fit_models(slc, rate=0.04, div_yield=0.012)
+    comp = fit_models(slc, rate=0.04, div_yield=0.012, hygiene={"recompute_iv": False})  # noisy quoted vols
     t = comp.table.set_index("model")
     assert np.isfinite(t[["rmse", "rmse_cv", "max_abs_error_bp"]].to_numpy()).all()
     assert (t["status"].str.startswith("ok")).all()
@@ -92,7 +92,7 @@ def test_a_nan_iv_does_not_break_the_comparison():
     _, slc = _slice()
     slc = slc.copy()
     slc.iloc[5, slc.columns.get_loc("implied_vol")] = np.nan
-    comp = fit_models(slc)
+    comp = fit_models(slc, hygiene={"recompute_iv": False})
     assert (comp.table["status"].str.startswith("ok")).all()
     assert "iv_missing" in comp.clean.counts
 
@@ -121,3 +121,22 @@ def test_too_few_quotes_is_a_clear_error():
     chain = _chain(dt.date(2024, 1, 2)).iloc[:6]
     with pytest.raises(ValueError, match="usable quotes"):
         compare_models(chain)
+
+
+def test_cv_refits_start_from_training_quotes_only(monkeypatch):
+    """Review: the SVI fold refits were warm-started from the full-sample
+    fit (which had seen the held-out quotes) while SABR started cold."""
+
+    import derivx.models.comparison as comp_mod
+
+    calls = []
+    real = comp_mod.fit_svi_strike_slice
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(comp_mod, "fit_svi_strike_slice", spy)
+    _, slc = _slice(30)
+    comp_mod.fit_models(slc, models=["svi"], rate=0.04, div_yield=0.012, folds=3)
+    assert len(calls) == 4 and all("x0" not in c for c in calls)

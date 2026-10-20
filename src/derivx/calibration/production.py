@@ -6,7 +6,12 @@ Pipeline per (trade_date, expiry) group:
 
 1. :func:`derivx.vol.quotes.clean_option_slice`: drop expired / same-day
    rows, IV placeholders, zero bids, crossed and stale quotes, ITM options
-   and duplicates; infer the forward from put-call parity (carry fallback).
+   and duplicates; infer the forward from put-call parity; recompute the
+   implied vols from bid/ask mids when the chain has them (quoted vols
+   otherwise). When parity fails for an expiry, its forward is
+   interpolated (ln F linear in T) from the parity forwards of the other
+   expiries of the same trade date, and only without any parity forward
+   does it fall back to ``spot exp((rate - div_yield) T)``.
 2. Keep strikes within a standardised moneyness band ``|k| <= std_band *
    atm_vol * sqrt(tau)`` (same width in standard deviations at every
    maturity; ``k = ln(K/F)``), and optionally a forward-moneyness band
@@ -14,9 +19,9 @@ Pipeline per (trade_date, expiry) group:
 3. Require ``min_points`` quotes (more than the 5 SVI parameters) with at
    least ``min_per_side`` on each side of the forward.
 4. Fit raw SVI in total variance (:func:`derivx.vol.svi.fit_svi_strike_slice`,
-   equal weights in vol, soft-L1 loss at 50 vol bp); with ``enforce_arbitrage`` the
-   butterfly and Lee conditions are penalised when the free fit violates
-   them.
+   equal weights in vol, soft-L1 loss at 50 vol bp); with ``enforce_arbitrage`` a
+   free fit that violates the butterfly or Lee conditions is replaced by a
+   constrained fit (or an arbitrage-free SSVI slice).
 5. Diagnostics: Gatheral butterfly density g(k) on a dense grid, Lee wing
    slopes, calendar check against the previous expiry of the same trade date
    (total variance non-decreasing at every k), Jacobian condition number at
@@ -36,10 +41,11 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 
-from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice
+from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice, interpolate_forward
 from derivx.vol.svi import SviFit, check_calendar, fit_svi_strike_slice, svi_iv
 
 SVI_N_PARAMS = 5
+CV_STARTS = 2  # quasi-explicit start points per cross-validation refit (training quotes only)
 
 
 @dataclass
@@ -96,6 +102,8 @@ class ChainCalibration:
                     "expiry": s.expiry.date(),
                     "tau": s.tau,
                     "forward": s.forward,
+                    "forward_method": d.get("forward_method"),
+                    "iv_source": d.get("iv_source"),
                     "points": s.n_points,
                     "rmse_bp": d.get("rmse_bp"),
                     "cv_rmse_bp": (s.benchmark or {}).get("rmse_svi_cv", np.nan) * 1e4,
@@ -123,7 +131,7 @@ def _groups(chain: pd.DataFrame, trade_date) -> List[tuple]:
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     for col in ("trade_date", "expiry"):
         if df[col].dt.tz is not None:
-            df[col] = df[col].dt.tz_convert(None)
+            df[col] = df[col].dt.tz_localize(None)  # keep the local calendar date
         df[col] = df[col].dt.normalize()
     return list(df.groupby(["trade_date", "expiry"], sort=True))
 
@@ -179,10 +187,11 @@ def calibrate_chain(
     """Calibrate SVI to every (trade_date, expiry) slice of ``chain``.
 
     ``rate`` / ``div_yield`` (continuously compounded) set the discount
-    factor used in put-call parity (and for vols recomputed from mids) and
-    the carry-forward fallback. ``weights``: None (equal), 'vega', or
-    'spread' (1 / bid-ask width in vol; needs ``hygiene={'recompute_iv':
-    True}``).
+    factor used in put-call parity and for vols recomputed from mids (the
+    default whenever the chain has bid, ask and option_type; pass
+    ``hygiene={'recompute_iv': False}`` to fit the quoted vols), and the
+    carry-forward fallback. ``weights``: None (equal), 'vega', or 'spread'
+    (1 / bid-ask width in vol; needs vols recomputed from bid/ask).
     ``min_points`` must exceed the 5 SVI parameters. ``hygiene`` passes
     extra keyword arguments to :func:`clean_option_slice` (e.g.
     ``{"max_stale_days": None}``). ``cv_folds=0`` skips the out-of-sample
@@ -194,23 +203,53 @@ def calibrate_chain(
         )
     if weights not in (None, "vega", "spread"):
         raise ValueError(f"weights must be None, 'vega' or 'spread', got {weights!r}")
-    if weights == "spread" and not (hygiene or {}).get("recompute_iv"):
-        raise ValueError("weights='spread' needs bid/ask implied vols: pass hygiene={'recompute_iv': True}")
+    if weights == "spread" and (hygiene or {}).get("recompute_iv", "auto") is False:
+        raise ValueError("weights='spread' needs bid/ask implied vols: do not pass hygiene={'recompute_iv': False}")
     if chain is None or chain.empty:
         return ChainCalibration([], [], pd.DataFrame())
     if "expiry" not in chain.columns:
         raise ValueError("Chain must contain 'expiry' column")
     slices: List[CalibratedSlice] = []
     skipped: List[SkippedSlice] = []
+    hyg = dict(hygiene or {})
+    cleaned = []
     for (td, exp), group in _groups(chain, trade_date):
         try:
-            clean = clean_option_slice(
-                group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, **(hygiene or {})
-            )
+            clean = clean_option_slice(group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, **hyg)
         except ValueError as exc:
             skipped.append(SkippedSlice(td, exp, str(exc), len(group)))
             continue
-        if clean.tau * 365.0 < min_days:
+        cleaned.append((td, exp, group, clean))
+    # Parity failed (too few consistent call/put pairs, typical for long expiries after liquidity
+    # filters)? Interpolate that forward from the parity forwards of the same trade date instead of
+    # assuming spot exp((rate - div_yield) T), which with unknown rates is the spot itself.
+    parity: Dict[pd.Timestamp, List[tuple]] = {}
+    for td, _, _, clean in cleaned:
+        if clean.forward_method == "parity" and clean.tau > 0:
+            parity.setdefault(td, []).append((clean.tau, clean.forward))
+    for i, (td, exp, group, clean) in enumerate(cleaned):
+        known = parity.get(td, [])
+        if clean.forward_method != "carry" or clean.tau <= 0 or not known or "forward" in hyg:
+            continue
+        fwd = interpolate_forward(clean.tau, clean.spot, known)
+        source = (
+            f"interpolated from {len(known)} parity forward(s) of this trade date (ln F linear in T); "
+            f"parity here: {clean.forward_source}"
+        )
+        clean = clean_option_slice(
+            group,
+            trade_date=td,
+            rate=rate,
+            div_yield=div_yield,
+            min_days=min_days,
+            forward=fwd,
+            forward_source=source,
+            **hyg,
+        )
+        clean.forward_method = "interpolated"
+        cleaned[i] = (td, exp, group, clean)
+    for td, exp, group, clean in cleaned:
+        if clean.days < min_days:
             skipped.append(SkippedSlice(td, exp, f"expired or same-day (tau = {clean.tau:.4f}y)", len(group)))
             continue
         if clean.quotes.empty:
@@ -250,6 +289,9 @@ def calibrate_chain(
             "tau": clean.tau,
             "forward": clean.forward,
             "forward_source": clean.forward_source,
+            "forward_method": clean.forward_method,
+            "iv_source": clean.iv_source,
+            "rate": clean.rate,
             "spot": clean.spot,
             "n_input": clean.n_input,
             "removed": clean.counts,
@@ -260,7 +302,8 @@ def calibrate_chain(
             "min_variance": fit.min_variance,
             "n_downweighted": fit.n_downweighted,
             "enforce_arbitrage": bool(enforce_arbitrage),
-            "arbitrage_penalised": fit.penalised,
+            "arbitrage_penalised": fit.penalised,  # True when enforcement replaced an arbitrageable free fit
+            "arbitrage_repair": fit.arbitrage_repair,
             **fit.butterfly.as_dict(),
             **fit.lee,
             "calendar_ok": None,
@@ -366,8 +409,11 @@ def benchmark_vs_baseline(
 
     Both models are refitted ``folds`` times with an interleaved fold of
     interior strikes held out and scored on it (``k``-fold CV, vol units).
-    A spline scored on its own knots has zero error by construction, so
-    only held-out errors are compared. ``relative_improvement = 1 -
+    Each SVI refit starts only from points computed from its training
+    quotes (``CV_STARTS`` quasi-explicit starts), never from the full-sample
+    fit, so the held-out quotes cannot steer it. A spline scored on its own
+    knots has zero error by construction, so only held-out errors are
+    compared. ``relative_improvement = 1 -
     rmse_svi_cv / rmse_spline_cv`` (> 0: SVI predicts unseen strikes
     better). ``chain_slice`` is accepted for backward compatibility and
     ignored: the slice's own cleaned quotes are used."""
@@ -390,7 +436,7 @@ def benchmark_vs_baseline(
             loss="soft_l1" if fit is None else fit.loss,
             f_scale=0.005 if fit is None or fit.f_scale is None else fit.f_scale,
             enforce_no_arbitrage=False if fit is None else fit.enforce_no_arbitrage,
-            x0=calibrated_slice.params,
+            n_starts=CV_STARTS,
         )
         return refit.vol(strikes[test])
 

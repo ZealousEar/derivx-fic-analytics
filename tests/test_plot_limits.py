@@ -11,6 +11,7 @@ from streamlit.testing.v1 import AppTest
 from derivx.calibration.production import calibrate_with_constraints
 from derivx.models.comparison import compare_models
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
+from derivx.vol.implied import black_price
 from derivx.vol.svi import svi_iv
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
@@ -59,19 +60,23 @@ def test_bound_scene_records_zoom_distance_and_pan_limits():
 def _chain(trade_date: dt.date) -> pd.DataFrame:
     strikes = np.linspace(80, 120, 9)
     params = {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "s": 0.4}
+    vols = svi_iv(strikes, params, F=100.0, T=1.0)  # params: total variance at T = 1
+    is_call = strikes >= 100.0
+    # bid/ask around the Black-76 price of each quoted vol (r = 0, F = 100), so mid vols equal the quotes
+    price = black_price(100.0, strikes, 30 / 365, vols, is_call)
     df = pd.DataFrame(
         {
             "trade_date": pd.Timestamp(trade_date),
             "expiry": pd.Timestamp(trade_date + dt.timedelta(days=30)),
             "strike": strikes,
-            "implied_vol": svi_iv(strikes, params, F=100.0, T=1.0),  # params: total variance at T = 1
+            "implied_vol": vols,
             "underlying_price": 100.0,
-            "bid": 1.0,
-            "ask": 1.2,
-            "mid": 1.1,
+            "bid": price * 0.99,
+            "ask": price * 1.01,
+            "mid": price,
             "volume": 50,
             "open_interest": 100,
-            "option_type": np.where(strikes < 100.0, "put", "call"),
+            "option_type": np.where(is_call, "call", "put"),
         }
     )
     df["moneyness"] = df["strike"] / 100.0
