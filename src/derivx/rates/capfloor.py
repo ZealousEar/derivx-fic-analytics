@@ -6,13 +6,18 @@ at e_i::
 
     caplet_i = N * tau_i * DF(e_i) * E[max(F_i - K, 0)]
 
-``F_i`` is the simple forward for the period from :meth:`Market.projected_rate`
-and the expectation is taken under the chosen model with option time
-ACT/365F from the valuation date to the fixing. A caplet that has already
-fixed is worth its intrinsic value; one already paid is gone. On the same
-schedule this matches QuantLib's ``Cap``/``Floor`` on an ``IborLeg`` with
-``BlackCapFloorEngine`` (plain and displaced) and ``BachelierCapFloorEngine``
-(``tests/test_capfloor.py``).
+``F_i`` is the simple forward for the period and the expectation is taken
+under the chosen model with option time ACT/365F from the valuation date to
+the fixing. A caplet that has already fixed is worth its intrinsic value;
+one already paid is gone. ``DF`` is always the discount (OIS) curve,
+``market.curve``. The forward comes from the projection curve of the cap's
+``projection`` index (a EURIBOR cap, :meth:`CapFloor.from_index`:
+multi-curve, OIS discounting) through :meth:`Market.index_rate`, or from
+``market.curve`` itself when ``projection`` is None (single-curve, via
+:meth:`Market.projected_rate`). On the same schedule this matches
+QuantLib's ``Cap``/``Floor`` on an ``IborLeg`` with ``BlackCapFloorEngine``
+(plain and displaced) and ``BachelierCapFloorEngine``
+(``tests/test_capfloor.py``, ``tests/test_multicurve.py``).
 
 Vols are in each model's own units: normal (Bachelier) vol in rate units
 (1bp = 1e-4), lognormal vol as a decimal (0.20 = 20%). Vegas are P&L per
@@ -41,6 +46,7 @@ from derivx.rates.conventions import (
     year_fraction,
 )
 from derivx.rates.curves import Market
+from derivx.rates.indices import TermIndex, get_index
 from derivx.risk.sensitivities import Position
 
 MODELS = ("bachelier", "black", "shifted_black")
@@ -349,8 +355,47 @@ class CapFloor:
     bdc: str = "MF"
     fixing_lag: int = 2
     exclude_first: Optional[bool] = None
+    projection: Optional[str] = None
+
+    @classmethod
+    def from_index(
+        cls,
+        index: Union[str, TermIndex],
+        notional: float,
+        kind: str,
+        strike: float,
+        tenor: str,
+        vol: VolInput,
+        model: str = "bachelier",
+        shift: float = 0.0,
+        **fields: object,
+    ) -> "CapFloor":
+        """Cap or floor on a term index (multi-curve): periods of the index
+        tenor on its calendar and day count, fixed ``fixing_lag`` business
+        days before each period, forwards from ``market.projection(index)``
+        and discounting on ``market.curve``. ``fields`` overrides any other
+        attribute (``forward_start``, ``start``, ``exclude_first``)."""
+
+        index = get_index(index)
+        terms = dict(
+            index_months=index.months,
+            day_count=index.day_count,
+            calendar=index.calendar,
+            bdc=index.bdc,
+            fixing_lag=index.fixing_lag,
+            projection=index.name,
+        )
+        return cls(notional, kind, strike, tenor, vol, model, shift, **{**terms, **fields})
 
     def __post_init__(self) -> None:
+        if self.projection is not None:
+            index = get_index(self.projection)
+            object.__setattr__(self, "projection", index.name)
+            if self.index_months != index.months or str(self.day_count).upper() != index.day_count:
+                raise ValueError(
+                    f"a {index.name} cap resets every {index.months}M on {index.day_count}, not every "
+                    f"{self.index_months}M on {self.day_count}"
+                )
         object.__setattr__(self, "kind", str(self.kind).lower())
         object.__setattr__(self, "model", str(self.model).lower())
         object.__setattr__(self, "bdc", str(self.bdc).upper())
@@ -416,7 +461,34 @@ class CapFloor:
     @property
     def label(self) -> str:
         span = f"{self.forward_start}x{self.tenor}" if self.forward_start else self.tenor
-        return f"{span} {self.kind.upper()} {self.strike:.3%} {self.index_months}M"
+        return f"{span} {self.kind.upper()} {self.strike:.3%} {self.projection or f'{self.index_months}M'}"
+
+    def _forwards(self, market: Market, rows: List[CapletPeriod]) -> np.ndarray:
+        """:meth:`rate` of each period, the forwards of periods still to fix
+        in one curve call."""
+
+        asof = market.asof
+        published = market.index_fixings.get(self.projection, {}) if self.projection is not None else {}
+        future = [p.fix > asof or (p.fix == asof and p.fix not in published) for p in rows]
+        out = np.empty(len(rows))
+        live = [i for i, f in enumerate(future) if f]
+        if live:
+            curve = market.projection(self.projection) if self.projection is not None else market.curve
+            starts = np.asarray(curve.df([rows[i].start for i in live]), dtype=float)
+            ends = np.asarray(curve.df([rows[i].end for i in live]), dtype=float)
+            out[live] = (starts / ends - 1.0) / np.array([rows[i].tau for i in live])
+        for i, p in enumerate(rows):
+            if not future[i]:
+                out[i] = self.rate(market, p)
+        return out
+
+    def rate(self, market: Market, period: CapletPeriod) -> float:
+        """The period's rate: a fixing or the forward (see the module
+        docstring for which curve)."""
+
+        if self.projection is not None:
+            return market.index_rate(self.projection, period.start, period.end, self.day_count, period.fix)
+        return market.projected_rate(period.start, period.end, self.day_count, period.fix)
 
     def _vol_points(self) -> Tuple[np.ndarray, np.ndarray]:
         if isinstance(self.vol, Mapping):
@@ -489,7 +561,7 @@ class CapFloor:
     def _strip(self, market: Market) -> _Strip:
         asof = market.asof
         rows = [p for p in self.periods(asof) if p.pay > asof]
-        forward = np.array([market.projected_rate(p.start, p.end, self.day_count, p.fix) for p in rows])
+        forward = self._forwards(market, rows)
         df = np.asarray(market.curve.df([p.pay for p in rows]), dtype=float) if rows else np.array([])
         return _Strip(
             periods=rows,
@@ -630,11 +702,10 @@ class CapFloor:
         (fixings curve for periods fixed before its valuation date)."""
 
         w = 1.0 if self.is_cap else -1.0
+        window = [p for p in self.periods(market.asof) if start < p.pay <= end]
         total = 0.0
-        for p in self.periods(market.asof):
-            if start < p.pay <= end:
-                rate = market.projected_rate(p.start, p.end, self.day_count, p.fix)
-                total += self.notional * p.tau * max(w * (rate - self.strike), 0.0)
+        for p, rate in zip(window, self._forwards(market, window)):
+            total += self.notional * p.tau * max(w * (rate - self.strike), 0.0)
         return total
 
 
@@ -671,6 +742,7 @@ def capfloor_position(cf: CapFloor, asof: Optional[Date] = None, name: Optional[
             "model": trade.model,
             "vol": trade.vol,
             "shift": trade.shift,
+            "projection": trade.projection,
             "trade": trade,
         },
     )

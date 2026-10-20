@@ -11,6 +11,13 @@ revaluation:
 
 A long receiver swap or long bond has negative PV01 (it loses when rates
 rise); a long cap has positive PV01.
+
+``which`` names one curve of the market: ``"curve"`` (the discount curve),
+``"govt"`` (Treasury) or a projection index such as ``"EURIBOR 6M"``. Bumping
+the discount curve rebuilds the projection curves bootstrapped on it with
+their own quotes held, so a EURIBOR swap's discount-curve ladder includes
+the projection curve's response (market-quote risk, per curve). A bumped
+``BASIS`` quote moves a tenor basis spread by 1bp.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ import numpy as np
 from derivx.rates.curves import Curve, Market
 
 PvFunction = Callable[[Market], float]
-CURVE_FIELDS = ("curve", "govt")
+CURVE_FIELDS = ("curve", "govt")  # the single-curve keys; projection curves are keyed by index name
 
 
 @dataclass
@@ -44,23 +51,21 @@ class Position:
 
 
 def _curve(market: Market, which: str) -> Curve:
-    if which not in CURVE_FIELDS:
-        raise ValueError(f"which must be one of {CURVE_FIELDS}")
-    curve = getattr(market, which)
-    if curve is None:
-        raise ValueError(f"market has no {which!r} curve")
-    return curve
+    if which not in market.curve_keys:
+        if which == "govt":
+            raise ValueError("market has no 'govt' curve")
+        raise ValueError(f"which must be one of {list(market.curve_keys)}, got {which!r}")
+    return market.get_curve(which)
 
 
 def bumped_market(market: Market, which: str, bumps_bp) -> Market:
     """Market with one curve rebuilt from bumped quotes (see
-    :meth:`Curve.rebuilt` for the forms ``bumps_bp`` can take)."""
+    :meth:`Curve.rebuilt` for the forms ``bumps_bp`` can take) and the
+    projection curves built on it rebuilt with their quotes held (see
+    :meth:`Market.rebuilt`)."""
 
-    curve = _curve(market, which).rebuilt(bumps_bp)
-    changes = {which: curve}
-    if which == "curve" and market.fixings is None:
-        changes["fixings"] = market.curve  # past fixings stay where they were
-    return market.replace(**changes)
+    _curve(market, which)
+    return market.rebuilt({which: bumps_bp})
 
 
 def parallel_pv01(pv: PvFunction, market: Market, which: str = "curve", bp: float = 1.0) -> float:
@@ -98,7 +103,7 @@ def key_rate_pv01(pv: PvFunction, market: Market, which: str = "curve", bp: floa
                 "index": i,
                 "label": f"{quote.tenor} {quote.kind}",
                 "tenor": quote.tenor,
-                "years": inst.tenor.years,
+                "years": inst.years,
                 "pv01": (up - down) / (2.0 * bp),
             }
         )

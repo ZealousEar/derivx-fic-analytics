@@ -439,7 +439,7 @@ def _waterfall(total: Dict[str, float]) -> go.Figure:
 
 
 def _explain_table(rows: List[Dict[str, object]]) -> pd.DataFrame:
-    frame = pd.DataFrame(rows)
+    frame = pd.DataFrame(rows).drop(columns=["delta_by_curve"], errors="ignore")
     total = {"position": TOTAL, "kind": "", **frame.drop(columns=["position", "kind"]).sum().to_dict()}
     frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
     return frame[list(TABLE_LABELS)].rename(columns=TABLE_LABELS)

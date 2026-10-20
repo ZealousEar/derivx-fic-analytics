@@ -32,6 +32,17 @@ England's OIS curve for GBP, or the user's uploaded history), otherwise by a
 flagged proxy (government yield changes, i.e. swap spreads held). Each shock
 records the data behind every curve in ``Shock.sources``.
 
+Multi-curve markets: a shock moves the discount curve (``curve``), the
+projection curves (``projections``, e.g. EURIBOR 3M/6M) and the Treasury
+curve (``govt``) independently, each projection rebuilt on the moved
+discount curve. Rate shocks move rate quotes (``rates``) and leave tenor
+basis spreads alone; :func:`ibor_ois_basis` moves only the projection
+curves' rate quotes (IBOR-OIS basis widens) and :func:`tenor_basis` only
+their ``BASIS`` spreads (3s6s). A profile can be given per curve with
+``profiles`` selectors ``"<curve key>:<currency>"`` (``"EURIBOR 6M:EUR"``);
+a projection curve without its own profile follows its currency's swap
+curve profile. The P&L explain splits delta by curve (``delta_by_curve``).
+
 The key-rate gammas reuse the +/-1bp revaluations of the PV01s. On a
 bootstrapped curve the cross-gammas are not small (the 10Y swap's annuity
 moves with every shorter quote; diagonal gammas alone leave ~3% of a 100bp
@@ -51,8 +62,9 @@ import pandas as pd
 
 from derivx.data.rates_history import EPISODE_TOLERANCE_DAYS, HistoryStore, bundled_store, dataset_info, user_dataset
 from derivx.rates.conventions import Date, parse_tenor
-from derivx.rates.curves import Curve, Market
-from derivx.risk.sensitivities import CURVE_FIELDS, Position
+from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Curve, Market
+from derivx.rates.indices import CURRENCY_INDICES
+from derivx.risk.sensitivities import Position
 
 NORMAL_VOL_UNIT = 1e-4  # 1bp of normal vol
 LOGNORMAL_VOL_UNIT = 0.01  # 1 lognormal vol point
@@ -80,9 +92,10 @@ SWAP_PROXIES = {"USD": ("UST_PAR",), "GBP": ("UST_PAR",), "EUR": ("EUR_AAA_ECB",
 @dataclass(frozen=True)
 class ReplaySource:
     """The data a historical shock uses for one curve: ``selector`` is
-    ``"<curve field>:<currency>"``, ``flag`` one of ``"real"`` (the curve's
-    own market), ``"upload"`` (the user's history), ``"proxy"`` (another
-    market's moves, same currency) or ``"cross-currency proxy"``."""
+    ``"<curve field>:<currency>"`` (``"projections:EUR"`` for the projection
+    curves), ``flag`` one of ``"real"`` (the curve's own market),
+    ``"upload"`` (the user's history), ``"proxy"`` (another market's moves,
+    same currency) or ``"cross-currency proxy"``."""
 
     selector: str
     dataset: str
@@ -105,8 +118,11 @@ class Shock:
     ``profile`` is ``((years, bp), ...)``, linear in between and flat
     outside. ``short_bp``/``long_bp`` (optional) pin the move at the
     shortest/longest quote of each curve being shocked, so a twist reaches
-    its end values on any curve. ``curve``/``govt`` say which of the market's
-    curves move. ``normal_vol_bp`` is added to normal vols (bp) and
+    its end values on any curve. ``curve``/``govt``/``projections`` say
+    which of the market's curves move (discount, Treasury, projection;
+    ``projections=None`` follows ``curve``, so a swap-curve shock moves the
+    projection curves too); ``rates`` and ``spreads`` which of their quotes
+    (rate levels, ``BASIS`` spreads). ``normal_vol_bp`` is added to normal vols (bp) and
     ``lognormal_vol_pts`` to lognormal vols (vol points). ``horizon_days``
     rolls the market forward (calendar days, adjusted to a business day).
     """
@@ -123,6 +139,9 @@ class Shock:
     description: str = ""
     profiles: Tuple[Tuple[str, Profile], ...] = ()
     sources: Tuple[ReplaySource, ...] = ()
+    projections: Optional[bool] = None
+    rates: bool = True
+    spreads: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profile", _clean_profile(self.profile))
@@ -147,11 +166,16 @@ class Shock:
 
     def profile_for(self, which: Optional[str] = None, currency: Optional[str] = None) -> Profile:
         """The profile for one curve: ``profiles["<which>:<currency>"]``,
-        else ``profiles["<which>:*"]``, else ``profile``."""
+        else ``profiles["<which>:*"]``; a projection curve then falls back
+        to the swap curve's (``"curve:<currency>"``, ``"curve:*"``); else
+        ``profile``."""
 
         if which is not None:
             table = dict(self.profiles)
-            for selector in (f"{which}:{currency}", f"{which}:*"):
+            selectors = [f"{which}:{currency}", f"{which}:*"]
+            if which not in (DISCOUNT_KEY, GOVT_KEY):
+                selectors += [f"{DISCOUNT_KEY}:{currency}", f"{DISCOUNT_KEY}:*"]
+            for selector in selectors:
                 if selector in table:
                     return table[selector]
         return self.profile
@@ -192,17 +216,38 @@ class Shock:
         return np.interp(years, xs, ys)
 
     def quote_bumps(self, curve: Curve, which: Optional[str] = None) -> np.ndarray:
-        """bp move of each of ``curve.quotes``. ``which`` (``"curve"`` or
-        ``"govt"``) picks the per-curve profile; by default a curve built
-        only from bills and bonds is the government curve."""
+        """bp move of each of ``curve.quotes``. ``which`` (``"curve"``,
+        ``"govt"`` or a projection index) picks the per-curve profile; by
+        default a projection curve is its index, a curve built only from
+        bills and bonds the government curve. Rate quotes move only if
+        ``rates``, ``BASIS`` spreads only if ``spreads``."""
 
         if not curve.instruments:
             raise ValueError("the curve has no quotes to shock; bootstrap it from quotes")
         if which is None:
-            which = "govt" if all(inst.kind in GOVT_KINDS for inst in curve.instruments) else "curve"
+            index = getattr(curve, "index", None)
+            if index is not None:
+                which = index.name
+            else:
+                which = GOVT_KEY if all(inst.kind in GOVT_KINDS for inst in curve.instruments) else DISCOUNT_KEY
         currency = curve.conventions.currency if curve.conventions is not None else None
-        years = np.array([inst.tenor.years for inst in curve.instruments])
-        return self.bp_at(years, (float(years.min()), float(years.max())), which, currency)
+        years = curve.years
+        bumps = self.bp_at(years, (float(years.min()), float(years.max())), which, currency)
+        spread = np.array([inst.kind in SPREAD_KINDS for inst in curve.instruments])
+        return np.where(spread, bumps if self.spreads else 0.0, bumps if self.rates else 0.0)
+
+    def applies_to(self, which: str) -> bool:
+        """Whether the shock moves the curve with key ``which``."""
+
+        if which == DISCOUNT_KEY:
+            return self.curve
+        if which == GOVT_KEY:
+            return self.govt
+        return self.moves_projections
+
+    @property
+    def moves_projections(self) -> bool:
+        return self.curve if self.projections is None else bool(self.projections)
 
     @property
     def moves_rates(self) -> bool:
@@ -210,7 +255,8 @@ class Shock:
 
         moves = [b for _, b in self.profile] + [b for b in (self.short_bp, self.long_bp) if b is not None]
         moves += [b for _, profile in self.profiles for _, b in profile]
-        return (self.curve or self.govt) and any(b != 0.0 for b in moves)
+        curves = self.curve or self.govt or self.moves_projections
+        return curves and (self.rates or self.spreads) and any(b != 0.0 for b in moves)
 
 
 def _clean_profile(profile: Sequence[Tuple[float, float]]) -> Profile:
@@ -299,6 +345,37 @@ def _years(tenor: Union[str, float]) -> float:
     return float(tenor) if isinstance(tenor, (int, float)) else parse_tenor(str(tenor)).years
 
 
+def ibor_ois_basis(bp: float, indices: Optional[Sequence[str]] = None, **settings) -> Shock:
+    """Projection curves' rate quotes move by ``bp`` (all, or ``indices``
+    only) while the discount and Treasury curves stay: the IBOR-OIS basis
+    widens. Tenor basis spreads are held, so a curve built from basis swaps
+    on a moved index moves with it."""
+
+    fields: Dict[str, object] = dict(curve=False, govt=False, projections=True, rates=True, spreads=False)
+    label = "all projection curves" if not indices else ", ".join(indices)
+    if indices:
+        fields["profiles"] = tuple((f"{str(i).strip().upper()}:*", ((0.0, float(bp)),)) for i in indices)
+        profile: List[Tuple[float, float]] = []
+    else:
+        profile = [(0.0, float(bp))]
+    return _shock(f"IBOR-OIS basis {bp:+g}bp", profile, settings, description=f"{label} rate quotes {bp:+g}bp, "
+                  "discount curve unchanged", **fields)  # fmt: skip
+
+
+def tenor_basis(bp: float, indices: Optional[Sequence[str]] = None, **settings) -> Shock:
+    """Only tenor basis swap spreads (``BASIS`` quotes, e.g. 3s6s) move by
+    ``bp``: the shorter tenor's projection curve moves against the other."""
+
+    fields: Dict[str, object] = dict(curve=False, govt=False, projections=True, rates=False, spreads=True)
+    label = "every basis spread" if not indices else ", ".join(indices) + " basis spreads"
+    if indices:
+        fields["profiles"] = tuple((f"{str(i).strip().upper()}:*", ((0.0, float(bp)),)) for i in indices)
+        profile: List[Tuple[float, float]] = []
+    else:
+        profile = [(0.0, float(bp))]
+    return _shock(f"Tenor basis {bp:+g}bp", profile, settings, description=f"{label} {bp:+g}bp", **fields)
+
+
 def key_rates(moves: Mapping[Union[str, float], float], **settings) -> Shock:
     """Moves at key tenors (``"10Y"`` or years), linear in between and flat
     beyond the first and last: the sum of Ho key-rate tents. To move one
@@ -382,6 +459,17 @@ def _replay(
         move, flag, note = _swap_move(store, currency, start, end, tolerance)
         profiles.append((f"curve:{currency}", tuple((y, b * scale) for y, b in move.profile)))
         sources.append(_replay_source(f"curve:{currency}", move, flag, note))
+        indices = CURRENCY_INDICES.get(currency, ())
+        if indices:
+            sources.append(
+                _replay_source(
+                    f"projections:{currency}",
+                    move,
+                    "proxy",
+                    f"no free {' / '.join(indices)} swap or basis history: the projection curves move with the "
+                    f"{currency} swap curve above ({flag}), so IBOR-OIS and tenor basis are held",
+                )
+            )
     label = name if scale == 1.0 else f"{name} x{scale:g}"
     return _shock(
         label,
@@ -446,9 +534,10 @@ def historical_sources(shock: Shock) -> pd.DataFrame:
     """One row per curve and currency of a historical shock: which data it
     replays, the dates used and whether it is the curve's own market."""
 
+    names = {"govt": "TREASURY", "projections": "PROJECTION"}
     rows = [
         {
-            "curve": "TREASURY" if src.selector.startswith("govt") else "SWAP",
+            "curve": names.get(src.selector.split(":", 1)[0], "SWAP"),
             "currency": src.selector.split(":", 1)[1],
             "data": src.title,
             "start": src.start,
@@ -493,16 +582,23 @@ def horizon_date(market: Market, days: int) -> Date:
     return conv.cal.adjust(target, "F") if conv is not None else target
 
 
+def shocked_curves(market: Market) -> Tuple[str, ...]:
+    """Curves a shock can move: every key of the market except a projection
+    that is the discount curve itself (it moves with it)."""
+
+    return tuple(k for k in market.curve_keys if k in (DISCOUNT_KEY, GOVT_KEY) or not market.projections.is_discount(k))
+
+
 def _bumps(market: Market, shock: Shock) -> Dict[str, np.ndarray]:
     """bp move of every quote of each curve the shock moves (non-zero only)."""
 
     out: Dict[str, np.ndarray] = {}
     if not shock.moves_rates:
         return out
-    for which in CURVE_FIELDS:
-        curve = getattr(market, which)
-        if curve is None or not getattr(shock, which):
+    for which in shocked_curves(market):
+        if not shock.applies_to(which):
             continue
+        curve = market.get_curve(which)
         if not curve.instruments:
             raise ValueError(f"the {which!r} curve has no quotes to shock; bootstrap it from quotes")
         bumps = shock.quote_bumps(curve, which)
@@ -518,24 +614,15 @@ def _moved(
     normal_bp: float = 0.0,
     lognormal_pts: float = 0.0,
 ) -> Market:
-    """Market with curves rebuilt on ``at`` from bumped quotes; past fixings
-    stay on today's curve."""
+    """Market with curves rebuilt on ``at`` from bumped quotes (projection
+    curves rebuilt on the moved discount curve); past fixings stay on
+    today's curves."""
 
-    rolled = at != market.asof
-    if rolled and market.fixings is not None:
-        raise ValueError("cannot roll a market that already has a separate fixings curve")
-    changes: Dict[str, object] = {}
-    for which in CURVE_FIELDS:
-        curve = getattr(market, which)
-        if curve is not None and (which in bumps or rolled):
-            if not curve.quotes:
-                raise ValueError(f"cannot roll the {which!r} curve to {at}: it has no quotes to rebuild from")
-            changes[which] = curve.rebuilt(list(bumps.get(which, np.zeros(len(curve.quotes)))), asof=at)
-    return market.replace(
+    moved = market.rebuilt({k: list(b) for k, b in bumps.items()}, asof=at)
+    return moved.replace(
         fixings=market.fixing_curve,
         vol_shift_normal=market.vol_shift_normal + normal_bp * NORMAL_VOL_UNIT,
         vol_shift_lognormal=market.vol_shift_lognormal + lognormal_pts * LOGNORMAL_VOL_UNIT,
-        **changes,
     )
 
 
@@ -599,7 +686,7 @@ def quote_risk(
     from one +/-``bp`` pair of rebuilds per quote (only ``indices`` if given;
     the other rows are zero). ``base`` reuses today's PVs."""
 
-    curve = getattr(market, which, None) if which in CURVE_FIELDS else None
+    curve = market.get_curve(which) if which in market.curve_keys else None
     if curve is None or not curve.quotes:
         raise ValueError(f"market has no {which!r} curve with quotes to bump")
     if not (math.isfinite(bp) and bp > 0):
@@ -617,7 +704,7 @@ def quote_risk(
     return QuoteRisk(
         which=which,
         labels=tuple(curve.labels),
-        years=np.array([inst.tenor.years for inst in curve.instruments]),
+        years=curve.years,
         pv01=pv01,
         gamma=gamma,
         computed=computed,
@@ -671,8 +758,9 @@ def run_scenario(
     """Full revaluation and P&L explain of each position (see the module
     docstring): one row per position with ``position``, ``kind``,
     ``base_pv``, ``shocked_pv`` (value at the horizon), ``cash`` (paid in the
-    window), ``pnl`` and the explain columns ``delta``, ``gamma``,
-    ``cross_gamma``, ``vol``, ``carry``, ``residual``.
+    window), ``pnl``, the explain columns ``delta``, ``gamma``,
+    ``cross_gamma``, ``vol``, ``carry``, ``residual`` and ``delta_by_curve``
+    ({curve key: delta from that curve's quote moves}, summing to ``delta``).
 
     ``risk`` ({curve field: :func:`quote_risk`}) reuses key-rate risk
     precomputed on the market the shock hits (``market`` itself, or
@@ -694,6 +782,7 @@ def run_scenario(
     bumps = _bumps(rolled, shock)
 
     delta, gamma = np.zeros(n), np.zeros(n)
+    delta_by_curve: Dict[str, np.ndarray] = {}
     for which, b in bumps.items():
         moved = np.flatnonzero(b)
         qr = (risk or {}).get(which)
@@ -704,7 +793,8 @@ def run_scenario(
             or not qr.computed[moved].all()
         ):
             qr = quote_risk(positions, rolled, which, indices=moved, base=rolled_pv)
-        delta += b @ qr.pv01
+        delta_by_curve[which] = b @ qr.pv01
+        delta += delta_by_curve[which]
         gamma += 0.5 * (b * b) @ qr.gamma
 
     cross = np.zeros(n)
@@ -728,7 +818,12 @@ def run_scenario(
     residual = pnl - (carry + delta + gamma + cross + vol)
     columns = (base, shocked_pv, cash, pnl, delta, gamma, cross, vol, carry, residual)
     return [
-        {"position": p.name, "kind": p.kind, **dict(zip(ROW_COLUMNS[2:], (float(c[k]) for c in columns)))}
+        {
+            "position": p.name,
+            "kind": p.kind,
+            **dict(zip(ROW_COLUMNS[2:], (float(c[k]) for c in columns))),
+            "delta_by_curve": {which: float(v[k]) for which, v in delta_by_curve.items()},
+        }
         for k, p in enumerate(positions)
     ]
 

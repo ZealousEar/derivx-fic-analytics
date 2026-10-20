@@ -4,17 +4,28 @@ Market data arrives in percent (FRED, Treasury), in decimals, or in basis
 points, with labels like ``1 Mo``, ``ON`` or ``10y``. :func:`clean_quotes`
 turns a table of rows into decimal :class:`CurveQuote` objects and reports
 every problem it finds instead of silently building a wrong curve.
+
+Futures rows (``SR1``, ``SR3``, ``FUT``) are quoted as a price (100 - rate,
+e.g. 96.25) whatever the table's units, with the contract month as the
+tenor (``DEC26``, ``Z26``, ``2026-12``); they become futures rates. ``FRA``
+tenors are ``AxB`` (months to start x months to end). ``BASIS`` rows are
+spreads in the table's units; the units are read from the rate rows only.
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import re
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Optional, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .conventions import parse_tenor
-from .curves import INSTRUMENT_KINDS, CurveQuote
+from .curves import INSTRUMENT_KINDS, SPREAD_KINDS, CurveQuote
+from .indices import FUTURES_KINDS, contract_label, futures_rate_from_price, parse_contract
+
+_FRA_LABEL = re.compile(r"^\s*(\d{1,3})\s*[Xx\u00d7]\s*(\d{1,3})\s*$")
 
 RATE_RANGE = (-0.05, 0.30)  # accepted after unit conversion
 UNIT_SCALE = {"decimal": 1.0, "percent": 0.01, "bp": 1e-4}
@@ -70,15 +81,22 @@ def clean_quotes(
     rows: Iterable[Mapping[str, object]],
     units: str = "auto",
     default_kind: Optional[str] = None,
+    kinds: Sequence[str] = INSTRUMENT_KINDS,
+    asof: Optional[dt.date] = None,
 ) -> Tuple[List[CurveQuote], List[Issue], str]:
     """Rows with ``kind`` (or ``instrument``), ``tenor`` and ``rate`` keys ->
     (quotes in decimals, issues, units used).
 
+    ``kinds`` are the instruments the table may hold (the discount curve's
+    by default; :data:`derivx.rates.multicurve.PROJECTION_KINDS` for a
+    projection curve); ``asof`` resolves one-digit futures years (``Z6``).
     Blank rows are skipped. Unknown kinds or tenors, non-numeric or
-    out-of-range rates, duplicate tenors and (with ``auto``) magnitudes
-    whose units cannot be told apart (:func:`ambiguous_units`) are errors.
+    out-of-range rates or prices, duplicate tenors or contracts and (with
+    ``auto``) magnitudes whose units cannot be told apart
+    (:func:`ambiguous_units`) are errors.
     """
 
+    kinds = tuple(k.upper() for k in kinds)
     issues: List[Issue] = []
     parsed = []
     for n, row in enumerate(rows, start=1):
@@ -88,48 +106,82 @@ def clean_quotes(
         if all(v is None or str(v).strip() in ("", "nan", "None") for v in (tenor_raw, rate_raw)):
             continue
         kind = str(kind_raw or "").strip().upper()
-        if kind not in INSTRUMENT_KINDS:
-            issues.append(
-                Issue("error", f"row {n}: instrument {kind_raw!r} is not one of {', '.join(INSTRUMENT_KINDS)}")
-            )
+        if kind not in kinds:
+            issues.append(Issue("error", f"row {n}: instrument {kind_raw!r} is not one of {', '.join(kinds)}"))
             continue
         try:
-            tenor = parse_tenor(str(tenor_raw))
+            tenor = _parse_label(kind, str(tenor_raw), asof)
         except ValueError as exc:
             issues.append(Issue("error", f"row {n}: {exc}"))
             continue
         try:
             rate = float(str(rate_raw).replace("%", "").strip())
         except ValueError:
-            issues.append(Issue("error", f"row {n}: rate {rate_raw!r} is not a number"))
+            issues.append(Issue("error", f"row {n}: {'price' if kind in FUTURES_KINDS else 'rate'} {rate_raw!r} "
+                                         "is not a number"))  # fmt: skip
             continue
         if not np.isfinite(rate):
             issues.append(Issue("error", f"row {n}: rate is missing"))
             continue
         parsed.append((n, kind, tenor, rate))
 
+    level_rates = [r for _, k, _, r in parsed if k not in FUTURES_KINDS and k not in SPREAD_KINDS]
     if units == "auto":
-        reason = ambiguous_units([r for *_, r in parsed])
+        if not level_rates and any(k in SPREAD_KINDS for _, k, _, _ in parsed):
+            return (
+                [],
+                issues + [Issue("error", "a table of basis spreads only: choose its units instead of auto")],
+                units,
+            )
+        reason = ambiguous_units(level_rates)
         if reason:
             return [], issues + [Issue("error", reason)], units
-        units = detect_units([r for *_, r in parsed])
-        if units != "decimal" and parsed:
+        units = detect_units(level_rates)
+        if units != "decimal" and level_rates:
             issues.append(Issue("info", f"Rates read as {units} and converted to decimals"))
     scale = UNIT_SCALE[units]
 
     quotes: List[CurveQuote] = []
     seen = {}
     for n, kind, tenor, rate in parsed:
-        value = rate * scale
-        if not RATE_RANGE[0] <= value <= RATE_RANGE[1]:
-            issues.append(Issue("error", f"row {n}: {value:.4%} is outside {RATE_RANGE[0]:.0%} to {RATE_RANGE[1]:.0%}"))
-            continue
-        key = (tenor.n, tenor.unit, tenor.anchor)
+        if kind in FUTURES_KINDS:
+            try:
+                value = futures_rate_from_price(rate)
+            except ValueError as exc:
+                issues.append(Issue("error", f"row {n}: {exc}"))
+                continue
+            key, label = (kind, tenor), tenor
+        else:
+            value = rate * scale
+            if not RATE_RANGE[0] <= value <= RATE_RANGE[1]:
+                issues.append(
+                    Issue("error", f"row {n}: {value:.4%} is outside {RATE_RANGE[0]:.0%} to {RATE_RANGE[1]:.0%}")
+                )
+                continue
+            if isinstance(tenor, str):  # FRA label
+                key, label = ("FRA", tenor), tenor
+            else:
+                key, label = (tenor.n, tenor.unit, tenor.anchor), str(tenor)
         if key in seen:
-            issues.append(Issue("error", f"row {n}: tenor {tenor} repeats row {seen[key]}; keep one quote per tenor"))
+            what = "contract" if kind in FUTURES_KINDS else "tenor"
+            issues.append(Issue("error", f"row {n}: {what} {label} repeats row {seen[key]}; keep one quote per {what}"))
             continue
         seen[key] = n
-        quotes.append(CurveQuote(kind, str(tenor), value))
+        quotes.append(CurveQuote(kind, label, value))
     if not quotes and not any(i.level == "error" for i in issues):
         issues.append(Issue("error", "no quotes entered"))
     return quotes, issues, units
+
+
+def _parse_label(kind: str, text: str, asof: Optional[dt.date]):
+    """Tenor (a :class:`~derivx.rates.conventions.Tenor`), FRA label
+    (``"6X12"``) or futures contract label (``"DEC26"``) of a row."""
+
+    if kind in FUTURES_KINDS:
+        return contract_label(*parse_contract(text, asof))
+    if kind == "FRA":
+        match = _FRA_LABEL.match(text)
+        if not match or int(match.group(2)) <= int(match.group(1)):
+            raise ValueError(f"FRA {text!r}: write months to start x months to end, e.g. 6X12")
+        return f"{int(match.group(1))}X{int(match.group(2))}"
+    return parse_tenor(text)
