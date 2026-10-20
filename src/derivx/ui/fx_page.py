@@ -102,6 +102,20 @@ FX_CSS = """
 }
 </style>
 """
+SHORT_LABELS = {
+    "MARKET": "MARKET (PAIR DEFAULT)",
+    "spot": "SPOT",
+    "forward": "FORWARD",
+    "spot_pa": "SPOT, PREMIUM-ADJ.",
+    "forward_pa": "FORWARD, PREMIUM-ADJ.",
+    "DNS": "ATM DNS",
+    "ATMF": "ATMF",
+    "SPOT": "ATM SPOT",
+    "market": "MARKET STRANGLE",
+    "smile": "SMILE STRANGLE",
+    "SABR": "SABR (β = 1 FIXED)",
+    "VV": "VANNA-VOLGA",
+}
 SURFACE_COLORS = [[0.0, "#003B82"], [0.35, "#35C1FF"], [0.6, "#7FFFD4"], [0.8, "#FFE66D"], [1.0, "#E5243B"]]
 SCENARIO_SPOT_STEPS = calc.SHOCK_STEPS
 SCENARIO_VOL_STEPS = calc.VOL_STEPS
@@ -377,7 +391,7 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
             format="%.2f",
             help="25 = the 25-delta option of the chosen type, in the delta convention of the quotes.",
         )
-    sb.markdown("#### / NOTIONAL AND PREMIUM")
+    sb.markdown("**/ NOTIONAL AND PREMIUM**")
     ccys = [pair.base, pair.quote]
     notional = _num("NOTIONAL", _k("notional"), min_value=0.0, step=100_000.0, format="%.0f")
     n_ccy = sb.radio("NOTIONAL CCY", ccys, horizontal=True, key=_k("notional_ccy", pair), persist_state=PERSIST)
@@ -390,7 +404,7 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
         help=f"Market default for {pair.label}: {pair.premium_ccy}. A premium in {pair.base} makes the hedge delta "
         "premium-adjusted.",
     )
-    sb.markdown("#### / CARRY")
+    sb.markdown("**/ CARRY**")
     carry = sb.radio("CARRY FROM", CARRY_MODES, horizontal=True, key=_k("carry"), persist_state=PERSIST)
     rd = _num(
         f"{pair.quote} RATE (%, CONT. ACT/365F)",
@@ -410,26 +424,38 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
             step=0.05,
             format="%.4f",
         )
-    sb.markdown("#### / VOL QUOTE CONVENTIONS")
+    sb.markdown("**/ VOL QUOTE CONVENTIONS**")
     delta_conv = sb.selectbox(
         "DELTA",
         ("MARKET",) + DELTA_TYPES,
         key=_k("delta_conv"),
         persist_state=PERSIST,
-        format_func=lambda d: "MARKET (PAIR DEFAULT)" if d == "MARKET" else DELTA_TYPE_LABELS[d],
+        format_func=SHORT_LABELS.get,
         help="MARKET: spot delta to 1Y and forward delta beyond; premium-adjusted when the pair's market premium "
         "currency is the base currency (USDJPY, USDCHF, USDCAD and the EUR crosses).",
     )
     atm_type = sb.selectbox(
-        "ATM", ATM_TYPES, key=_k("atm_type"), persist_state=PERSIST, format_func=lambda a: ATM_TYPE_LABELS[a]
+        "ATM",
+        ATM_TYPES,
+        key=_k("atm_type"),
+        persist_state=PERSIST,
+        format_func=SHORT_LABELS.get,
+        help="DNS: delta-neutral straddle (premium-adjusted with premium-adjusted deltas); ATMF: K = forward; "
+        "SPOT: K = spot.",
     )
     strangle = sb.selectbox(
-        "BUTTERFLY", STRANGLE_CONVENTIONS, key=_k("strangle"), persist_state=PERSIST, format_func=STRANGLE_LABELS.get
+        "BUTTERFLY",
+        STRANGLE_CONVENTIONS,
+        key=_k("strangle"),
+        persist_state=PERSIST,
+        format_func=SHORT_LABELS.get,
+        help="MARKET: the broker fly (one vol ATM + BF for both strikes; the smile reprices that strangle). "
+        "SMILE: BF = (σ(25C) + σ(25P)) / 2 − ATM on the smile.",
     )
     model = sb.selectbox(
-        "SMILE MODEL", SMILE_MODELS, key=_k("model"), persist_state=PERSIST, format_func=MODEL_LABELS.get
+        "SMILE MODEL", SMILE_MODELS, key=_k("model"), persist_state=PERSIST, format_func=SHORT_LABELS.get
     )
-    sb.markdown("#### / VOL")
+    sb.markdown("**/ VOL**")
     vol_src = sb.radio(
         "PRICE AT",
         VOL_SOURCES,
