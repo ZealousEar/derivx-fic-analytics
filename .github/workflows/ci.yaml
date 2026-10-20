@@ -20,7 +20,7 @@ jobs:
           pip install -r requirements.txt
           pip install -e .[dev]
       - name: Lint rates modules
-        run: ruff check --isolated --select E,F,W,I --line-length 120 src/derivx/rates/conventions.py src/derivx/rates/curves.py src/derivx/rates/quotes.py src/derivx/rates/examples.py src/derivx/risk/sensitivities.py src/derivx/ui/plot_limits.py src/derivx/ui/theme.py src/derivx/ui/rates_curve.py tools/golden tools/gen_golden.py
+        run: ruff check --isolated --select E,F,W,I --line-length 120 src/derivx/rates/conventions.py src/derivx/rates/curves.py src/derivx/rates/quotes.py src/derivx/rates/examples.py src/derivx/risk/sensitivities.py src/derivx/ui/plot_limits.py src/derivx/ui/theme.py src/derivx/ui/rates_curve.py src/derivx/rates/swaps.py src/derivx/rates/capfloor.py src/derivx/rates/bonds.py src/derivx/risk/scenarios.py src/derivx/ui/rates_swap.py src/derivx/ui/rates_capfloor.py src/derivx/ui/rates_bonds.py src/derivx/ui/rates_scenarios.py tools/golden tools/gen_golden.py tools/build_historical_shocks.py
       - name: Tests (golden fixtures, plus live QuantLib checks from the dev extra)
         run: pytest -q
 
