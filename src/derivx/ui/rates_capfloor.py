@@ -14,7 +14,7 @@ and a one-day theta."""
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -215,9 +215,18 @@ def _quote_tables(market: Market, layout: str):
     return mats, grid, strikes, not edited.equals(default)
 
 
+def _quote_terms(terms: Dict[str, object]) -> Dict[str, object]:
+    """Schedule of the quoted caps: the trade's index, calendar and day
+    count, but spot-start (cap vols are quoted on spot-start caps, whatever
+    forward start the trade has)."""
+
+    return {k: v for k, v in terms.items() if k != "forward_start"}
+
+
 def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, object]:
     """Quote editor and stripping settings; returns the stripped vols (a
-    curve for ATM quotes, a surface by strike) and what they came from."""
+    curve for ATM quotes, a surface by strike) and what they came from.
+    ``terms`` are the quoted caps' schedule (:func:`_quote_terms`)."""
 
     st.markdown("#### / CAP VOL QUOTES")
     c1, c2 = st.columns(2)
@@ -244,6 +253,9 @@ def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, obje
 
 
 def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms: Dict[str, object]) -> None:
+    """Stripped caplet vols, repricing table, caplet smile and quote vegas;
+    ``terms`` are the quoted (spot-start) caps' schedule."""
+
     results, method, source = stripped["results"], stripped["method"], stripped["source"]
     st.markdown("### / STRIPPED CAPLET VOLS")
     shown = results
@@ -283,23 +295,33 @@ def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms
         expiry = labels[choice]
         longest = CapFloor(1.0, "cap", 0.03, results[0].table["maturity"].iloc[-1], 0.01, **terms).caplets(market)
         forward = float(longest.iloc[int(np.argmin(np.abs(longest["expiry"].to_numpy() - expiry)))]["forward"])
-        st.plotly_chart(_smile_chart(surface, expiry, forward, source, market.asof), width="stretch",
-                        config=PLOTLY_2D_CONFIG, key="cap_smile_chart")  # fmt: skip
+        fig, fit_note = _smile_chart(surface, expiry, forward, source, market.asof)
+        st.plotly_chart(fig, width="stretch", config=PLOTLY_2D_CONFIG, key="cap_smile_chart")
         st.caption(
-            f"Caplet vols stripped at each quoted strike for the caplet fixing {expiry:.2f}Y ahead, and a normal "
-            f"SABR (beta 0, shift {SMILE_SHIFT:.0%}) fitted to them; the diamond is that caplet's forward."
+            f"Caplet vols stripped at each quoted strike for the caplet fixing {expiry:.2f}Y ahead"
+            + (f", and a normal SABR (beta 0, shift {SMILE_SHIFT:.0%}) fitted to them" if not fit_note else "")
+            + "; the diamond is that caplet's forward."
+            + (f" No SABR fit is drawn: {fit_note}." if fit_note else "")
         )
     elif st.checkbox("SHOW VEGA BY QUOTED CAP (RE-STRIPS EACH QUOTE)", value=False, key="cap_quote_vega"):
         key = (rates_risk.market_key(market), repr(cf), tuple(stripped["maturities"]),
                tuple(np.ravel(stripped["flat"]).tolist()), method)  # fmt: skip
-        vegas = rates_risk.cached("cap_quote_vega", key, lambda: quote_vegas(
-            cf, market, stripped["maturities"], stripped["flat"], None, method, terms))  # fmt: skip
-        view = vegas.rename(columns={"maturity": "QUOTED CAP", "vega": "VEGA (PER +1BP FLAT VOL)"})
+        try:
+            vegas = rates_risk.cached("cap_quote_vega", key, lambda: quote_vegas(
+                cf, market, stripped["maturities"], stripped["flat"], None, method, terms))  # fmt: skip
+        except ValueError as err:
+            st.warning(f"No vega by quoted cap: {err}")
+            return
+        view = vegas.rename(columns={"maturity": "QUOTED CAP", "vega": "VEGA (PER +1BP FLAT VOL)",
+                                     "difference": "DIFFERENCE"})  # fmt: skip
         st.dataframe(view, hide_index=True, width="stretch", column_config={"VEGA (PER +1BP FLAT VOL)": MONEY_2DP})
+        one_sided = [r.maturity for r in vegas.itertuples() if r.difference != "central"]
         st.caption(
             f"P&L for +1bp on one quoted flat vol, caplet vols re-stripped (central difference). Sum "
             f"{vegas['vega'].sum():,.2f}; quotes beyond the cap's last caplet do not move it."
-        )
+            + (f" One-sided at {', '.join(one_sided)}: the other side of the bump cannot be stripped (flat vols "
+               "falling about as fast as non-negative caplet vols allow)." if one_sided else "")
+        )  # fmt: skip
 
 
 def _vol_strip_chart(results, method: str, source: str, asof) -> go.Figure:
@@ -322,8 +344,12 @@ def _vol_strip_chart(results, method: str, source: str, asof) -> go.Figure:
                       yaxis=axis_limits(shown, pad=0.1, floor=0.0))  # fmt: skip
 
 
-def _smile_chart(surface: CapletVolSurface, expiry: float, forward: float, source: str, asof) -> go.Figure:
+def _smile_chart(surface: CapletVolSurface, expiry: float, forward: float, source: str, asof) -> Tuple[go.Figure, str]:
+    """Stripped caplet vols at one expiry and a normal SABR fit; returns the
+    figure and why no fit is drawn (empty when it is)."""
+
     strikes, vols = surface.smile(expiry)
+    note = ""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=strikes * 100, y=vols * 1e4, mode="markers", name="STRIPPED CAPLET VOLS",
                              marker=dict(color=SERIES[3], size=9)))  # fmt: skip
@@ -331,18 +357,20 @@ def _smile_chart(surface: CapletVolSurface, expiry: float, forward: float, sourc
     xs = list(strikes * 100) + [forward * 100]
     try:
         fit = calibrate_sabr_smile(strikes, vols, expiry, forward, 0.0, SMILE_SHIFT, vol_type="normal")
+        if not fit.success:
+            raise ValueError(f"the fit did not converge ({fit.message})")
         grid = np.linspace(strikes.min(), strikes.max(), 120)
         line = sabr_vol(forward, grid, expiry, fit.alpha, 0.0, fit.rho, fit.nu, SMILE_SHIFT, "normal") * 1e4
         fig.add_trace(go.Scatter(x=grid * 100, y=line, mode="lines", name=f"NORMAL SABR (RMSE {fit.rmse_bp:.2f}BP)",
                                  line=dict(color=SERIES[0], width=2)))  # fmt: skip
         shown += list(line)
-    except ValueError:
-        pass  # too few strikes or a smile SABR cannot fit: the stripped points are still shown
+    except ValueError as err:  # too few strikes or SABR cannot fit: the stripped points are still shown
+        note = str(err).rstrip(".")
     fig.add_trace(go.Scatter(x=[forward * 100], y=[float(np.interp(forward, strikes, vols)) * 1e4], mode="markers",
                              name="CAPLET FORWARD", marker=dict(color=ACCENT, size=12, symbol="diamond")))  # fmt: skip
     dark_layout(fig, height=340, xtitle="STRIKE (%)", ytitle="CAPLET NORMAL VOL (BP)")
     rates_data.badge(fig, source, asof)
-    return bound_axes(fig, xaxis=axis_limits(xs, pad=0.05), yaxis=axis_limits(shown, pad=0.12, floor=0.0))
+    return bound_axes(fig, xaxis=axis_limits(xs, pad=0.05), yaxis=axis_limits(shown, pad=0.12, floor=0.0)), note
 
 
 def _vega_chart(buckets: pd.DataFrame, per: str) -> go.Figure:
@@ -438,7 +466,7 @@ def render(market: Market) -> List[Position]:
         atm = CapFloor(notional, kind, 0.0, tenor, 0.0, **terms).atm_strike(market)
         strike = strike_pct / 100 if strike_mode == "Absolute %" else atm + offset_bp * 1e-4
         if vol_mode == "Stripped from cap quotes":
-            stripped = _stripped_inputs(market, terms)
+            stripped = _stripped_inputs(market, _quote_terms(terms))
             vol = stripped["vol"]
         cf = CapFloor(notional, kind, strike, tenor, vol, model, shift, **terms)
         table = cf.caplets(market)
@@ -503,7 +531,7 @@ def render(market: Market) -> List[Position]:
         f"discount factors and vols held) is {decay:,.2f}."
     )
     if stripped is not None:
-        _show_strip(stripped, cf, market, terms)
+        _show_strip(stripped, cf, market, _quote_terms(terms))
     if vol_mode == "Flat" and vol == 0.0:
         st.warning("Zero vol: every caplet is worth only its intrinsic value on the forward.")
     pillars = market.curve.pillar_dates
