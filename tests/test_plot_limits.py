@@ -106,12 +106,14 @@ def test_every_pricer_chart_is_zoom_bounded(mode):
     at.sidebar.radio[0].set_value(mode).run()
     assert not at.exception
     charts = _charts(at)
-    # Equity/FX: surface + smile; Rates: every chart across its five tabs.
-    assert len(charts) == 2 if mode != "[ RATES ]" else len(charts) >= 5
+    # Equity/FX: scenario grid + risk surface + smile; Rates: every chart across its five tabs.
+    assert len(charts) == 3 if mode != "[ RATES ]" else len(charts) >= 5
     for spec, config in charts:
         _assert_bounded(spec, config)
     if mode != "[ RATES ]":
-        smile = charts[1][0]["layout"]
+        named = {spec["layout"]["meta"]["chart"]: spec["layout"] for spec, _ in charts}
+        assert set(named) == {"scenario", "surface", "smile"}
+        smile = named["smile"]
         assert smile["xaxis"]["minallowed"] >= 0.0  # no negative strikes
         assert smile["yaxis"]["minallowed"] >= 0.0
 
