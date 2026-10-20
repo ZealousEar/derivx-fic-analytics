@@ -10,10 +10,10 @@ from derivx.vol.svi import svi_iv
 
 def _daily_chain(trade_date: dt.date, shift: float = 0.0, expiry: Optional[dt.date] = None) -> pd.DataFrame:
     expiry = expiry or (dt.date(2024, 2, 1))
-    strikes = np.linspace(90, 110, 5)
+    strikes = np.linspace(90, 110, 9)
     forward = 100.0 + shift
     params = {"a": 0.02, "b": 0.25, "rho": -0.1, "m": 0.0, "s": 0.35}
-    ivs = np.array([svi_iv(k, params, F=forward) for k in strikes]) + 0.0002 * shift
+    ivs = svi_iv(strikes, params, F=forward, T=1.0) + 0.0002 * shift  # params: total variance at T = 1
     df = pd.DataFrame(
         {
             "trade_date": pd.Timestamp(trade_date),

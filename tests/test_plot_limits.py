@@ -64,14 +64,14 @@ def _chain(trade_date: dt.date) -> pd.DataFrame:
             "trade_date": pd.Timestamp(trade_date),
             "expiry": pd.Timestamp(trade_date + dt.timedelta(days=30)),
             "strike": strikes,
-            "implied_vol": [svi_iv(k, params, F=100.0) for k in strikes],
+            "implied_vol": svi_iv(strikes, params, F=100.0, T=1.0),  # params: total variance at T = 1
             "underlying_price": 100.0,
             "bid": 1.0,
             "ask": 1.2,
             "mid": 1.1,
             "volume": 50,
             "open_interest": 100,
-            "option_type": "call",
+            "option_type": np.where(strikes < 100.0, "put", "call"),
         }
     )
     df["moneyness"] = df["strike"] / 100.0

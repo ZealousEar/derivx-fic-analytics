@@ -13,7 +13,7 @@ EXPIRY = pd.Timestamp("2024-03-15")
 
 
 def _chain(trade_date: dt.date, shift: float) -> pd.DataFrame:
-    strikes = np.linspace(80, 120, 9)
+    strikes = np.linspace(80, 120, 17)  # 13 inside the tab's 0.85-1.15 band: more than 5 SVI params
     forward = 100.0 + shift
     params = {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "s": 0.4}
     return pd.DataFrame(
@@ -21,14 +21,14 @@ def _chain(trade_date: dt.date, shift: float) -> pd.DataFrame:
             "trade_date": pd.Timestamp(trade_date),
             "expiry": EXPIRY,
             "strike": strikes,
-            "implied_vol": [svi_iv(k, params, F=forward) for k in strikes],
+            "implied_vol": svi_iv(strikes, params, F=forward, T=1.0),  # params: total variance at T = 1
             "underlying_price": forward,
             "bid": 1.0,
             "ask": 1.2,
             "mid": 1.1,
             "volume": 50,
             "open_interest": 100,
-            "option_type": "call",
+            "option_type": np.where(strikes < forward, "put", "call"),
         }
     )
 
