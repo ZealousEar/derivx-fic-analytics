@@ -1,9 +1,14 @@
 """SCENARIOS tab of the Rates page: shock curve quotes and vols, roll the
 market forward, explain each position's P&L and run the standard scenario
-library over the portfolio."""
+library over the portfolio. Historical shocks (named episodes or any window
+of the history store) move each curve by its own history where a free one
+exists and say per curve which data they used."""
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import io
 import math
 from dataclasses import replace
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -13,8 +18,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from derivx.data import rates_history as rh
 from derivx.rates.curves import Curve, Market
 from derivx.risk.scenarios import (
+    EPISODES,
     EXPLAIN_COLUMNS,
     LOGNORMAL_VOL_UNIT,
     NORMAL_VOL_UNIT,
@@ -25,7 +32,8 @@ from derivx.risk.scenarios import (
     carry_market,
     historical,
     historical_episodes,
-    historical_table,
+    historical_sources,
+    history_window,
     horizon_date,
     key_rates,
     parallel,
@@ -36,10 +44,18 @@ from derivx.risk.scenarios import (
     twist,
 )
 from derivx.risk.sensitivities import Position
+from derivx.ui import rates_data
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
-SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "Historical")
+SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "Historical", "History window")
+HISTORY_UPLOAD_KEY = "rates_user_history"
+FLAG_LABELS = {
+    "real": "REAL: the curve's own market",
+    "upload": "YOUR UPLOAD",
+    "proxy": "PROXY: government yields (swap spreads held)",
+    "cross-currency proxy": "CROSS-CURRENCY PROXY",
+}
 KEY_TENORS = ("3M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y")
 BP_LIMIT = 500.0
 NORMAL_VOL_LIMIT = 200.0  # bp of normal vol
@@ -132,15 +148,13 @@ def _bp(container, label: str, value: float, key: str) -> float:
 # --------------------------------------------------------------------------
 
 
-def _profile_inputs(kind: str, c2, c3) -> Shock:
+def _profile_inputs(kind: str, c2, c3, store: rh.HistoryStore) -> Shock:
     """The quote-move part of the shock; raises ValueError on bad inputs."""
 
     if kind == "Parallel":
         return parallel(_bp(c2, "SHIFT (BP)", 25.0, "scn_par_bp"))
     if kind == "Twist":
-        pivot = c2.number_input(
-            "PIVOT (YRS)", min_value=0.25, max_value=30.0, value=5.0, step=0.25, key="scn_tw_pivot"
-        )
+        pivot = c2.number_input("PIVOT (YRS)", min_value=0.25, max_value=30.0, value=5.0, step=0.25, key="scn_tw_pivot")
         a, b, c, d = st.columns(4)
         short_bp = _bp(a, "SHORT END (BP)", -25.0, "scn_tw_short")
         long_bp = _bp(b, "LONG END (BP)", 25.0, "scn_tw_long")
@@ -179,18 +193,105 @@ def _profile_inputs(kind: str, c2, c3) -> Shock:
         cols = st.columns(len(KEY_TENORS))
         moves = {t: _bp(col, f"{t} (BP)", 0.0, f"scn_kr_{t}") for t, col in zip(KEY_TENORS, cols)}
         return key_rates(moves)
-    name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
-    scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
-    return historical(name, scale)
+    if kind == "Historical":
+        name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
+        scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
+        return historical(name, scale, store=store)
+    dates = store.dates("UST_PAR")[::-1]
+    end_default = 0
+    start_default = next((i for i, d in enumerate(dates) if (dates[0] - d).days >= 28), len(dates) - 1)
+    start = c2.selectbox("WINDOW START", dates, index=start_default, key="scn_win_start")
+    end = c3.selectbox("WINDOW END", dates, index=end_default, key="scn_win_end")
+    scale = st.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_win_scale")
+    return history_window(start, end, scale, store=store)
 
 
-def _shock_inputs(market: Market) -> Optional[Shock]:
+def _history_store(market: Market) -> rh.HistoryStore:
+    """The CURVE tab's store plus the user's uploaded swap history."""
+
+    base = rates_data.active_store()
+    uploads = st.session_state.get(HISTORY_UPLOAD_KEY, {})
+    if not uploads:
+        return base
+    token = ",".join(sorted(f"{ccy}:{u['sha'][:10]}" for ccy, u in uploads.items()))
+    memo = st.session_state.setdefault("_scn_store_memo", {})
+    key = (id(base), token)
+    if key not in memo:
+        memo.clear()
+        memo[key] = rh.build_store([base.frame] + [u["frame"] for u in uploads.values()], f"{base.label} + {token}")
+    return memo[key]
+
+
+def _history_upload(market: Market) -> None:
+    """Expander to upload the user's own swap-curve history (kept in session
+    state per currency until cleared)."""
+
+    currency = market.curve.conventions.currency if market.curve.conventions else "USD"
+    uploads = st.session_state.setdefault(HISTORY_UPLOAD_KEY, {})
+    with st.expander(f"Your {currency} swap-curve history (CSV upload, used by historical shocks)"):
+        st.caption(
+            "Columns date, tenor, rate (long) or date plus one column per tenor (wide: 2Y, 5Y, 10Y ...); par swap "
+            "rates. Where it covers a window it replaces the proxy for the swap curve."
+        )
+        c1, c2 = st.columns([3, 1])
+        file = c1.file_uploader("SWAP HISTORY CSV", type=["csv"], key=rates_data.widget_key("scn_hist_upload"))
+        units = c2.radio("UNITS", ["auto", "percent", "decimal", "bp"], key="scn_hist_units")
+        if file is not None:
+            payload = file.getvalue()
+            sha = hashlib.sha256(payload + units.encode()).hexdigest()
+            if uploads.get(currency, {}).get("sha") != sha:
+                try:
+                    raw = pd.read_csv(io.BytesIO(payload))
+                except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
+                    st.error(f"{file.name}: could not read the file ({exc})")
+                    raw = None
+                if raw is not None:
+                    frame, issues, used = rh.parse_history_upload(raw, currency, units, file.name)
+                    for issue in issues:
+                        (st.error if issue.level == "error" else st.caption)(f"{file.name}: {issue.message}")
+                    if len(frame):
+                        uploads[currency] = {"name": file.name, "sha": sha, "frame": frame}
+        mine = uploads.get(currency)
+        if mine is not None:
+            days = sorted(set(mine["frame"]["asof"]))
+            st.caption(
+                f"Using {mine['name']}: {len(days)} dates from {days[0]} to {days[-1]}, "
+                f"{mine['frame']['tenor'].nunique()} tenors."
+            )
+            st.button(
+                "CLEAR SWAP HISTORY",
+                key="scn_hist_clear",
+                on_click=rates_data.clear_upload,
+                args=(HISTORY_UPLOAD_KEY, "scn_hist_upload", currency),
+            )
+
+
+def _sources_table(shock: Shock, market: Market) -> None:
+    """Which data each moved curve of a historical shock replays."""
+
+    table = historical_sources(shock)
+    if table.empty:
+        return
+    currency = market.curve.conventions.currency if market.curve.conventions else None
+    shown = table[(table["curve"] == "TREASURY") | (table["currency"] == currency)]
+    shown = shown.assign(flag=shown["flag"].map(FLAG_LABELS).fillna(shown["flag"]))
+    shown.columns = [c.upper() for c in shown.columns]
+    st.dataframe(shown, hide_index=True, width="stretch")
+    st.caption(
+        "Each curve's quotes move by its data's change at the same tenor (linear in between, flat beyond). REAL "
+        "swap/OIS history: ICE USD swap rates (FRED, to 2016-10-28), the Bank of England OIS curve (GBP, par OIS "
+        "rates derived from its spot curve) or your upload. Otherwise a flagged proxy moves the swap curve by "
+        "government yield changes, which holds swap spreads unchanged."
+    )
+
+
+def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
     """Read the shock builder; None (with the reason shown) if invalid."""
 
     c1, c2, c3 = st.columns(3)
     kind = c1.selectbox("SHOCK TYPE", SHOCK_TYPES, key="scn_type")
     try:
-        shock = _profile_inputs(kind, c2, c3)
+        shock = _profile_inputs(kind, c2, c3, store)
     except ValueError as exc:
         st.error(f"Cannot build this shock: {exc}")
         return None
@@ -234,11 +335,8 @@ def _shock_inputs(market: Market) -> Optional[Shock]:
         horizon_days=int(horizon),
     )
     st.caption(f"{shock.name}: {shock.description}.")
-    if kind == "Historical":
-        st.caption(
-            "Historical moves are US Treasury constant-maturity yield changes (FRED), applied to every quote by "
-            "tenor (flat beyond 1M and 30Y). Applied to the swap curve they hold swap spreads unchanged."
-        )
+    if kind in ("Historical", "History window"):
+        _sources_table(shock, market)
     if not (shock.moves_rates or normal or lognormal or horizon):
         st.warning("This scenario moves nothing: pick a curve, a non-zero shock, a vol shock or a horizon.")
     return shock
@@ -274,7 +372,9 @@ def _floored_vols(positions: Sequence[Position], market: Market, shock: Shock) -
 # --------------------------------------------------------------------------
 
 
-def _curve_chart(base: Curve, shocked: Curve, view: str, bumps: np.ndarray) -> go.Figure:
+def _curve_chart(
+    base: Curve, shocked: Curve, view: str, bumps: np.ndarray, source: Optional[Tuple[str, dt.date]] = None
+) -> go.Figure:
     years = np.array([inst.tenor.years for inst in base.instruments])
     if view == "PAR QUOTES":
         x = years
@@ -304,6 +404,8 @@ def _curve_chart(base: Curve, shocked: Curve, view: str, bumps: np.ndarray) -> g
     fig.update_layout(
         yaxis2=dict(title_text="SHOCK (BP)", overlaying="y", side="right", showgrid=False, zeroline=False)
     )
+    label, asof = source if source is not None else ("curve as passed to this tab", base.asof)
+    rates_data.badge(fig, label, asof)
     return bound_axes(
         fig,
         xaxis=axis_limits(np.concatenate([x, years]), pad=0.02, floor=0.0),
@@ -380,15 +482,19 @@ def _show_curves(market: Market, shock: Shock) -> None:
     st.markdown("#### / BASE VS SHOCKED CURVE")
     available = [w for w in ("curve", "govt") if _has_quotes(getattr(market, w))]
     c1, c2 = st.columns(2)
-    which = c1.radio(
-        "CURVE", available, format_func=CURVE_LABELS.get, horizontal=True, key="scn_chart_curve"
-    )
+    which = c1.radio("CURVE", available, format_func=CURVE_LABELS.get, horizontal=True, key="scn_chart_curve")
     view = c2.radio("SHOW", ["PAR QUOTES", "ZERO RATES"], horizontal=True, key="scn_chart_view")
     base = getattr(market, which)
-    bumps = shock.quote_bumps(base) if getattr(shock, which) else np.zeros(len(base.quotes))
+    bumps = shock.quote_bumps(base, which) if getattr(shock, which) else np.zeros(len(base.quotes))
     shocked = base.rebuilt(list(bumps)) if np.any(bumps) else base
+    badge = rates_data.badge_for(which)
+    if badge is not None and badge[1] != base.asof:
+        badge = None
     st.plotly_chart(
-        _curve_chart(base, shocked, view, bumps), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_curve_chart"
+        _curve_chart(base, shocked, view, bumps, badge),
+        width="stretch",
+        config=PLOTLY_2D_CONFIG,
+        key="scn_curve_chart",
     )
     st.caption(
         "Each quote moves by the shock profile at its tenor (linear between profile points, flat beyond) and the "
@@ -420,11 +526,28 @@ def _show_explain(rows: List[Dict[str, object]], market: Market, shock: Shock) -
     st.download_button("Download P&L explain CSV", _csv(table), file_name="scenario_explain.csv", key="scn_explain_csv")
 
 
-def _show_grid(positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple) -> None:
+def _episode_flags(store: rh.HistoryStore, market: Market) -> str:
+    """One line per episode: the data its swap-curve move comes from."""
+
+    currency = market.curve.conventions.currency if market.curve.conventions else "USD"
+    parts = []
+    for name, _, _ in EPISODES:
+        rows = historical_sources(historical(name, store=store))
+        row = rows[(rows["curve"] == "SWAP") & (rows["currency"] == currency)]
+        if not row.empty:
+            r = row.iloc[0]
+            parts.append(f"{name} ({r['start']} to {r['end']}): {r['data']} [{FLAG_LABELS.get(r['flag'], r['flag'])}]")
+    return "; ".join(parts)
+
+
+def _show_grid(
+    positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple, store: rh.HistoryStore
+) -> None:
     """Standard library grid, headed by the custom ``shock`` when given."""
 
     st.markdown("### / SCENARIO GRID")
-    library = standard_library()
+    library = standard_library(store)
+    key = (key, tuple(library))  # the historical shocks depend on the store
     if not _has_quotes(market.govt):
         library = [replace(s, govt=False) for s in library]
     grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
@@ -438,12 +561,11 @@ def _show_grid(positions: Sequence[Position], market: Market, shock: Optional[Sh
     table = grid.rename_axis("SCENARIO").reset_index()
     st.dataframe(table, hide_index=True, width="stretch", column_config={c: MONEY for c in table.columns[1:]})
     st.download_button("Download scenario grid CSV", _csv(table), file_name="scenario_grid.csv", key="scn_grid_csv")
-    episodes = historical_table().drop_duplicates("episode")
-    dates = "; ".join(f"{r.episode} {r.start} to {r.end}" for r in episodes.itertuples())
     st.caption(
         "Full-revaluation P&L in $ per position. The library is instantaneous and moves both curves: parallel "
         "+/-25 and +/-100bp; 2s10s steepener/flattener (2Y -/+12.5bp, 10Y +/-12.5bp, pivot 5Y, flat beyond); "
-        f"2s5s10s fly (5Y +25bp, 2Y and 10Y unchanged); historical Treasury moves ({dates})."
+        "2s5s10s fly (5Y +25bp, 2Y and 10Y unchanged); historical episodes, the Treasury curve moving by US "
+        "Treasury par yield changes and the swap curve by: " + _episode_flags(store, market) + "."
     )
 
 
@@ -454,7 +576,9 @@ def render(market: Market, positions: List[Position]) -> None:
     if not market.curve.quotes:
         st.error("Scenarios shock curve quotes: the swap curve must be bootstrapped from quotes.")
         return
-    shock = _shock_inputs(market)
+    _history_upload(market)
+    store = _history_store(market)
+    shock = _shock_inputs(market, store)
     if shock is None:
         return
     try:
@@ -486,4 +610,4 @@ def render(market: Market, positions: List[Position]) -> None:
         rows = None
     if rows is not None:
         _show_explain(rows, market, shock)
-    _show_grid(positions, market, shock if rows is not None else None, key)
+    _show_grid(positions, market, shock if rows is not None else None, key, store)
