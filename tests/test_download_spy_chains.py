@@ -74,3 +74,10 @@ def test_partial_and_failed_fetches(tmp_path):
 def test_current_session_rolls_back_over_weekends():
     assert tool.current_session(pd.Timestamp("2026-10-18T15:00:00Z")) == pd.Timestamp("2026-10-16")
     assert tool.refuse_past_dates(["2026-10-16"], pd.Timestamp("2026-10-18T15:00:00Z")) is None
+
+
+def test_a_malformed_date_is_a_clear_error_not_a_traceback(tmp_path, capsys):
+    fetch, calls = _fetcher(FakeTicker())
+    code = tool.main(["--date", "2026/10/20", "--outdir", str(tmp_path)], fetch=fetch, now=NOW)
+    assert code == 1 and calls == []
+    assert "'2026/10/20' is not a date in YYYY-MM-DD form" in capsys.readouterr().err

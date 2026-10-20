@@ -73,3 +73,26 @@ def test_main_writes_every_output(tmp_path):
     bad.write_text("strike,iv\n100,0.2\n")
     assert cm.main(["--chain", str(bad), "--outdir", str(tmp_path / "out")]) == 1
     assert not (tmp_path / "out").exists()
+
+
+def test_a_multi_snapshot_synthetic_history_is_labelled_and_scored_by_days():
+    """Files of synthetic rows are named as such even when the dataset is
+    just 'N file(s)', a pooled run is not called 'single-snapshot', and the
+    walk-forward table counts days won (not only quote-level wins)."""
+
+    from derivx.data.chain_schema import merge_datasets, validate_chain
+    from derivx.data.synthetic import synthetic_history
+
+    days = synthetic_history(2)
+    files = [
+        validate_chain(df[df["expiry"] <= td + pd.Timedelta(days=8)], f"d{i}.csv")
+        for i, (td, df) in enumerate(days.items())
+    ]
+    result = cm.compute(merge_datasets(files, source="2 file(s)"), calibration=False, max_days=8)
+    summary = cm.jsonable(result["summary"])
+    md = cm.report_markdown(summary)
+    assert summary["data"]["row_sources"] == ["synthetic"]
+    assert "**SYNTHETIC DATA, NOT MARKET DATA**" in md and "single-snapshot" not in md
+    assert summary["walk_forward"]["status"] == "ok" and "| days won |" in md
+    svi = next(r for r in summary["walk_forward"]["summary"] if r["predictor"] == "svi_sticky_strike")
+    assert svi["day_win_n"] == 1 and svi["benchmark"] == "persistence"

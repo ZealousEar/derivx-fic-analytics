@@ -90,12 +90,16 @@ def trading_days_between(start: DateLike, end: DateLike) -> int:
 
 
 def add_trading_days(start: DateLike, n: int) -> pd.Timestamp:
-    """The date ``n`` trading days after ``start`` (``n`` >= 0; with 0,
-    ``start`` itself if it is a trading day, else the next one)."""
+    """The ``n``-th trading day after ``start`` (``n`` >= 0), so that
+    ``trading_days_between(start, add_trading_days(start, n)) == n`` also
+    when ``start`` is a weekend or holiday (Saturday + 1 = Monday,
+    Thanksgiving + 1 = the Friday after). With ``n = 0``: ``start`` itself
+    if it is a trading day, else the next one."""
 
     if n < 0:
         raise ValueError("n must be >= 0")
-    day = np.busday_offset(_day(start), n, roll="forward", holidays=_holidays())
+    # roll a non-trading start back to the last session, then count forward
+    day = np.busday_offset(_day(start), n, roll="backward" if n > 0 else "forward", holidays=_holidays())
     return pd.Timestamp(day)
 
 

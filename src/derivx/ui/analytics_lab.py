@@ -79,6 +79,7 @@ UPLOAD_TYPES = ["csv", "gz", "parquet", "pq", "txt"]
 PULL_BUCKET_S = 300  # Yahoo pulls are shared between sessions within one 5-minute bucket
 MIN_FIT_DAYS = 2.0  # expiries closer than this are not fitted or scored
 PRICER_TENORS_DAYS = (7.0, 30.0, 61.0, 91.0, 182.0, 365.0)  # expiries handed to the EQUITY page's MARKET smile
+SPOT_DRIFT_WARN = 1e-3  # warn when spot moved more than 0.1% between the first and last expiry response of a fetch
 
 # session-state keys (results are per session; nothing here is shared)
 K_DATA = "lab_dataset"
@@ -169,16 +170,23 @@ def _banner(
 ) -> None:
     dates = prov.get("trade_dates") or []
     session = dates[0] if len(dates) == 1 else (f"{dates[0]} .. {dates[-1]} ({len(dates)} sessions)" if dates else "?")
+    size = f"{int(prov.get('rows') or 0):,} rows, {prov.get('expiries')} expiries"
+    if len(dates) > 1 and prov.get("slices") is not None:
+        size += f" ({prov['slices']} session x expiry slices)"
+    row_sources = [str(s) for s in prov.get("row_sources") or []]
+    labelled = "synthetic" in str(prov.get("source", "")).lower()
+    synth_rows = [s for s in row_sources if "synthetic" in s.lower()] and not labelled
     parts = [
         str(prov.get("ticker") or "ticker unknown"),
         f"session {session}",
         f"source: {prov.get('source')}",
         f"fetched {_when(prov['fetched_at_utc'])}" if prov.get("fetched_at_utc") else "fetch time not recorded",
-        f"{int(prov.get('rows') or 0):,} rows, {prov.get('expiries')} expiries",
+        size,
         f"sha256 {str(prov.get('data_sha256', ''))[:12]}",
+        *(["SYNTHETIC ROWS: not market data"] if synth_rows else []),
         *extra,
     ]
-    is_synth = "synthetic" in str(prov.get("source", "")).lower()
+    is_synth = labelled or bool(synth_rows)
     css = " ".join(c for c in ("dx-lab-banner", kind, "synthetic" if is_synth else "") if c)
     body = " · ".join(html.escape(p) for p in parts)
     st.markdown(f"<div class='{css}'><b>{html.escape(label)}</b> · {body}</div>", unsafe_allow_html=True)
@@ -241,6 +249,26 @@ def _manifest(kind: str, prov: Mapping, inputs: Mapping, model: Mapping, seed=No
     return build_manifest(kind, inputs=inputs, data=prov, model=model, seed=seed)
 
 
+def _filter_breakdown(chain: pd.DataFrame, filters: Mapping[str, object]) -> str:
+    """How many quotes fail each liquidity rule (a quote can fail several)."""
+
+    bid = pd.to_numeric(chain["bid"], errors="coerce").fillna(0.0)
+    ask = pd.to_numeric(chain["ask"], errors="coerce").fillna(0.0)
+    mid = (bid + ask) / 2.0
+    parts = []
+    if filters["min_volume"] > 0 and "volume" in chain.columns:
+        low = int((pd.to_numeric(chain["volume"], errors="coerce").fillna(0) < filters["min_volume"]).sum())
+        parts.append(f"volume < {filters['min_volume']} (missing counts as 0): {low:,}")
+    parts.append(f"bid <= 0: {int((bid <= 0).sum()):,}")
+    parts.append(f"ask <= bid: {int((ask <= bid).sum()):,}")
+    parts.append(f"mid < {filters['min_mid']:g}: {int((mid < filters['min_mid']).sum()):,}")
+    if filters["max_spread"] is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            wide = ((ask - bid) / mid.replace(0, np.nan)) > filters["max_spread"]
+        parts.append(f"relative spread > {filters['max_spread']:g}: {int(wide.sum()):,}")
+    return f"{len(chain):,} quotes in; " + "; ".join(parts)
+
+
 # -- Yahoo pulls -----------------------------------------------------------------
 
 
@@ -259,7 +287,7 @@ def _pull_shared(ticker: str, max_expiries: int, bucket: int) -> Tuple[pd.DataFr
     the bucket number, part of the cache key). Only complete pulls are
     cached; the rows carry their real fetch times."""
 
-    result = fetch_option_chain(ticker, max_expiries=max_expiries)
+    result = fetch_option_chain(ticker, max_expiries=max_expiries, min_days=MIN_FIT_DAYS)
     status = result.status.as_dict()
     if result.status.status != "ok":
         raise _NotCached(result.chain, status)
@@ -270,7 +298,7 @@ def _pull(ticker: str, max_expiries: int, force: bool) -> Tuple[pd.DataFrame, Di
     """(chain, status, served_from_cache). ``force`` bypasses the cache."""
 
     if force:
-        result = fetch_option_chain(ticker, max_expiries=max_expiries)
+        result = fetch_option_chain(ticker, max_expiries=max_expiries, min_days=MIN_FIT_DAYS)
         return result.chain, result.status.as_dict(), False
     clicked = pd.Timestamp.now(tz="UTC")
     try:
@@ -348,7 +376,9 @@ def _load_controls() -> None:
             type=UPLOAD_TYPES,
             key="lab_upload",
             help="Required columns: trade_date, expiry, option_type, strike, bid, ask, implied_vol (decimal), "
-            "underlying_price. Files exported here (and by tools/download_spy_chains.py) re-upload as is.",
+            "underlying_price. Optional: volume (without it, set Min volume to 0), last_trade_date, ticker, "
+            "fetched_at_utc and more. Dates as YYYY-MM-DD or YYYYMMDD. Files exported here (and by "
+            "tools/download_spy_chains.py) re-upload as is.",
         )
         if up is not None and st.session_state.get(K_UPLOAD_SEEN) != up.file_id:
             st.session_state[K_UPLOAD_SEEN] = up.file_id  # process each file once: no silent re-load on reruns
@@ -391,7 +421,8 @@ def _load_controls() -> None:
         force = st.checkbox("Bypass the 5-minute shared cache", value=False, key="lab_force", persist_state=PERSIST)
         st.caption(
             "Yahoo serves only the current (delayed) chain. Rows are stamped with the session the quotes belong "
-            "to and their real fetch time; rate limits are retried with backoff."
+            "to and their real fetch time; rate limits are retried with backoff. The nearest expiries at least "
+            f"{MIN_FIT_DAYS:g} days away are requested (after the close Yahoo still lists the day's expired one)."
         )
         if st.button("Pull current chain", key="lab_pull", width="stretch"):
             try:
@@ -428,6 +459,7 @@ def _load_controls() -> None:
             st.success(text)
     active = _active() or {}
     status = active.get("status") or {}
+    _fetch_status_panel(status)
     if active.get("origin") == "yahoo" and status.get("failed_expiries"):
         with st.expander(f"{len(status['failed_expiries'])} expiry request(s) failed"):
             st.dataframe(
@@ -439,6 +471,46 @@ def _load_controls() -> None:
         with st.expander(f"{len(active['dataset'].warnings)} data note(s)"):
             for w in active["dataset"].warnings:
                 st.markdown(f"- {w}")
+
+
+def _fetch_status_panel(status: Optional[Mapping[str, object]]) -> None:
+    """What the fetch of the active dataset did (Yahoo pulls and the
+    bundled sample's recorded fetch): requests, retries, the spot and how
+    far it moved between the first and last expiry response, and notes."""
+
+    if not isinstance(status, Mapping):
+        return
+    fs = status.get("fetch_status", status)
+    if not isinstance(fs, Mapping) or "status" not in fs:
+        return
+    drift = fs.get("spot_drift")
+    drift_txt = "not measured" if drift is None else f"{float(drift) * 1e4:+.1f} bp of spot"
+    spot = fs.get("spot")
+    rows = [
+        ("status", f"{fs.get('status')}" + (f": {fs.get('reason')}" if fs.get("reason") else "")),
+        ("session the quotes belong to", fs.get("quote_date") or "?"),
+        ("fetch started / finished (UTC)", f"{fs.get('started_at_utc')} / {fs.get('finished_at_utc')}"),
+        (
+            "spot (first response) and its time (UTC)",
+            f"{float(spot):,.4f} at {fs.get('spot_time_utc') or 'time not reported'}" if spot is not None else "?",
+        ),
+        ("spot drift, first to last expiry response", drift_txt),
+        ("requests / retries / backoff wait", f"{fs.get('requests')} / {fs.get('retries')} / {fs.get('waited_s')} s"),
+        (
+            "expiries requested / fetched / failed",
+            f"{len(fs.get('expiries_requested') or [])} / {len(fs.get('expiries_fetched') or [])} / "
+            f"{len(fs.get('failed_expiries') or {})}",
+        ),
+    ]
+    with st.expander(f"Fetch status: {fs.get('status')}, spot drift {drift_txt}"):
+        st.dataframe(pd.DataFrame(rows, columns=["field", "value"]), hide_index=True, width="stretch")
+        for note in fs.get("notes") or []:
+            st.markdown(f"- {note}")
+    if drift is not None and abs(float(drift)) > SPOT_DRIFT_WARN:
+        st.warning(
+            f"Spot moved {float(drift) * 1e4:+.1f} bp between the first and the last expiry response of this fetch: "
+            "the expiries were quoted against different spots (each slice keeps the spot of its own response)."
+        )
 
 
 def _publish_to_pricer(ds: ChainDataset, prov: Mapping, filtered: pd.DataFrame, report: pd.DataFrame, filters) -> None:
@@ -501,24 +573,37 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         "max_spread": None if no_cap else float(max_spread),
         "rate_cc": float(rate_pct) / 100.0,
     }
-    filtered = apply_liquidity_filters(
-        raw, min_volume=filters["min_volume"], max_spread=filters["max_spread"], min_mid=filters["min_mid"]
-    )
+    try:
+        filtered = apply_liquidity_filters(
+            raw, min_volume=filters["min_volume"], max_spread=filters["max_spread"], min_mid=filters["min_mid"]
+        )
+    except ValueError as exc:
+        st.session_state["market_chain"] = raw.iloc[0:0]
+        st.error(f"The liquidity filters cannot be applied to this chain: {exc}")
+        return None
     data_key = _key(prov["data_sha256"], filters)
     if filtered.empty:
         st.session_state["market_chain"] = filtered
-        st.warning("The liquidity filters removed every quote: loosen them to continue.")
+        st.warning(
+            "The liquidity filters removed every quote: loosen them to continue. Quotes failing each rule: "
+            + _filter_breakdown(raw, filters)
+            + "."
+        )
         return None
     with st.spinner("Cleaning quotes (hygiene)..."):
         report = _hygiene(filtered, filters["rate_cc"])
     _publish_to_pricer(ds, prov, filtered, report, filters)
     usable = report[(report["days"] >= MIN_FIT_DAYS) & (report["kept"] >= 8)] if not report.empty else report
+    spots = pd.to_numeric(raw["underlying_price"], errors="coerce").dropna()
+    spot_txt = (
+        f"{spots.iloc[0]:,.2f}" if spots.nunique() <= 1 else f"{spots.min():,.2f}-{spots.max():,.2f}"
+    )  # one spot per expiry response
     _stats(
         [
             ("QUOTES AFTER FILTERS", f"{len(filtered):,}"),
             ("EXPIRIES", f"{filtered['expiry'].nunique()}"),
             ("OTM QUOTES KEPT", f"{int(report['kept'].sum()) if not report.empty else 0:,}"),
-            ("SPOT", f"{float(raw['underlying_price'].iloc[0]):,.2f}"),
+            ("SPOT" if spots.nunique() <= 1 else "SPOT RANGE", spot_txt),
         ]
     )
     st.caption(
@@ -900,6 +985,10 @@ def _render_walkforward_tab() -> None:
         return
     ds: ChainDataset = entry["dataset"]
     prov = ds.provenance()
+    if ds.warnings:
+        with st.expander(f"{len(ds.warnings)} data note(s) on these files"):
+            for w in ds.warnings:
+                st.markdown(f"- {w}")
     gaps = missing_trading_days(ds.trade_dates)
     _banner(
         prov,
@@ -960,8 +1049,14 @@ def _render_walkforward_tab() -> None:
     )
     data_key = _key(prov["data_sha256"], filters)
     settings_key = _key(settings.as_dict())
-    if st.button("Run walk-forward test", key="lab_wf_run", width="stretch"):
-        prepared = _prepared_history(ds, filters)
+    run = st.button("Run walk-forward test", key="lab_wf_run", width="stretch")
+    prepared = None
+    if run:
+        try:
+            prepared = _prepared_history(ds, filters)
+        except ValueError as exc:
+            st.error(f"The liquidity filters cannot be applied to this history: {exc}")
+    if prepared is not None:
         with st.spinner(f"Walk-forward over {len(prepared)} snapshots (one SVI fit per origin and expiry)..."):
             result = run_walk_forward(prepared, settings)
         st.session_state[K_WF] = {
@@ -989,10 +1084,14 @@ def _render_walkforward_tab() -> None:
         f"Horizon {cfg.horizon} trading day(s); calibration window {cfg.window} snapshot(s). Quotes matched on "
         "(expiry, strike, option type): a call is never scored against a put. svi_sticky_strike and persistence use "
         "origin information only; the sticky-moneyness pair is conditional on the realised target forward. skill = 1 "
-        "- RMSE / benchmark RMSE (> 0 beats the benchmark). win rate: share of quotes whose actual move exceeds the "
-        "target half spread on which the forecast beats its benchmark, with a Wilson 95% interval. dm_t: "
-        "Diebold-Mariano t on daily squared-error differences (negative favours the forecast; rough with few days). "
-        "noise_bp: RMS half bid/ask width of the target quotes, the level below which errors are inside the market."
+        "- RMSE / benchmark RMSE (> 0 beats the benchmark). days won: target days on which the forecast's mean "
+        "squared error is below its benchmark's, with a Wilson 95% interval on days. win rate: share of quotes whose "
+        "actual move exceeds the target half spread on which the forecast beats its benchmark; its Wilson interval "
+        "treats quotes as independent, but quotes of one day move together, so it is too narrow: judge significance "
+        "by days won and dm_t. dm_t: Diebold-Mariano statistic on daily squared-error differences, with "
+        "autocovariances up to lag horizon - 1 for overlapping multi-day horizons and the Harvey-Leybourne-Newbold "
+        "correction (negative favours the forecast; rough with few days). noise_bp: RMS half bid/ask width of the "
+        "target quotes, the level below which errors are inside the market."
     )
     st.plotly_chart(_plot_walkforward(result.daily), width="stretch", config=PLOTLY_2D_CONFIG, key="lab_wf_chart")
     st.markdown("#### / REGIMES (30-day constant-maturity ATM vol, terciles of this history)")
@@ -1032,8 +1131,12 @@ def _format_summary(summary: pd.DataFrame) -> pd.DataFrame:
         "" if not np.isfinite(w) else f"{w:.3f} [{lo:.3f}, {hi:.3f}] n={int(n)}"
         for w, lo, hi, n in zip(out["win_rate"], out["win_lo"], out["win_hi"], out["win_n"])
     ]
-    cols = ["predictor", "rmse_bp", "benchmark", "benchmark_rmse_bp", "skill", "win_rate (95% CI)", "dm_t", "noise_bp"]
-    cols += ["n_quotes", "n_days", "description"]
+    out["days won (95% CI)"] = [
+        "" if not np.isfinite(w) else f"{int(round(w * n))} of {int(n)} [{lo:.2f}, {hi:.2f}]"
+        for w, lo, hi, n in zip(out["day_win_rate"], out["day_win_lo"], out["day_win_hi"], out["day_win_n"])
+    ]
+    cols = ["predictor", "rmse_bp", "benchmark", "benchmark_rmse_bp", "skill", "days won (95% CI)"]
+    cols += ["win_rate (95% CI)", "dm_t", "noise_bp", "n_quotes", "n_days", "description"]
     return out[cols]
 
 
@@ -1163,7 +1266,9 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
             }
     stored = st.session_state.get(K_MC)
     if stored and stored.get("error"):
-        st.error(f"Model comparison failed for this slice: {stored['error']}")
+        # an error belongs to the data and settings it was raised on: never shown against other ones
+        if stored.get("data_key") == ctx["data_key"] and stored.get("settings_key") == settings_key:
+            st.error(f"Model comparison failed for this slice: {stored['error']}")
     elif stored:
         _stale_notice(stored, ctx["data_key"], settings_key, "model comparison")
         comp: ModelComparison = stored["comp"]
@@ -1193,7 +1298,7 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
         a1.number_input("Max days to expiry", 3, 1000, 120, step=10, key="lab_mc_all_maxdays", persist_state=PERSIST)
     )
     n_all = int((ok["days"] <= max_days).sum())
-    a2.caption(f"{n_all} expiries in range; about 1-2 s each (5-fold CV of every model).")
+    a2.caption(f"{n_all} expiries in range; about 2-3 s each (5-fold CV of every model).")
     all_settings = {**settings, "expiry": "all", "max_days": max_days}
     all_key = _key(all_settings)
     if st.button("Compare models on every expiry", key="lab_mc_all_run", width="stretch"):

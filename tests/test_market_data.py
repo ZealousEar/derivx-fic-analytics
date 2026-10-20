@@ -82,6 +82,21 @@ def test_only_the_requested_expiries_are_downloaded():
     assert fake2.requests == ["options", "2026-11-20"]
 
 
+def test_expiries_too_close_to_fit_are_not_requested_when_asked():
+    """After the close Yahoo still lists the day's expired expiry: a lab pull
+    of the nearest N expiries used to spend two of its N requests on the 0-
+    and 1-day expiries that no fit can use."""
+
+    fake = FakeTicker()
+    res = _fetch(fake, max_expiries=3, min_days=2)  # the clock reads 2026-10-20 17:00 New York
+    assert fake.requests == ["options", "2026-10-22", "2026-10-23", "2026-10-26"]
+    assert res.status.status == "ok" and res.status.expiries_requested == ["2026-10-22", "2026-10-23", "2026-10-26"]
+    assert any("not requested: 2 expiry(ies) fewer than 2 days after 2026-10-20" in n for n in res.status.notes)
+    fake = FakeTicker()
+    res = _fetch(fake, expiries=["2026-10-20"], min_days=2)
+    assert res.status.status == "empty" and fake.requests == ["options"]
+
+
 def test_unknown_expiries_and_bad_inputs_raise():
     with pytest.raises(ValueError, match="not listed by Yahoo"):
         _fetch(FakeTicker(), expiries=["2030-01-18"])
@@ -175,10 +190,24 @@ def test_liquidity_filters_keep_both_option_types():
     chain = load_sample_chain().single()
     f = apply_liquidity_filters(chain, 10, 0.4, 0.1)
     assert set(f["option_type"]) == {"call", "put"}  # parity needs both
-    with pytest.raises(ValueError, match="missing column"):
+    with pytest.raises(ValueError, match="no 'volume' column.*set min volume to 0"):
         apply_liquidity_filters(data.drop(columns=["volume"]))
+    with pytest.raises(ValueError, match="missing column"):
+        apply_liquidity_filters(data.drop(columns=["bid"]))
     with pytest.raises(ValueError, match="max_spread"):
         apply_liquidity_filters(data, max_spread=0.0)
+
+
+def test_a_chain_without_volume_is_usable_with_min_volume_zero():
+    """volume is optional in the chain schema: the filters must not need it
+    when no volume filter is asked for (a file with only the required
+    columns used to crash the lab with a traceback)."""
+
+    data = pd.DataFrame({"bid": [1.0, 0.0, 0.5], "ask": [1.2, 0.5, 1.5], "strike": [100, 105, 110]})
+    kept = apply_liquidity_filters(data, min_volume=0, max_spread=None, min_mid=0.5)
+    assert kept["strike"].tolist() == [100, 110]  # bid > 0, ask > bid and mid >= 0.5; volume not consulted
+    with_nan = data.assign(volume=np.nan)
+    assert apply_liquidity_filters(with_nan, min_volume=1, max_spread=None, min_mid=0.0).empty  # NaN counts as 0
 
 
 def test_compute_moneyness_is_spot_moneyness():
@@ -210,6 +239,13 @@ def test_calendar_rules():
     assert calendar.trading_days_between("2026-11-25", "2026-11-27") == 1  # over Thanksgiving
     assert calendar.trading_days_between("2026-10-19", "2026-10-16") == -1
     assert calendar.add_trading_days("2026-11-25", 1) == pd.Timestamp("2026-11-27")
+    # from a weekend or holiday: the n-th session after it (it used to roll forward first, one session too far)
+    assert calendar.add_trading_days("2026-10-24", 1) == pd.Timestamp("2026-10-26")  # Saturday -> Monday
+    assert calendar.add_trading_days("2026-11-26", 1) == pd.Timestamp("2026-11-27")  # Thanksgiving -> Friday
+    assert calendar.add_trading_days("2026-11-26", 0) == pd.Timestamp("2026-11-27")
+    for start in pd.date_range("2026-11-20", "2027-01-10"):
+        for n in (1, 2, 5):
+            assert calendar.trading_days_between(start, calendar.add_trading_days(start, n)) == n
     assert calendar.session_date("2026-10-21T02:00:00Z") == pd.Timestamp("2026-10-20")
     assert calendar.previous_trading_day("2026-10-18") == pd.Timestamp("2026-10-16")
     assert calendar.missing_trading_days(["2026-10-15", "2026-10-19"]) == [pd.Timestamp("2026-10-16")]
