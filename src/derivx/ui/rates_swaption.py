@@ -227,7 +227,8 @@ def _smile_chart(cube: SwaptionVolCube, trade: Swaption, T: float, F: float, sou
             marker=dict(color=ACCENT, size=12, symbol="diamond"),
         )
     )
-    dark_layout(fig, height=380, xtitle="STRIKE - ATM FORWARD (BP)", ytitle="NORMAL VOL (BP)")
+    dark_layout(fig, height=420, xtitle="STRIKE - ATM FORWARD (BP)", ytitle="NORMAL VOL (BP)")
+    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0), margin=dict(b=100))  # off the curve
     rates_data.badge(fig, source, asof)
     return bound_axes(
         fig,
@@ -237,14 +238,23 @@ def _smile_chart(cube: SwaptionVolCube, trade: Swaption, T: float, F: float, sou
 
 
 def _heatmap(z: np.ndarray, expiries, tenors, title: str, fmt: str, diverging: bool, source: str, asof) -> go.Figure:
+    """Expiry x tenor matrix, shortest expiry on top; a diverging map is
+    black at zero (red below, blue above)."""
+
+    z = np.asarray(z, dtype=float)[::-1]  # plotly draws the first row at the bottom
+    rows = list(expiries)[::-1]
     finite = z[np.isfinite(z)]
-    peak = float(np.max(np.abs(finite))) if finite.size else 1.0
-    kwargs = dict(colorscale="RdBu", zmid=0.0, zmin=-peak, zmax=peak) if diverging else dict(colorscale="Viridis")
+    peak = max(float(np.max(np.abs(finite))) if finite.size else 1.0, 1e-12)
+    if diverging:
+        scale = [[0.0, ACCENT], [0.5, "#111111"], [1.0, SERIES[2]]]
+        kwargs = dict(colorscale=scale, zmid=0.0, zmin=-peak, zmax=peak, textfont=dict(color=SERIES[0]))
+    else:
+        kwargs = dict(colorscale="Viridis")
     fig = go.Figure(
         go.Heatmap(
             z=z,
             x=list(tenors),
-            y=list(expiries),
+            y=rows,
             text=[[fmt.format(v) for v in row] for row in z],
             texttemplate="%{text}",
             hovertemplate="%{y} x %{x}: %{text}<extra></extra>",
@@ -279,7 +289,11 @@ def _risk(trade: Swaption, market: Market) -> Dict[str, float]:
 
 
 def _inputs(market: Market) -> Optional[dict]:
-    c1, c2, c3, c4, c5 = st.columns(5)
+    """Trade, vol and SABR inputs, three to a row (wider rows wrap next to
+    the sidebar)."""
+
+    indices = [k for k in market.projections if not market.projections.is_discount(k)]
+    c1, c2, c3 = st.columns(3)
     kind = KIND_LABELS[c1.radio("TYPE", list(KIND_LABELS), horizontal=True, key="swn_kind")]
     side = c2.radio("POSITION", ["Long", "Short"], horizontal=True, key="swn_side")
     notional = c3.number_input(
@@ -291,27 +305,26 @@ def _inputs(market: Market) -> Optional[dict]:
         format="%.0f",
         key="swn_notional",
     )
-    expiry = c4.selectbox("OPTION EXPIRY", EXPIRIES, index=EXPIRIES.index("1Y"), key="swn_expiry")
-    tenor = c5.selectbox("SWAP TENOR", TENORS, index=TENORS.index("5Y"), key="swn_tenor")
-    indices = [k for k in market.projections if not market.projections.is_discount(k)]
-    c1, c2, c3, c4, c5 = st.columns(5)
-    options = indices + ["OIS"] if indices else ["OIS"]
+    c1, c2, c3 = st.columns(3)
     under = c1.radio(
         "UNDERLYING",
-        options,
+        indices + ["OIS"] if indices else ["OIS"],
         horizontal=True,
         key=f"swn_index_{_currency(market)}",
-        help="OIS: an OIS swap on the discount curve's conventions (SOFR, €STR, SONIA). EURIBOR: fixed "
-        "annual 30/360 against EURIBOR, projected on its curve and discounted on €STR.",
+        help="OIS: an OIS swap on the discount curve's conventions (SOFR, €STR, SONIA). EURIBOR: fixed annual "
+        "30/360 against EURIBOR, projected on its curve and discounted on €STR.",
     )
-    strike_mode = c2.radio("STRIKE", ["ATM ± bp", "Absolute %"], horizontal=True, key="swn_strike_mode")
+    expiry = c2.selectbox("OPTION EXPIRY", EXPIRIES, index=EXPIRIES.index("1Y"), key="swn_expiry")
+    tenor = c3.selectbox("SWAP TENOR", TENORS, index=TENORS.index("5Y"), key="swn_tenor")
+    c1, c2, c3 = st.columns(3)
+    strike_mode = c1.radio("STRIKE", ["ATM ± bp", "Absolute %"], horizontal=True, key="swn_strike_mode")
+    strike_pct = offset_bp = None
     if strike_mode == "Absolute %":
-        strike_pct = c3.number_input(
+        strike_pct = c2.number_input(
             "STRIKE (%)", min_value=-5.0, max_value=30.0, value=3.5, step=0.125, format="%.4f", key="swn_strike_pct"
         )
-        offset_bp = None
     else:
-        offset_bp = c3.number_input(
+        offset_bp = c2.number_input(
             "ATM OFFSET (BP)",
             min_value=-500.0,
             max_value=500.0,
@@ -320,23 +333,8 @@ def _inputs(market: Market) -> Optional[dict]:
             format="%.1f",
             key="swn_offset_bp",
         )
-        strike_pct = None
-    model = MODEL_LABELS[c4.selectbox("VOL UNIT / MODEL", list(MODEL_LABELS), key="swn_model")]
-    shift = 0.0
-    if model == "shifted_black":
-        shift = (
-            c5.number_input(
-                "MODEL SHIFT (%)",
-                min_value=0.0,
-                max_value=20.0,
-                value=3.0,
-                step=0.25,
-                format="%.2f",
-                key="swn_model_shift",
-            )
-            / 100.0
-        )
-    c1, c2, c3, c4, c5 = st.columns(5)
+    model = MODEL_LABELS[c3.selectbox("VOL UNIT / MODEL", list(MODEL_LABELS), key="swn_model")]
+    c1, c2, c3 = st.columns(3)
     source = c1.radio("VOL", ["SABR cube", "Flat vol"], horizontal=True, key="swn_vol_source")
     label, unit, top = VOL_UNITS[model]
     flat = None
@@ -353,8 +351,23 @@ def _inputs(market: Market) -> Optional[dict]:
             )
             * unit
         )
-    fit = FIT_LABELS[c3.selectbox("SABR FIT", list(FIT_LABELS), key="swn_fit")]
-    beta = c4.number_input(
+    shift = 0.0
+    if model == "shifted_black":
+        shift = (
+            c3.number_input(
+                "MODEL SHIFT (%)",
+                min_value=0.0,
+                max_value=20.0,
+                value=3.0,
+                step=0.25,
+                format="%.2f",
+                key="swn_model_shift",
+            )
+            / 100.0
+        )
+    c1, c2, c3 = st.columns(3)
+    fit = FIT_LABELS[c1.selectbox("SABR FIT", list(FIT_LABELS), key="swn_fit")]
+    beta = c2.number_input(
         "SABR BETA",
         min_value=0.0,
         max_value=1.0,
@@ -364,7 +377,7 @@ def _inputs(market: Market) -> Optional[dict]:
         key=f"swn_beta_{fit}",
     )
     sabr_shift = (
-        c5.number_input(
+        c3.number_input(
             "SABR SHIFT (%)",
             min_value=0.0,
             max_value=20.0,
@@ -434,20 +447,26 @@ def render(market: Market) -> List[Position]:
     c = rates_risk.money(market)
     label, unit, _ = VOL_UNITS[ui["model"]]
 
-    m = st.columns(6)
-    m[0].metric(f"PV ({c})", _num(g["pv"]))
-    m[1].metric("PREMIUM (BP OF NOTIONAL)", _num(g["premium_bp"], 3))
-    m[2].metric("FORWARD SWAP RATE (%)", _num(g["forward"] * 100, 4))
-    m[3].metric("STRIKE (%)", _num(K * 100, 4), delta=f"{g['atm_offset_bp']:+.1f}bp vs ATM", delta_color="off")
-    m[4].metric(f"VOL ({label})", _num(vol / unit, 2))
-    m[5].metric("NORMAL VOL EQUIV (BP)", _num(g["normal_vol"] * 1e4, 2))
-    m = st.columns(6)
-    m[0].metric(f"DELTA ({c}/BP FWD)", _num(g["delta_fwd"]))
-    m[1].metric(f"PV01 ({c}/BP CURVE)", _num(risk["pv01"]))
-    m[2].metric(f"GAMMA ({c}/BP²)", _num(g["gamma_fwd"], 4))
-    m[3].metric(f"VEGA ({c}/BP NORMAL)", _num(g["vega_normal_bp"]))
-    m[4].metric(f"VEGA ({c}/VOL PT)", _num(g["vega_lognormal_pt"]))
-    m[5].metric(f"THETA ({c}, 1 BUS. DAY)", _num(risk["theta"]))
+    cells = [
+        (f"PV ({c})", _num(g["pv"])),
+        ("PREMIUM (BP)", _num(g["premium_bp"], 3)),
+        ("FWD SWAP RATE (%)", _num(g["forward"] * 100, 4)),
+        ("STRIKE (%)", _num(K * 100, 4)),
+        (f"VOL ({label})", _num(vol / unit, 2)),
+        ("NORMAL VOL EQUIV (BP)", _num(g["normal_vol"] * 1e4, 2)),
+        (f"DELTA ({c}/BP FWD)", _num(g["delta_fwd"])),
+        (f"PV01 ({c}/BP CURVE)", _num(risk["pv01"])),
+        (f"GAMMA ({c}/BP²)", _num(g["gamma_fwd"], 4)),
+        (f"VEGA ({c}/BP NORMAL)", _num(g["vega_normal_bp"])),
+        (f"VEGA ({c}/VOL PT)", _num(g["vega_lognormal_pt"])),
+        (f"THETA ({c}, 1 BUS. DAY)", _num(risk["theta"])),
+    ]
+    for start in range(0, len(cells), 3):
+        for col, (name, value) in zip(st.columns(3), cells[start : start + 3]):
+            if name == "STRIKE (%)":
+                col.metric(name, value, delta=f"{g['atm_offset_bp']:+.1f}bp vs ATM", delta_color="off")
+            else:
+                col.metric(name, value)
     swap = trade.underlying(market)
     under = ui["index"] or f"{(market.curve.conventions.name if market.curve.conventions else 'USD SOFR')} OIS"
     st.caption(
@@ -481,20 +500,26 @@ def render(market: Market) -> List[Position]:
     quoted = ui["expiry"] in cube.expiries and ui["tenor"] in cube.tenors
     if quoted:
         point = cube.point(ui["expiry"], ui["tenor"])
-        cols = st.columns(7)
-        for col, (name, value) in zip(
-            cols,
+        params = pd.DataFrame(
             [
-                ("ALPHA", point.alpha),
-                ("BETA", point.beta),
-                ("RHO", point.rho),
-                ("NU", point.nu),
-                ("SHIFT (%)", point.shift * 100),
-                ("RMSE (BP)", point.rmse_bp),
-                ("MAX ERROR (BP)", point.max_abs_bp),
-            ],
-        ):
-            col.metric(name, _num(value, 4))
+                {
+                    "ALPHA": point.alpha,
+                    "BETA": point.beta,
+                    "RHO": point.rho,
+                    "NU": point.nu,
+                    "SHIFT (%)": point.shift * 100,
+                    "RMSE (BP)": point.rmse_bp,
+                    "MAX ERROR (BP)": point.max_abs_bp,
+                    "STATUS": point.status,
+                }
+            ]
+        )
+        st.dataframe(
+            params,
+            hide_index=True,
+            width="stretch",
+            column_config={k: st.column_config.NumberColumn(format="%.4f") for k in params.columns[:-1]},
+        )
         residuals = pd.DataFrame(
             {
                 "OFFSET (BP)": point.offsets_bp,
