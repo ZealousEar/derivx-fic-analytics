@@ -4,6 +4,7 @@ import streamlit as st
 
 from derivx.ui import analytics_lab, pricer_page, rates_bonds, rates_capfloor, rates_curve, rates_scenarios, rates_swap
 from derivx.ui.plot_limits import mount_zoom_guard
+from derivx.ui.state import keep_widget_values
 from derivx.ui.theme import apply_app_style
 
 st.set_page_config(page_title="DERIVX / FIC ANALYTICS", layout="wide", initial_sidebar_state="expanded")
@@ -44,4 +45,5 @@ elif mode == "RATES":
 elif mode == "ANALYTICS":
     analytics_lab.render()
 
+keep_widget_values()  # widget values of the modes not drawn this run survive the switch (UIE-04)
 mount_zoom_guard()
