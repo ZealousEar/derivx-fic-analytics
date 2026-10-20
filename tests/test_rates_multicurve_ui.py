@@ -1,0 +1,143 @@
+"""The multi-curve Rates page: EURIBOR projection-curve editors with
+illustrative quotes, forward and basis charts, EURIBOR swaps and caps with
+per-curve key-rate ladders and hedges, and per-curve scenarios."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+from pathlib import Path
+
+import pytest
+from streamlit.testing.v1 import AppTest
+
+from derivx.rates.curves import CurveQuote, bootstrap
+from derivx.rates.examples import EXAMPLE_ASOF, sofr_example_rows
+from derivx.rates.multicurve import bootstrap_projection, illustrative_quotes
+from derivx.ui import rates_curve
+
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "src" / "derivx" / "ui" / "streamlit_app.py"
+
+
+def _assert_bounded(at: AppTest) -> None:
+    for chart in at.get("plotly_chart"):
+        layout = json.loads(chart.proto.spec)["layout"]
+        limits = layout["meta"]["zoom"]["axes"]
+        axes = [name for name in layout if name.startswith(("xaxis", "yaxis"))]
+        assert axes and set(axes) <= set(limits), (chart.proto.id, axes)
+        for name in axes:
+            assert layout[name]["minallowed"] == limits[name]["min"], (chart.proto.id, name)
+            assert layout[name]["maxallowed"] == limits[name]["max"], (chart.proto.id, name)
+
+
+def _chart(at: AppTest, key: str) -> dict:
+    return json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith(key)).proto.spec)
+
+
+def _metric(at: AppTest, label: str) -> str:
+    return next(m.value for m in at.metric if m.label == label)
+
+
+@pytest.fixture(scope="module")
+def eur() -> AppTest:
+    at = AppTest.from_file(str(APP), default_timeout=600)
+    at.run()
+    at.sidebar.radio[0].set_value("[ RATES ]").run()
+    at.selectbox(key="rates_conv").set_value("EUR ESTR").run()
+    assert not at.exception, [e.value for e in at.exception]
+    return at
+
+
+def test_curve_tab_builds_euribor_projection_curves_from_labelled_quotes(eur):
+    assert not eur.error, [e.value for e in eur.error]
+    tables = {d.key: d.value for d in eur.dataframe if d.key and d.key.startswith("rates_proj_")}
+    assert len(tables) == 2
+    six = next(v for k, v in tables.items() if "EURIBOR_6M" in k)
+    three = next(v for k, v in tables.items() if "EURIBOR_3M" in k)
+    assert list(six["instrument"].unique()) == ["DEPO", "FRA", "IRS"]
+    assert {"DEPO", "FUT", "BASIS"} == set(three["instrument"])
+    for table in (six, three):
+        assert table["source"].str.startswith("ILLUSTRATIVE").all()  # never shown as market data
+    futures = three[three["instrument"] == "FUT"]
+    assert futures["rate"].between(90.0, 101.0).all()  # quoted as prices
+    errors = [m.value for m in eur.metric if m.label == "MAX REPRICING ERROR"]
+    assert len(errors) == 3 and all(float(v.split()[0]) < 1e-6 for v in errors)
+    forwards, basis = _chart(eur, "rates_mc_forwards"), _chart(eur, "rates_mc_basis")
+    names = [t["name"] for t in forwards["data"]]
+    assert {"OIS 3M FWD", "OIS 6M FWD", "EURIBOR 3M FWD", "EURIBOR 6M FWD"} <= set(names)
+    assert any("BASIS QUOTES" in t["name"] for t in basis["data"])
+    badge = next(a["text"] for a in forwards["layout"]["annotations"] if a["text"].startswith("SOURCE:"))
+    assert "ILLUSTRATIVE" in badge
+    _assert_bounded(eur)
+
+
+def test_euribor_swap_has_per_curve_ladders_and_a_multi_curve_hedge(eur):
+    eur.radio(key="swap_kind").set_value("EURIBOR 6M").run()
+    assert not eur.exception and not eur.error, [e.value for e in eur.error]
+    assert "EURIBOR 6M" in eur.session_state["swap_kind"]
+    ladder_charts = [c.proto.id for c in eur.get("plotly_chart") if "swap_ladder_chart" in c.proto.id]
+    assert any(i.endswith("swap_ladder_chart_euribor_6m") for i in ladder_charts)
+    assert float(_metric(eur, "LADDER RISK REMOVED (%)")) > 99.0
+    hedge = next(d.value for d in eur.dataframe if "CURVE" in d.value.columns and "BENCHMARK" in d.value.columns)
+    used = hedge[hedge["NOTIONAL ($)"] > 0]
+    assert set(used["CURVE"]) == {"EURIBOR 6M (PROJECTION)"}  # a par swap is its own curve's 5Y quote
+    pv01 = float(_metric(eur, "PV01 ($, +1BP)").replace(",", ""))
+    assert pv01 < 0  # receiver
+    _assert_bounded(eur)
+
+
+def test_euribor_cap_and_basis_scenarios(eur):
+    eur.radio(key="cap_index").set_value("EURIBOR 3M").run()
+    assert not eur.exception and not eur.error, [e.value for e in eur.error]
+    caps = [c.proto.id for c in eur.get("plotly_chart") if "cap_ladder_chart" in c.proto.id]
+    assert len(caps) == 3  # €STR, EURIBOR 6M (the 3M curve rides on it) and EURIBOR 3M
+    eur.selectbox(key="scn_type").set_value("Tenor basis").run()
+    assert not eur.exception and not eur.error, [e.value for e in eur.error]
+    by_curve = next(d.value for d in eur.dataframe if "POSITION" in d.value.columns
+                    and any("EURIBOR 3M" in c for c in d.value.columns))  # fmt: skip
+    assert len(by_curve) >= 2
+    eur.selectbox(key="scn_type").set_value("IBOR-OIS basis").run()
+    assert not eur.exception and not eur.error
+    grid = next(d.value for d in eur.dataframe if "SCENARIO" in d.value.columns)
+    assert any("IBOR-OIS basis" in s for s in grid["SCENARIO"]) and any("Tenor basis" in s for s in grid["SCENARIO"])
+    eur.radio(key="scn_chart_curve").set_value("EURIBOR 6M").run()
+    assert not eur.exception
+    _assert_bounded(eur)
+
+
+def test_single_curve_without_projection_curves(eur):
+    eur.checkbox(key="rates_mc_on").uncheck().run()
+    assert not eur.exception and not eur.error
+    assert eur.radio(key="swap_kind").options == ["OIS", "IRS"]
+    assert not any(c.proto.id.endswith("rates_mc_forwards") for c in eur.get("plotly_chart"))
+    eur.checkbox(key="rates_mc_on").check().run()
+    assert not eur.exception
+
+
+def test_sofr_futures_build_into_the_cached_curve():
+    """The CURVE tab's cached builder takes SR1/SR3 quotes with Hull-White
+    convexity and the store's SOFR fixings for part-fixed contracts."""
+
+    from derivx.data.rates_history import bundled_store
+
+    rates = {r["tenor"]: r["rate"] for r in sofr_example_rows()}
+    quotes = (("DEPO", "1W", rates["1W"]), ("SR1", "OCT26", 0.0390), ("SR3", "DEC26", 0.0368),
+              ("SR3", "MAR27", 0.0355), ("OIS", "2Y", rates["2Y"]), ("OIS", "10Y", rates["10Y"]))  # fmt: skip
+    fixings = rates_curve._ois_fixings(bundled_store(), "USD", EXAMPLE_ASOF)
+    assert fixings and fixings[-1][0] < EXAMPLE_ASOF and all(dt.date(2026, 6, 1) < d for d, _ in fixings)
+    curve = rates_curve._build(EXAMPLE_ASOF, quotes, "USD SOFR", "loglinear", (0.03, 0.0085), fixings)
+    rows = curve.repricing()
+    assert max(abs(r["error_bp"]) for r in rows) < 1e-8
+    assert next(r for r in rows if r["tenor"] == "MAR27")["convexity_bp"] > 0.0
+    table = rates_curve._repricing_table(curve)
+    assert {"Price", "Convexity (bp)"} <= set(table.columns)
+
+
+def test_illustrative_prefill_is_consistent_with_the_ois_curve():
+    quotes = [CurveQuote(r["kind"], r["tenor"], r["rate"] - 0.012) for r in sofr_example_rows()]
+    ois = bootstrap(EXAMPLE_ASOF, quotes, "EUR ESTR")
+    six = bootstrap_projection(EXAMPLE_ASOF, illustrative_quotes(ois, "EURIBOR 6M"), "EURIBOR 6M", ois)
+    three = illustrative_quotes(ois, "EURIBOR 3M", basis_curve=six)
+    assert {q.kind for q in three} == {"DEPO", "FUT", "BASIS"}
+    assert all(0.0 < q.rate < 0.002 for q in three if q.kind == "BASIS")  # 3s6s spread positive, a few bp
