@@ -10,9 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements first for better caching
 COPY requirements.txt .
-COPY setup.py .
 COPY pyproject.toml .
+COPY README.md .
 COPY src/ src/
+# Example market data the Rates and Analytics pages load at run time
+COPY data/examples/ data/examples/
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
