@@ -3,7 +3,13 @@ Bachelier (normal), Black or shifted Black model.
 
 On a single-curve market the term rate projects on the swap curve. On a
 multi-curve market (EUR) the cap is on EURIBOR 3M or 6M: forwards from its
-projection curve, discounting on €STR, and key-rate risk bucketed per curve."""
+projection curve, discounting on €STR, and key-rate risk bucketed per curve.
+
+Vols are one flat vol, a term structure, or caplet vols stripped from flat
+cap vol quotes (ATM or by strike; ILLUSTRATIVE defaults, editable) so that
+every quoted cap reprices. Risk: PV01 and gamma for +1bp on every rate
+quote, vega in total and by caplet expiry (and by quoted cap when stripped),
+and a one-day theta."""
 
 from __future__ import annotations
 
@@ -17,13 +23,22 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from derivx.rates.capfloor import CapFloor, cap_floor_parity, capfloor_position
+from derivx.rates.capvol import CapletVolSurface, quote_vegas, strip_caplet_vols, strip_surface, vega_by_expiry
+from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
-from derivx.risk.sensitivities import Position, key_rate_pv01, parallel_pv01
-from derivx.ui import rates_risk
+from derivx.rates.vol_examples import ILLUSTRATIVE, illustrative_cap_atm, illustrative_cap_strikes
+from derivx.risk.scenarios import theta
+from derivx.risk.sensitivities import Position, key_rate_pv01, rate_pv01_gamma
+from derivx.ui import rates_data, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.vol.sabr import calibrate_sabr_smile, sabr_vol
 
 MODEL_LABELS = {"Normal (bp)": "bachelier", "Black (%)": "black", "Shifted Black (%)": "shifted_black"}
+VOL_MODES = ["Flat", "Term structure", "Stripped from cap quotes"]
+STRIP_METHODS = {"Piecewise constant": "constant", "Linear": "linear"}
+SMILE_SHIFT = 0.03  # shift of the normal SABR fitted to each caplet smile
+MONEY_2DP = st.column_config.NumberColumn(format="%,.2f")
 TENORS = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y", "12Y", "15Y", "20Y", "25Y", "30Y"]
 FORWARD_STARTS = ["Spot", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y"]
 # Vol inputs are in display units: bp for the normal model, % for the Black models.
@@ -151,6 +166,198 @@ def _ladder_chart(rows: List[dict]) -> go.Figure:
     return fig
 
 
+def _currency(market: Market) -> str:
+    conv = market.curve.conventions
+    return conv.currency if conv is not None else "USD"
+
+
+def _maturity(text: object, row: int) -> str:
+    label = str(text).strip().upper()
+    tenor = parse_tenor(label)
+    if tenor.months is None:
+        raise ValueError(f"row {row}: cap maturity {text!r} must be months or years (e.g. 18M, 5Y)")
+    return label
+
+
+def _strike_column(name: str) -> float:
+    try:
+        return float(str(name).replace("%", "").strip()) / 100.0
+    except ValueError:
+        raise ValueError(f"column {name!r} is not a strike in % (e.g. 3.50%)") from None
+
+
+def _quote_tables(market: Market, layout: str):
+    """Editable flat cap vol quotes (normal bp); returns (maturities, flat
+    vols decimal, strikes decimal or None for ATM, whether the user edited
+    the defaults)."""
+
+    ccy = _currency(market)
+    if layout == "ATM":
+        default = illustrative_cap_atm(ccy).rename(columns={"maturity": "MATURITY", "vol_bp": "FLAT VOL (BP)"})
+        edited = st.data_editor(
+            default, num_rows="dynamic", hide_index=True, width="stretch", key=f"cap_strip_atm_{ccy}",
+            column_config={"FLAT VOL (BP)": st.column_config.NumberColumn(min_value=0.0, max_value=2000.0,
+                                                                          format="%.1f")},
+        )  # fmt: skip
+        rows = edited.dropna()
+        if rows.empty:
+            raise ValueError("the cap quote table needs at least one maturity with a vol")
+        mats = [_maturity(m, i + 1) for i, m in enumerate(rows["MATURITY"])]
+        return mats, rows["FLAT VOL (BP)"].astype(float).to_numpy() * 1e-4, None, not edited.equals(default)
+    default = illustrative_cap_strikes(ccy).rename(columns={"maturity": "MATURITY"})
+    edited = st.data_editor(default, num_rows="dynamic", hide_index=True, width="stretch", key=f"cap_strip_grid_{ccy}")
+    rows = edited.dropna(how="all", subset=list(edited.columns[1:]))
+    if rows.empty:
+        raise ValueError("the cap quote grid needs at least one maturity row")
+    mats = [_maturity(m, i + 1) for i, m in enumerate(rows["MATURITY"])]
+    strikes = np.array([_strike_column(c) for c in rows.columns[1:]])
+    grid = rows.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float) * 1e-4
+    return mats, grid, strikes, not edited.equals(default)
+
+
+def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, object]:
+    """Quote editor and stripping settings; returns the stripped vols (a
+    curve for ATM quotes, a surface by strike) and what they came from."""
+
+    st.markdown("#### / CAP VOL QUOTES")
+    c1, c2 = st.columns(2)
+    layout = c1.radio("QUOTES", ["ATM", "By strike"], horizontal=True, key="cap_strip_layout")
+    method = STRIP_METHODS[c2.radio("CAPLET VOLS", list(STRIP_METHODS), horizontal=True, key="cap_strip_method")]
+    st.caption(
+        "Flat normal cap vols (bp) by cap maturity on the selected index: spot-start caps, first caplet excluded. "
+        f"Defaults are {ILLUSTRATIVE}; edit the table or paste your broker's quotes."
+    )
+    mats, vols, strikes, edited = _quote_tables(market, layout)
+    source = f"{ILLUSTRATIVE}: {_currency(market)} flat cap normal vols" + (" (edited by you)" if edited else "")
+    key = (rates_risk.market_key(market), tuple(mats), tuple(np.ravel(vols).tolist()),
+           None if strikes is None else tuple(strikes.tolist()), method, tuple(sorted(terms.items())))  # fmt: skip
+
+    def compute():
+        if strikes is None:
+            result = strip_caplet_vols(market, mats, vols, None, method, terms=terms)
+            return result.curve, [result]
+        return strip_surface(market, mats, strikes, vols, method, terms=terms)
+
+    vol, results = rates_risk.cached("cap_strip", key, compute)
+    return {"vol": vol, "results": results, "layout": layout, "method": method, "maturities": mats, "flat": vols,
+            "strikes": strikes, "source": source}  # fmt: skip
+
+
+def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms: Dict[str, object]) -> None:
+    results, method, source = stripped["results"], stripped["method"], stripped["source"]
+    st.markdown("### / STRIPPED CAPLET VOLS")
+    st.plotly_chart(_vol_strip_chart(results, method, source, market.asof), width="stretch", config=PLOTLY_2D_CONFIG,
+                    key="cap_vol_strip_chart")  # fmt: skip
+    rows = []
+    for result in results:
+        for r in result.table.itertuples():
+            rows.append({"MATURITY": r.maturity, "STRIKE (%)": r.strike * 100, "FLAT VOL (BP)": r.flat_vol * 1e4,
+                         "LAST CAPLET EXPIRY (Y)": r.node, "CAPLETS": r.caplets,
+                         "QUOTED PV (BP UPFRONT)": r.target_pv * 1e4, "STRIPPED PV (BP UPFRONT)": r.stripped_pv * 1e4,
+                         "ERROR (BP UPFRONT)": r.error * 1e4})  # fmt: skip
+    table = pd.DataFrame(rows)
+    fmt = {c: st.column_config.NumberColumn(format="%.6f") for c in table.columns if c not in ("MATURITY", "CAPLETS")}
+    st.dataframe(table, hide_index=True, width="stretch", column_config=fmt)
+    worst = max(r.max_error for r in results) * 1e4
+    rule = ("one caplet vol for the caplets each quote adds (piecewise constant in expiry)" if method == "constant"
+            else "caplet vols linear in expiry between the quotes' last caplets (flat before the first)")  # fmt: skip
+    st.caption(
+        f"Bootstrapped maturity by maturity, {rule}, so every quoted cap reprices at its flat vol (largest error "
+        f"{worst:.1e}bp upfront). "
+        + ("ATM quotes strip on each cap's own ATM strike: the curve is the caplet vol at those strikes, with no "
+           "smile between them." if stripped["strikes"] is None else
+           "Each strike is stripped on its own; between strikes the caplet vol is linear in strike, flat outside.")
+    )  # fmt: skip
+    if stripped["strikes"] is not None:
+        surface = stripped["vol"]
+        nodes = list(surface.nodes)
+        labels = {f"{m} ({t:.2f}Y)": t for m, t in zip(results[0].table["maturity"], nodes)}
+        choice = st.selectbox("SMILE AT CAPLET EXPIRY", list(labels), index=min(4, len(labels) - 1),
+                              key="cap_smile_expiry")  # fmt: skip
+        expiry = labels[choice]
+        longest = CapFloor(1.0, "cap", 0.03, results[0].table["maturity"].iloc[-1], 0.01, **terms).caplets(market)
+        forward = float(longest.iloc[int(np.argmin(np.abs(longest["expiry"].to_numpy() - expiry)))]["forward"])
+        st.plotly_chart(_smile_chart(surface, expiry, forward, source, market.asof), width="stretch",
+                        config=PLOTLY_2D_CONFIG, key="cap_smile_chart")  # fmt: skip
+        st.caption(
+            f"Caplet vols stripped at each quoted strike for the caplet fixing {expiry:.2f}Y ahead, and a normal "
+            f"SABR (beta 0, shift {SMILE_SHIFT:.0%}) fitted to them; the diamond is that caplet's forward."
+        )
+    elif st.checkbox("SHOW VEGA BY QUOTED CAP (RE-STRIPS EACH QUOTE)", value=False, key="cap_quote_vega"):
+        key = (rates_risk.market_key(market), repr(cf), tuple(stripped["maturities"]),
+               tuple(np.ravel(stripped["flat"]).tolist()), method)  # fmt: skip
+        vegas = rates_risk.cached("cap_quote_vega", key, lambda: quote_vegas(
+            cf, market, stripped["maturities"], stripped["flat"], None, method, terms))  # fmt: skip
+        view = vegas.rename(columns={"maturity": "QUOTED CAP", "vega": "VEGA (PER +1BP FLAT VOL)"})
+        st.dataframe(view, hide_index=True, width="stretch", column_config={"VEGA (PER +1BP FLAT VOL)": MONEY_2DP})
+        st.caption(
+            f"P&L for +1bp on one quoted flat vol, caplet vols re-stripped (central difference). Sum "
+            f"{vegas['vega'].sum():,.2f}; quotes beyond the cap's last caplet do not move it."
+        )
+
+
+def _vol_strip_chart(results, method: str, source: str, asof) -> go.Figure:
+    fig = go.Figure()
+    shown: List[float] = []
+    top = max(r.curve.nodes[-1] for r in results)
+    t = np.linspace(1e-6, top + 0.5, 600)
+    for k, result in enumerate(results):
+        name = "ATM" if result.curve.strike is None else f"{result.curve.strike:.2%}"
+        vols = result.curve.vol_at(t) * 1e4
+        color = SERIES[k % len(SERIES)]
+        fig.add_trace(go.Scatter(x=t, y=vols, mode="lines", name=f"CAPLET {name}", line=dict(color=color, width=2)))
+        flat = result.table["flat_vol"].to_numpy() * 1e4
+        fig.add_trace(go.Scatter(x=result.table["node"], y=flat, mode="markers", name=f"FLAT QUOTE {name}",
+                                 marker=dict(color=color, size=8, symbol="circle-open")))  # fmt: skip
+        shown += list(vols) + list(flat)
+    dark_layout(fig, height=360, xtitle="CAPLET EXPIRY (YEARS TO FIXING)", ytitle="NORMAL VOL (BP)")
+    rates_data.badge(fig, source, asof)
+    return bound_axes(fig, xaxis=axis_limits([0.0, top + 0.5], pad=0.02, floor=0.0),
+                      yaxis=axis_limits(shown, pad=0.1, floor=0.0))  # fmt: skip
+
+
+def _smile_chart(surface: CapletVolSurface, expiry: float, forward: float, source: str, asof) -> go.Figure:
+    strikes, vols = surface.smile(expiry)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=strikes * 100, y=vols * 1e4, mode="markers", name="STRIPPED CAPLET VOLS",
+                             marker=dict(color=SERIES[3], size=9)))  # fmt: skip
+    shown = list(vols * 1e4)
+    xs = list(strikes * 100) + [forward * 100]
+    try:
+        fit = calibrate_sabr_smile(strikes, vols, expiry, forward, 0.0, SMILE_SHIFT, vol_type="normal")
+        grid = np.linspace(strikes.min(), strikes.max(), 120)
+        line = sabr_vol(forward, grid, expiry, fit.alpha, 0.0, fit.rho, fit.nu, SMILE_SHIFT, "normal") * 1e4
+        fig.add_trace(go.Scatter(x=grid * 100, y=line, mode="lines", name=f"NORMAL SABR (RMSE {fit.rmse_bp:.2f}BP)",
+                                 line=dict(color=SERIES[0], width=2)))  # fmt: skip
+        shown += list(line)
+    except ValueError:
+        pass  # too few strikes or a smile SABR cannot fit: the stripped points are still shown
+    fig.add_trace(go.Scatter(x=[forward * 100], y=[float(np.interp(forward, strikes, vols)) * 1e4], mode="markers",
+                             name="CAPLET FORWARD", marker=dict(color=ACCENT, size=12, symbol="diamond")))  # fmt: skip
+    dark_layout(fig, height=340, xtitle="STRIKE (%)", ytitle="CAPLET NORMAL VOL (BP)")
+    rates_data.badge(fig, source, asof)
+    return bound_axes(fig, xaxis=axis_limits(xs, pad=0.05), yaxis=axis_limits(shown, pad=0.12, floor=0.0))
+
+
+def _vega_chart(buckets: pd.DataFrame, per: str) -> go.Figure:
+    fixes, values = list(buckets["fix"]), buckets["vega"].tolist()
+    fig = go.Figure(go.Bar(x=fixes, y=values, name="VEGA", marker=dict(color=SERIES[2])))
+    dark_layout(fig, height=300, xtitle="CAPLET FIXING DATE", ytitle=f"VEGA (PER +{per})", legend=False)
+    return bound_axes(fig, xaxis=_date_limits(fixes), yaxis=axis_limits([0.0, *values], pad=0.12,
+                                                                         floor=min(0.0, *values)))  # fmt: skip
+
+
+def _greeks(position: Position, market: Market, trade_key: tuple) -> Dict[str, float]:
+    """PV01 and gamma (+1bp on every rate quote, curves rebuilt) and the full
+    one-day theta, cached per market and trade."""
+
+    def compute() -> Dict[str, float]:
+        pv01, gamma = rate_pv01_gamma(position.pv, market)
+        return {"pv01": pv01, "gamma": gamma, "theta": float(theta([position], market)[0])}
+
+    return rates_risk.cached("cap_greeks", (rates_risk.market_key(market), trade_key), compute)
+
+
 def render(market: Market) -> List[Position]:
     """Draw the tab and return the priced cap/floor as a position."""
 
@@ -192,16 +399,24 @@ def render(market: Market) -> List[Position]:
         ) / 100
 
     vol_label, vol_unit, vol_top = VOL_UNITS[model]
-    vol_mode = st.radio("VOL INPUT", ["Flat", "Term structure"], horizontal=True, key="cap_vol_mode")
+    vol_mode = st.radio("VOL INPUT", VOL_MODES, horizontal=True, key="cap_vol_mode")
+    stripped = None
     try:
         if vol_mode == "Flat":
             vol = st.number_input(
                 f"FLAT VOL ({vol_label})", min_value=0.0, max_value=vol_top, value=DEFAULT_FLAT_VOL[model],
                 step=1.0, format="%.2f", key=f"cap_flat_vol_{model}",
             ) * vol_unit
-        else:
+        elif vol_mode == "Term structure":
             st.caption("Vol by option expiry (years to fixing), linear in expiry and flat outside the table.")
             vol = _vol_table(model)
+        else:
+            vol = 0.0  # replaced by the stripped caplet vols below
+            if model != "bachelier":
+                raise ValueError(
+                    "cap vol quotes here are flat normal vols (bp), the way USD and EUR caps are quoted: pick the "
+                    "Normal (bp) model to strip them, or enter a lognormal term structure"
+                )
         if projection:
             index = market.get_curve(projection).index
             terms = dict(
@@ -216,35 +431,43 @@ def render(market: Market) -> List[Position]:
             )
         atm = CapFloor(notional, kind, 0.0, tenor, 0.0, **terms).atm_strike(market)
         strike = strike_pct / 100 if strike_mode == "Absolute %" else atm + offset_bp * 1e-4
+        if vol_mode == "Stripped from cap quotes":
+            stripped = _stripped_inputs(market, terms)
+            vol = stripped["vol"]
         cf = CapFloor(notional, kind, strike, tenor, vol, model, shift, **terms)
         table = cf.caplets(market)
         position = capfloor_position(cf, asof=market.asof)
         pv = float(table["pv"].sum())
         vega = float(table["vega"].sum())
         premium_bp = cf.premium_bp_running(market)
+        trade = ("cap", repr(position.details["trade"]))
         if market.is_multi_curve:
-            trade = ("cap", repr(position.details["trade"]))
             curves = rates_risk.projection_chain(market, projection)
             ladders = rates_risk.ladders(market, position.pv, trade, curves)
-            pv01 = rates_risk.rate_pv01(market, position.pv, trade)
             ladder = [dict(r, pv01=float(v)) for key in curves for r, v in zip(*ladders[key])]
         else:
             ladders = None
-            pv01 = parallel_pv01(position.pv, market)
-            ladder = key_rate_pv01(position.pv, market)
+            ladder = rates_risk.cached("cap_ladder", (rates_risk.market_key(market), trade),
+                                       lambda: key_rate_pv01(position.pv, market))  # fmt: skip
+        greeks = _greeks(position, market, trade)
+        pv01 = greeks["pv01"]
+        decay = cf.decay(market)
         parity = cap_floor_parity(cf, market)
     except ValueError as err:
         st.error(f"Cannot price this {kind}: {err}")
         return []
 
     per = "1BP" if model == "bachelier" else "VOL PT"
-    m = st.columns(6)
+    m = st.columns(4)
     m[0].metric("PV", f"{pv:,.2f}")
     m[1].metric("PREMIUM (BP RUNNING)", f"{premium_bp:,.2f}")
     m[2].metric("PREMIUM (% UPFRONT)", f"{pv / notional * 100:.4f}")
     m[3].metric("ATM STRIKE (%)", f"{atm * 100:.4f}")
-    m[4].metric(f"VEGA (/{per})", f"{vega:,.2f}")
-    m[5].metric("PV01 (/BP)", f"{pv01:,.2f}")
+    m = st.columns(4)
+    m[0].metric(f"VEGA (/{per})", f"{vega:,.2f}")
+    m[1].metric("PV01 (/BP)", f"{pv01:,.2f}")
+    m[2].metric("GAMMA (/BP²)", f"{greeks['gamma']:,.4f}")
+    m[3].metric("THETA (1 BUS. DAY)", f"{greeks['theta']:,.2f}")
     shift_text = (
         "+1bp on every rate quote of the OIS and EURIBOR curves, rebuilt (basis spreads held)"
         if ladders is not None else "+1bp on every curve quote with the curve rebuilt"
@@ -264,6 +487,14 @@ def render(market: Market) -> List[Position]:
         + (f"forwards from the {projection} projection curve, discounting on the OIS curve." if projection
            else "one curve projects and discounts.")
     )  # fmt: skip
+    st.caption(
+        "GAMMA: P&L per (1bp)² for a move of every rate quote (central second difference, curves rebuilt), so "
+        "P&L(x bp) ~ PV01 x + gamma x²/2. THETA: value on the next business day with quotes and vols unchanged "
+        f"(curves rolled, caplet vols read at their shorter expiry) minus today; time decay alone (forwards, "
+        f"discount factors and vols held) is {decay:,.2f}."
+    )
+    if stripped is not None:
+        _show_strip(stripped, cf, market, terms)
     if vol_mode == "Flat" and vol == 0.0:
         st.warning("Zero vol: every caplet is worth only its intrinsic value on the forward.")
     pillars = market.curve.pillar_dates
@@ -282,6 +513,14 @@ def render(market: Market) -> List[Position]:
         "DOWNLOAD CAPLETS CSV", view.to_csv(index=False), file_name=f"{kind}lets.csv", mime="text/csv",
         on_click="ignore", key="cap_caplets_csv",
     )
+    buckets = vega_by_expiry(cf, market)
+    if len(buckets):
+        st.markdown(f"### / VEGA BY CAPLET EXPIRY (PER +{per})")
+        st.plotly_chart(_vega_chart(buckets, per), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_vega_chart")
+        st.caption(
+            f"Each live {kind}let's vega: P&L for +{'1bp of normal vol' if model == 'bachelier' else '1 vol point'} "
+            f"on that caplet's vol alone. They sum to the vega {vega:,.2f}."
+        )
 
     st.markdown("### / KEY-RATE PV01" + (" BY CURVE" if ladders is not None else ""))
     if ladders is None:

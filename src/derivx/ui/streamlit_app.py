@@ -11,6 +11,7 @@ from derivx.ui import (
     rates_curve,
     rates_scenarios,
     rates_swap,
+    rates_swaption,
 )
 from derivx.ui.plot_limits import mount_zoom_guard
 from derivx.ui.state import keep_widget_values
@@ -36,7 +37,7 @@ elif mode == "FX":
     fx_page.render()
 elif mode == "RATES":
     st.markdown("## / INTEREST RATES")
-    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS"])
+    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS"])
     with tabs[0]:
         market = rates_curve.render()
     if market is None:
@@ -48,10 +49,12 @@ elif mode == "RATES":
         with tabs[1]:
             positions += rates_swap.render(market)
         with tabs[2]:
-            positions += rates_capfloor.render(market)
+            positions += rates_swaption.render(market)
         with tabs[3]:
-            positions += rates_bonds.render(market)
+            positions += rates_capfloor.render(market)
         with tabs[4]:
+            positions += rates_bonds.render(market)
+        with tabs[5]:
             rates_scenarios.render(market, positions)
 elif mode == "ANALYTICS":
     analytics_lab.render()
