@@ -255,3 +255,71 @@ def test_pca_shock_runs_through_the_scenario_engine():
     expected = pca.factor_pv01(risk.pv01, risk.years, result, 1)[0, 0] * result.sigma_bp[0]
     assert row["delta"] == pytest.approx(expected, rel=1e-9)
     assert abs(row["residual"]) < 1e-3 * abs(row["pnl"])
+
+
+def _basis_quoted_eur_market():
+    """ESTR discount curve, EURIBOR 6M from swaps and EURIBOR 3M quoted as
+    3s6s BASIS spreads over the 6M curve (ILLUSTRATIVE quotes)."""
+
+    from derivx.rates.curves import CurveQuote, Market, bootstrap
+    from derivx.rates.multicurve import bootstrap_projection, illustrative_quotes
+
+    ois = {"1Y": 0.02, "2Y": 0.021, "5Y": 0.023, "10Y": 0.026, "30Y": 0.028}
+    discount = bootstrap(EXAMPLE_ASOF, [CurveQuote("OIS", t, r) for t, r in ois.items()], "EUR ESTR")
+    six = bootstrap_projection(EXAMPLE_ASOF, illustrative_quotes(discount, "EURIBOR 6M"), "EURIBOR 6M", discount)
+    quotes = illustrative_quotes(discount, "EURIBOR 3M", basis_curve=six)
+    three = bootstrap_projection(EXAMPLE_ASOF, quotes, "EURIBOR 3M", discount, basis=six)
+    assert any(inst.kind == "BASIS" for inst in three.instruments)
+    return Market(curve=discount, projections={"EURIBOR 6M": six, "EURIBOR 3M": three}, govt=example_market().govt)
+
+
+def test_factor_risk_holds_basis_spreads_like_the_pca_shock():
+    """Review finding: the RESEARCH factor risk summed PV01 x loading over
+    every quote, BASIS spreads included, so on a 3M curve quoted as 3s6s
+    basis the level factor moved the basis too: +1,696 per sd for a 3M
+    swap whose PCA level shock loses 43,901. Spread quotes are held, as in
+    the shock and the VaR."""
+
+    from derivx.risk.scenarios import factor_risk, shocked_curves
+
+    market = _basis_quoted_eur_market()
+    swap = VanillaSwap.from_index("EURIBOR 3M", "10Y", 0.025, 1e7, trade_date=market.asof)
+    positions = [swap_position(swap)]
+    risk = {k: quote_risk(positions, market, k) for k in shocked_curves(market)}
+    store = rh.bundled_store()
+    levels = store.complete("UST_PAR")
+    result = pca.pca_curve_changes(levels, AUDIT_TENORS, start=pca.recent_daily_start(levels, AUDIT_TENORS),
+                                   end=market.asof)  # fmt: skip
+    per_score = factor_risk(market, risk, result, 3)
+    for k in range(3):
+        shock = pca_factor(k + 1, 1.0, store, end=market.asof)
+        delta = run_scenario(positions, market, shock, risk)[0]["delta"]
+        assert per_score[k, 0] * result.sigma_bp[k] == pytest.approx(delta, rel=1e-9, abs=1e-6)
+    assert per_score[0, 0] * result.sigma_bp[0] < -40_000  # receiving fixed vs 3M loses ~44k on a +1 sd level move
+    naive = sum(pca.factor_pv01(qr.pv01, qr.years, result, 1) for qr in risk.values())[0, 0]
+    assert naive * result.sigma_bp[0] > 0  # what the tab showed before: basis spreads moving with the level
+    with pytest.raises(ValueError, match="no key-rate risk"):
+        factor_risk(market, {}, result)
+
+
+def test_pca_shock_on_the_boe_curve_uses_its_par_ois_rates():
+    """The swap curve is quoted in par OIS rates: a PCA shock from the BoE
+    SONIA history analyses its derived par OIS rates (as the historical
+    replay and the VaR do), not its spot rates."""
+
+    from derivx.risk.scenarios import quoted_levels
+
+    store = rh.bundled_store()
+    shock = pca_factor(1, 1.0, store, "GBP_OIS_BOE", end=EXAMPLE_ASOF)
+    assert "derived par OIS rates" in shock.description
+    zero = store.complete("GBP_OIS_BOE")
+    tenors = [t for t in pca.DEFAULT_TENORS if t in zero.columns]
+    start = pca.recent_daily_start(zero, tenors, end=EXAMPLE_ASOF)
+    par = quoted_levels(store, "GBP_OIS_BOE", start, EXAMPLE_ASOF)
+    assert par.loc[EXAMPLE_ASOF, "10Y"] == pytest.approx(store.ois_par("GBP_OIS_BOE", EXAMPLE_ASOF)["10Y"])
+    expected = pca.pca_curve_changes(par, tenors, start=start, end=EXAMPLE_ASOF)
+    np.testing.assert_allclose([b for _, b in shock.profile], expected.sigma_bp[0] * expected.loadings[:, 0])
+    on_zero = pca.pca_curve_changes(zero, tenors, start=start, end=EXAMPLE_ASOF)
+    assert not np.allclose(expected.sigma_bp[0] * expected.loadings[:, 0], on_zero.sigma_bp[0] * on_zero.loadings[:, 0])
+    ust = pca_factor(1, 1.0, store, end=EXAMPLE_ASOF)
+    assert "changes in par yields" in ust.description

@@ -150,10 +150,27 @@ def _timed(series: pd.Series) -> pd.Series:
     return out.sort_index()
 
 
-def _window(years: float) -> str:
+def window_days(years: float) -> int:
+    """Calendar days of a trailing window of ``years`` (365.25 a year)."""
+
     if not (math.isfinite(years) and years > 0):
         raise ValueError("the window must be a positive number of years")
-    return f"{int(round(365.25 * years))}D"
+    return int(round(365.25 * years))
+
+
+def _window(years: float) -> str:
+    return f"{window_days(years)}D"
+
+
+def trailing(series: pd.Series, years: float) -> pd.Series:
+    """The observations of ``series`` (dated by ``datetime.date``) in the
+    trailing window (last - window_days(years), last], the window
+    :func:`rolling_stats`, :func:`snapshot` and :func:`rank_structures` use."""
+
+    if series.empty:
+        return series
+    start = series.index.max() - dt.timedelta(days=window_days(years))
+    return series[series.index > start]
 
 
 def rolling_stats(series: pd.Series, years: float, min_obs: int = MIN_WINDOW_OBS) -> pd.DataFrame:
@@ -250,8 +267,7 @@ def snapshot(series: pd.Series, windows: Mapping[str, float] = WINDOWS) -> pd.Da
     rows = []
     last = series.index.max()
     for label, years in windows.items():
-        start = last - dt.timedelta(days=int(round(365.25 * years)))
-        window = series[series.index > start]
+        window = trailing(series, years)
         n = len(window)
         value = float(series.loc[last])
         mean = float(window.mean()) if n else float("nan")
@@ -305,8 +321,7 @@ def rank_structures(
         if len(series) < 2:
             continue
         stats = snapshot(series, {window: WINDOWS[window]}).iloc[0]
-        start = series.index.max() - dt.timedelta(days=int(round(365.25 * WINDOWS[window])))
-        recent = series[series.index > start]
+        recent = trailing(series, WINDOWS[window])
         changes = daily_changes(recent)
         vol = float(changes.std(ddof=1)) if len(changes) > 1 else float("nan")
         try:

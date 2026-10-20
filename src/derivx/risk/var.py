@@ -6,9 +6,12 @@ Scenarios (:func:`build_scenarios`)
     history's tenors, linear in maturity in between and flat beyond (as a
     shock profile; ``BASIS`` spread quotes are held), applied to today's
     curves. The scenario dates are the last ``lookback`` daily changes of the
-    US Treasury par curve (FRED H.15 / US Treasury) up to the valuation date;
-    a change spanning more than 5 calendar days (a gap in the history) is
-    not a daily change and is skipped. Another history's change on a
+    US Treasury par curve (FRED H.15 / US Treasury) up to the valuation date,
+    within its most recent unbroken daily stretch: a gap of more than 5
+    calendar days ends the window, so month-end data or an older episode
+    window are never mixed in, and a valuation date early in the daily
+    history gets fewer scenarios than asked (``VarScenarios.lookback``
+    keeps the number asked for). Another history's change on a
     scenario date runs from its last observation on or before the previous
     scenario date to its last observation on or before that date (as-of
     alignment: a holiday in one market neither drops nor doubles a move); an
@@ -64,7 +67,7 @@ from scipy.stats import norm
 from derivx.data.rates_history import HistoryStore, dataset_info, user_dataset
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Market
 from derivx.rates.pca import MAX_GAP_DAYS, tenor_map, tenor_years
-from derivx.risk.scenarios import GOVT_HISTORY, SWAP_HISTORY, SWAP_PROXIES, QuoteRisk, shocked_curves
+from derivx.risk.scenarios import GOVT_HISTORY, SWAP_HISTORY, SWAP_PROXIES, QuoteRisk, quoted_levels, shocked_curves
 from derivx.risk.sensitivities import Position
 
 CONFIDENCES = (0.95, 0.975, 0.99)
@@ -103,10 +106,17 @@ class VarScenarios:
     bumps: Dict[str, np.ndarray]
     labels: Dict[str, Tuple[str, ...]]
     sources: Tuple[CurveSource, ...]
+    lookback: int = 0  # daily changes asked for; ``n`` is fewer when the daily history starts later
 
     @property
     def n(self) -> int:
         return len(self.dates)
+
+    @property
+    def short(self) -> bool:
+        """True if the daily history held fewer changes than asked for."""
+
+        return self.n < self.lookback
 
     def sources_table(self) -> pd.DataFrame:
         rows = [
@@ -135,17 +145,8 @@ def dataset_levels(store: HistoryStore, dataset: str, start: dt.date, end: dt.da
     with OIS conventions (the BoE SONIA curve) give their derived par OIS
     rates, the rates the swap curve is quoted in."""
 
-    info = dataset_info(dataset)
-    if info.measure == "zero_cc" and info.ois_conventions:
-        days = [d for d in store.dates(dataset) if start <= d <= end]
-        frame = pd.DataFrame({d: store.ois_par(dataset, d) for d in days}).T
-    else:
-        frame = store.complete(dataset)
-        frame = frame[(frame.index >= start) & (frame.index <= end)]
-    if frame.empty:
-        return frame
-    frame = frame.dropna(axis=1, how="any").sort_index()
-    return frame[sorted(frame.columns, key=lambda t: tenor_years([t])[0])].astype(float)
+    frame = quoted_levels(store, dataset, start, end)
+    return frame if frame.empty else frame.dropna(axis=1, how="any")
 
 
 def daily_pairs(dates: Sequence[dt.date], max_gap_days: int = MAX_GAP_DAYS) -> List[Tuple[dt.date, dt.date]]:
@@ -154,6 +155,18 @@ def daily_pairs(dates: Sequence[dt.date], max_gap_days: int = MAX_GAP_DAYS) -> L
 
     days = sorted(dates)
     return [(a, b) for a, b in zip(days[:-1], days[1:]) if (b - a).days <= max_gap_days]
+
+
+def recent_daily_pairs(dates: Sequence[dt.date], max_gap_days: int = MAX_GAP_DAYS) -> List[Tuple[dt.date, dt.date]]:
+    """(previous, date) of consecutive observations in the most recent
+    unbroken stretch: back from the last observation until two consecutive
+    ones are more than ``max_gap_days`` calendar days apart."""
+
+    days = sorted(dates)
+    i = len(days) - 1
+    while i > 0 and (days[i] - days[i - 1]).days <= max_gap_days:
+        i -= 1
+    return list(zip(days[i:-1], days[i + 1 :]))
 
 
 def aligned_changes(
@@ -227,11 +240,12 @@ def build_scenarios(
         raise ValueError("min_coverage must be in (0, 1]")
     end = end or market.asof
     anchor_dates = [d for d in store.dates(ANCHOR) if d <= end]
-    pairs = daily_pairs(anchor_dates)[-int(lookback) :]
+    pairs = recent_daily_pairs(anchor_dates)[-int(lookback) :]
     if len(pairs) < MIN_SCENARIOS:
         raise ValueError(
-            f"only {len(pairs)} daily US Treasury changes up to {end} in the history store (need {MIN_SCENARIOS}); "
-            "the bundled history is daily from 2015, the LIVE source adds the latest days"
+            f"only {len(pairs)} daily US Treasury changes up to {end} in the most recent daily stretch of the "
+            f"history store (need {MIN_SCENARIOS}); the bundled history is daily from 2015, the LIVE source adds the "
+            "latest days"
         )
     previous = tuple(a for a, _ in pairs)
     dates = tuple(b for _, b in pairs)
@@ -282,7 +296,7 @@ def build_scenarios(
         bumps[key] = quote_moves
         labels[key] = tuple(curve.labels)
         sources.append(CurveSource(key, ccy, dataset, dataset_info(dataset).title, flag, coverage, note))
-    return VarScenarios(market.asof, dates, previous, bumps, labels, tuple(sources))
+    return VarScenarios(market.asof, dates, previous, bumps, labels, tuple(sources), int(lookback))
 
 
 # --------------------------------------------------------------------------

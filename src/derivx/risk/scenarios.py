@@ -556,6 +556,28 @@ def historical_sources(shock: Shock) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["curve", "currency", "data", "start", "end", "flag", "note"])
 
 
+def quoted_levels(
+    store: HistoryStore, dataset: str, start: Optional[dt.date] = None, end: Optional[dt.date] = None
+) -> pd.DataFrame:
+    """Decimal levels of ``dataset`` on its complete-curve dates in [start,
+    end] (one column per tenor, shortest first), in the rates a curve is
+    quoted in: a zero-curve dataset with OIS conventions (the Bank of
+    England SONIA curve) gives its derived par OIS rates
+    (:meth:`HistoryStore.ois_par`), any other its own measure."""
+
+    info = dataset_info(dataset)
+    if info.measure == "zero_cc" and info.ois_conventions:
+        days = [d for d in store.dates(dataset) if (start is None or d >= start) and (end is None or d <= end)]
+        frame = pd.DataFrame({d: store.ois_par(dataset, d) for d in days}).T
+    else:
+        frame = store.complete(dataset)
+        frame = frame[[(start is None or d >= start) and (end is None or d <= end) for d in frame.index]]
+    if frame.empty:
+        return frame
+    frame = frame.sort_index()
+    return frame[sorted(frame.columns, key=lambda t: parse_tenor(t).years)].astype(float)
+
+
 def _pca_flag(dataset: str, selector: str) -> str:
     """How a PCA profile from ``dataset`` relates to the curve ``selector``
     (``"govt:USD"``, ``"curve:EUR"``)."""
@@ -606,11 +628,16 @@ def pca_factor(
             tenors = list(dataset_info(dataset).core_tenors)
     if start is None:
         start = pca_mod.recent_daily_start(levels, tenors, end=end)
+    info = dataset_info(dataset)
+    quoted = "par yields" if info.measure.startswith("par") else "rates"
+    if info.measure == "zero_cc" and info.ois_conventions:
+        # The swap curve is quoted in par OIS rates: analyse those (as the historical replay and the VaR do).
+        levels = quoted_levels(store, dataset, start, end)
+        quoted = "derived par OIS rates"
     result = pca_mod.pca_curve_changes(levels, tenors, window, start=start, end=end)
     if factor > len(result.tenors):
         raise ValueError(f"{len(result.tenors)} tenors give {len(result.tenors)} factors, not PC{factor}")
     profile = result.factor_profile(int(factor) - 1, float(n_sigma), int(days))
-    info = dataset_info(dataset)
     label = pca_mod.FACTOR_LABELS[factor - 1] if factor <= len(pca_mod.FACTOR_LABELS) else ""
     sd = float(result.sigma_bp[factor - 1])
     span = f"{result.start} to {result.end}"
@@ -619,7 +646,7 @@ def pca_factor(
     sources = []
     for selector in selectors:
         flag = _pca_flag(dataset, selector)
-        note = f"PC{factor} of {info.title} daily changes ({span}, {result.n_obs} changes)"
+        note = f"PC{factor} of {info.title} daily changes in {quoted} ({span}, {result.n_obs} changes)"
         if flag != "real":
             note += f": applied to this curve as a {flag}"
         sources.append(ReplaySource(selector, dataset, info.title, str(result.start), str(result.end), flag, note))
@@ -630,7 +657,7 @@ def pca_factor(
         settings,
         description=(
             f"PC{factor} ({label.lower() or 'factor'}, {100 * result.explained[factor - 1]:.1f}% of the variance) of "
-            f"daily {info.title} changes {span} ({result.n_obs} changes): sd {sd:.2f}bp a day, move = "
+            f"daily {info.title} changes in {quoted} {span} ({result.n_obs} changes): sd {sd:.2f}bp a day, move = "
             f"{n_sigma:+g} sd{days_text} x loading, in bp: {shape}"
         ),
         sources=tuple(sources),
@@ -641,6 +668,29 @@ def pca_library(store: Optional[HistoryStore] = None, n_sigma: float = 2.0, **kw
     """+/-``n_sigma`` sd of PC1, PC2 and PC3 (see :func:`pca_factor`)."""
 
     return [pca_factor(k, sign * n_sigma, store, **kwargs) for k in (1, 2, 3) for sign in (1.0, -1.0)]
+
+
+def factor_risk(
+    market: Market, risk: Mapping[str, QuoteRisk], result: pca_mod.PCAResult, n_factors: int = 3
+) -> np.ndarray:
+    """P&L (factors x positions) of every curve in ``risk`` moving along each
+    of the first ``n_factors`` loadings by a score of +1 (tenor i up
+    ``L_ik`` bp): the delta of a :func:`pca_factor` shock of one sd divided
+    by the sd. Rate quotes move by the loading read at their maturity
+    (:func:`derivx.rates.pca.factor_pv01`); ``BASIS`` spread quotes are held,
+    as a shock and the value at risk hold them."""
+
+    total: Optional[np.ndarray] = None
+    for which, qr in risk.items():
+        curve = market.get_curve(which)
+        if len(curve.instruments) != qr.pv01.shape[0]:
+            raise ValueError(f"the {which!r} key-rate risk does not match the curve's {len(curve.instruments)} quotes")
+        rates = np.array([inst.kind not in SPREAD_KINDS for inst in curve.instruments], dtype=float)
+        part = pca_mod.factor_pv01(qr.pv01 * rates[:, None], qr.years, result, n_factors)
+        total = part if total is None else total + part
+    if total is None:
+        raise ValueError("no key-rate risk to combine with the factors")
+    return total
 
 
 def standard_library(store: Optional[HistoryStore] = None) -> List[Shock]:

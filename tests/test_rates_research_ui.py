@@ -37,6 +37,26 @@ DOWNLOADS = ("rs_rv_csv", "rs_carry_csv", "rs_pca_csv", "rs_pca_explained_csv", 
              "rs_pca_risk_csv", "rs_var_csv", "rs_var_pnl_csv", "rs_var_report_csv")  # fmt: skip
 
 
+PCA_START = "rs_pca_start_UST_PAR_2014-12-31_2026-10-19"  # keyed on the daily history's first and last dates
+DATED_APP = """
+import datetime as dt
+import streamlit as st
+from derivx.rates.curves import Market
+from derivx.rates.examples import example_curve, ust_curve
+from derivx.rates.swaps import VanillaSwap, swap_position
+from derivx.ui import rates_research
+
+asof = st.session_state.get("asof", dt.date(2026, 10, 19))
+market = Market(curve=example_curve(asof=asof), govt=ust_curve(asof) if asof.year == 2026 else None)
+swap = VanillaSwap.from_conventions(market.curve.conventions, "10Y", 0.0373, 1e7, trade_date=market.asof)
+rates_research.render(market, [swap_position(swap)])
+"""
+
+
+def _pca_caption(at: AppTest) -> str:
+    return next(c.value for c in at.caption if c.value.startswith("PCA of daily changes"))
+
+
 def _app(**state) -> AppTest:
     at = AppTest.from_string(APP, default_timeout=300)
     for key, value in state.items():
@@ -161,11 +181,11 @@ def test_pca_inputs_and_factor_risk():
     _ok(at)
     assert any("at least three tenors" in w.value for w in at.warning)
     at.multiselect(key="rs_pca_tenors_UST_PAR").set_value(["2Y", "5Y", "10Y", "30Y"]).run()
-    at.date_input(key="rs_pca_start_UST_PAR").set_value(dt.date(2026, 6, 1)).run()  # ~100 changes < 252
+    at.date_input(key=PCA_START).set_value(dt.date(2026, 6, 1)).run()  # ~100 changes < 252
     _ok(at)
     assert not at.error
     assert any("longer than the" in w.value for w in at.warning)
-    at.date_input(key="rs_pca_start_UST_PAR").set_value(dt.date(2026, 10, 1)).run()  # too few for a PCA
+    at.date_input(key=PCA_START).set_value(dt.date(2026, 10, 1)).run()  # too few for a PCA
     _ok(at)
     assert any("Cannot run the PCA" in e.value for e in at.error)
 
@@ -231,3 +251,61 @@ def test_research_tab_and_pca_shock_in_the_full_app():
     at.number_input(key="scn_pca_days").set_value(10).run()
     _ok(at)
     assert any(c.value.startswith("PC2 slope +2 sd 10d:") for c in at.caption)
+
+
+def test_pca_dates_follow_the_valuation_date_and_the_tenors():
+    """Review finding: the FROM/TO dates were kept by key alone, so a window
+    picked for one valuation date or tenor set stuck: after 2026-06-30 the
+    PCA still ended there on 2026-10-19, and after picking the 2026-only 6W
+    bill the start stayed in 2026 once the usual tenors were back."""
+
+    at = AppTest.from_string(DATED_APP, default_timeout=300)
+    at.session_state["asof"] = dt.date(2026, 6, 30)
+    at.run()
+    _ok(at)
+    assert "2015-01-02 to 2026-06-30" in _pca_caption(at)
+    at.session_state["asof"] = dt.date(2026, 10, 19)
+    at.run()
+    _ok(at)
+    assert "2015-01-02 to 2026-10-19 (2950 changes" in _pca_caption(at)
+    at.multiselect(key="rs_pca_tenors_UST_PAR").set_value(["6W", "2M", "4M"]).run()
+    _ok(at)
+    assert "2026-01-05 to 2026-10-19" in _pca_caption(at)  # the 6W bill is quoted from 2026 only
+    at.multiselect(key="rs_pca_tenors_UST_PAR").set_value(["3M", "1Y", "2Y", "5Y", "10Y", "30Y"]).run()
+    _ok(at)
+    assert "2015-01-02 to 2026-10-19 (2950 changes" in _pca_caption(at)
+
+
+def test_var_follows_the_store_content_and_says_when_the_window_is_short():
+    """Review finding: the VaR scenarios were cached on the store's label and
+    row count, so a store with revised values (same rows) kept the old VaR.
+    A valuation date early in the daily history gets fewer days than asked
+    for, and the tab says so."""
+
+    from derivx.data import rates_history as rh
+
+    base = rh.bundled_store()
+    at = AppTest.from_string(DATED_APP, default_timeout=300)
+    at.session_state["rates_store"] = base
+    at.run()
+    _ok(at)
+    before = _number(_metric(at, "HIST VAR 99% ($)"))
+    revised = base.frame.copy()
+    recent = (revised["dataset"] == "UST_PAR") & (revised["asof"] >= dt.date(2025, 1, 1))
+    revised.loc[recent, "value_decimal"] *= 1.2  # same rows, other values
+    other = rh.build_store([revised], base.label)
+    assert len(other.frame) == len(base.frame)
+    at.session_state["rates_store"] = other
+    at.run()
+    _ok(at)
+    assert _number(_metric(at, "HIST VAR 99% ($)")) != pytest.approx(before, rel=1e-3)
+    early = AppTest.from_string(DATED_APP, default_timeout=300)
+    early.session_state["asof"] = dt.date(2015, 6, 30)
+    early.run()
+    _ok(early)
+    early.radio(key="rs_var_lookback").set_value(250).run()
+    early.radio(key="rs_var_conf").set_value(0.95).run()
+    _ok(early)
+    short = "holds only 125 daily changes (from 2014-12-31), not the 250 asked for"
+    assert any(short in w.value for w in early.warning)
+    assert _metric(early, "SCENARIO DAYS") == "125"

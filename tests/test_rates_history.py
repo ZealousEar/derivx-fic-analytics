@@ -298,3 +298,12 @@ def test_uploaded_treasury_origin_is_named_once():
     text = (FIXTURES / "treasury_2026.csv").read_text()
     store = rh.build_store([rh.treasury_upload(text, "t.csv")])
     assert store.origin("UST_PAR", D("2026-10-19")) == "upload: t.csv"  # was "upload: t.csv, upload: t.csv"
+
+
+def test_store_fingerprint_follows_the_data_not_the_label(store):
+    same = rh.build_store([store.frame], "another label")
+    assert same.fingerprint == store.fingerprint and len(store.fingerprint) == 64
+    changed = store.frame.copy()
+    changed.loc[changed.index[-1], "value_decimal"] += 1e-6  # one value, same number of rows
+    other = rh.build_store([changed], store.label)
+    assert len(other.frame) == len(store.frame) and other.fingerprint != store.fingerprint
