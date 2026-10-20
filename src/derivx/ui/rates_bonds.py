@@ -272,7 +272,10 @@ def _price_input(bond: FixedRateBond, settle: dt.date, fair_clean: float) -> Opt
         state.pop("bond_quote_mode", None)
     c1, c2, _ = st.columns(3)
     mode = c1.radio("QUOTE", ["Price", "Yield"], horizontal=True, key="bond_input_mode")
-    if state.get("bond_quote_mode") != mode:
+    widget = "bond_price_text" if mode == "Price" else "bond_yield_pct"
+    # Re-sync on a mode change, and when Streamlit dropped the widget's state
+    # because another page was open in the last run.
+    if state.get("bond_quote_mode") != mode or widget not in state:
         _sync_quote(bond, settle, mode, fair_clean)
     if mode == "Price":
         text = c2.text_input(
