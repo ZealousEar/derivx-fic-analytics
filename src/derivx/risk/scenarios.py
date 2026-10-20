@@ -24,6 +24,11 @@ The Greeks are those of the rolled market, so a trade that matures before
 the horizon has no delta and the residual holds only third- and
 higher-order terms.
 
+PCA factor shocks (:func:`pca_factor`, :func:`pca_library`) move every
+shocked curve by n standard deviations of one principal component (level,
+slope, curvature) of a history's daily changes, from
+:mod:`derivx.rates.pca`, and record the history used in ``Shock.sources``.
+
 Historical shocks (:func:`historical`, :func:`history_window`) replay
 each curve's own history where a free one exists: the Treasury curve moves
 by the Treasury's par yield changes, and the swap curve by the swap/OIS
@@ -61,6 +66,7 @@ import numpy as np
 import pandas as pd
 
 from derivx.data.rates_history import EPISODE_TOLERANCE_DAYS, HistoryStore, bundled_store, dataset_info, user_dataset
+from derivx.rates import pca as pca_mod
 from derivx.rates.conventions import Date, parse_tenor
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Curve, Market
 from derivx.rates.indices import CURRENCY_INDICES
@@ -548,6 +554,93 @@ def historical_sources(shock: Shock) -> pd.DataFrame:
         for src in shock.sources
     ]
     return pd.DataFrame(rows, columns=["curve", "currency", "data", "start", "end", "flag", "note"])
+
+
+def _pca_flag(dataset: str, selector: str) -> str:
+    """How a PCA profile from ``dataset`` relates to the curve ``selector``
+    (``"govt:USD"``, ``"curve:EUR"``)."""
+
+    which, currency = selector.split(":", 1)
+    if which == "govt":
+        own = (GOVT_HISTORY.get(currency),)
+    else:
+        own = SWAP_HISTORY.get(currency, ()) + (user_dataset(currency),)
+    if dataset in own:
+        return "real"
+    return "proxy" if dataset_info(dataset).currency == currency else "cross-currency proxy"
+
+
+def pca_factor(
+    factor: int,
+    n_sigma: float = 2.0,
+    store: Optional[HistoryStore] = None,
+    dataset: str = GOVT_HISTORY["USD"],
+    tenors: Optional[Sequence[str]] = None,
+    start: Optional[dt.date] = None,
+    end: Optional[dt.date] = None,
+    window: Optional[int] = None,
+    days: int = 1,
+    **settings,
+) -> Shock:
+    """``n_sigma`` standard deviations of PCA factor ``factor`` (1 = level,
+    2 = slope, 3 = curvature) of a history's daily changes, scaled by
+    sqrt(``days``) (independent daily moves assumed): the profile is
+    ``n_sigma x sd_k x sqrt(days) x loading_k`` in bp at the PCA tenors
+    (linear in between, flat beyond), applied to every curve the shock
+    moves. The PCA (:func:`derivx.rates.pca.pca_curve_changes`, demeaned bp
+    changes) runs on ``dataset`` from ``start`` (default: where its most
+    recent daily stretch begins) to ``end``, keeping the last ``window``
+    changes if given; ``tenors`` default to 3M, 1Y, 2Y, 5Y, 10Y, 30Y where
+    the history has them. ``Shock.sources`` says which curves the history is
+    the curve's own market for."""
+
+    store = store or bundled_store()
+    if int(factor) != factor or factor < 1:
+        raise ValueError("the factor is 1 (level), 2 (slope), 3 (curvature) or higher")
+    if not store.has(dataset):
+        raise ValueError(f"the history store has no {dataset} data ({dataset_info(dataset).title})")
+    levels = store.complete(dataset)
+    if tenors is None:
+        tenors = [t for t in pca_mod.DEFAULT_TENORS if t in levels.columns]
+        if len(tenors) < 3:
+            tenors = list(dataset_info(dataset).core_tenors)
+    if start is None:
+        start = pca_mod.recent_daily_start(levels, tenors, end=end)
+    result = pca_mod.pca_curve_changes(levels, tenors, window, start=start, end=end)
+    if factor > len(result.tenors):
+        raise ValueError(f"{len(result.tenors)} tenors give {len(result.tenors)} factors, not PC{factor}")
+    profile = result.factor_profile(int(factor) - 1, float(n_sigma), int(days))
+    info = dataset_info(dataset)
+    label = pca_mod.FACTOR_LABELS[factor - 1] if factor <= len(pca_mod.FACTOR_LABELS) else ""
+    sd = float(result.sigma_bp[factor - 1])
+    span = f"{result.start} to {result.end}"
+    shape = ", ".join(f"{t} {b:+.1f}" for t, (_, b) in zip(result.tenors, profile))
+    selectors = ["govt:USD"] + [f"curve:{c}" for c in CURRENCIES]
+    sources = []
+    for selector in selectors:
+        flag = _pca_flag(dataset, selector)
+        note = f"PC{factor} of {info.title} daily changes ({span}, {result.n_obs} changes)"
+        if flag != "real":
+            note += f": applied to this curve as a {flag}"
+        sources.append(ReplaySource(selector, dataset, info.title, str(result.start), str(result.end), flag, note))
+    days_text = "" if days == 1 else f" x sqrt({int(days)} days)"
+    return _shock(
+        f"PC{factor} {label.lower()} {n_sigma:+g} sd{'' if days == 1 else f' {int(days)}d'}".replace("  ", " "),
+        list(profile),
+        settings,
+        description=(
+            f"PC{factor} ({label.lower() or 'factor'}, {100 * result.explained[factor - 1]:.1f}% of the variance) of "
+            f"daily {info.title} changes {span} ({result.n_obs} changes): sd {sd:.2f}bp a day, move = "
+            f"{n_sigma:+g} sd{days_text} x loading, in bp: {shape}"
+        ),
+        sources=tuple(sources),
+    )
+
+
+def pca_library(store: Optional[HistoryStore] = None, n_sigma: float = 2.0, **kwargs) -> List[Shock]:
+    """+/-``n_sigma`` sd of PC1, PC2 and PC3 (see :func:`pca_factor`)."""
+
+    return [pca_factor(k, sign * n_sigma, store, **kwargs) for k in (1, 2, 3) for sign in (1.0, -1.0)]
 
 
 def standard_library(store: Optional[HistoryStore] = None) -> List[Shock]:
