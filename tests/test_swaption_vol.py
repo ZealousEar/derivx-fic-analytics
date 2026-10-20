@@ -145,6 +145,49 @@ def test_parse_rejects_bad_tables_with_reasons(table, units, match):
     assert any(match in i.message for i in issues if i.level == "error"), [i.message for i in issues]
 
 
+def test_one_point_cannot_be_quoted_under_two_names(market):
+    """12M and 1Y (or 24M and 2Y) are the same expiry or tenor: a second
+    label used to add a duplicate cube node, so the ATM vol jumped from one
+    quote to the other at 1Y and the first was silently shadowed."""
+
+    rows = [{"expiry": e, "tenor": t, "-50": v + 2.0, "ATM": v, "+50": v + 1.0}
+            for e, v in (("6M", 90.0), ("12M", 80.0), ("1Y", 100.0), ("2Y", 95.0)) for t in ("5Y", "10Y")]  # fmt: skip
+    grid, issues = parse_vol_grid(pd.DataFrame(rows))
+    assert grid is None
+    assert any("second quote for 1Yx5Y ATM (12Mx5Y and 1Yx5Y are the same point)" in i.message for i in issues)
+    tenors = pd.DataFrame([{"expiry": "1Y", "tenor": t, "ATM": 90.0} for t in ("12M", "1Y", "5Y")])
+    assert parse_vol_grid(tenors)[0] is None
+    # Labels are canonical, so 12M / 24M quotes become the 1Y / 2Y points the SWAPTION tab selects
+    renamed = pd.DataFrame([{"expiry": e, "tenor": t, "-50": 92.0, "ATM": 90.0, "+50": 91.0}
+                            for e in ("12M", "24M") for t in ("60M", "10Y")])  # fmt: skip
+    grid, issues = parse_vol_grid(renamed)
+    assert not issues and grid.expiries == ("1Y", "2Y") and grid.tenors == ("5Y", "10Y")
+    with pytest.raises(ValueError, match="12M and 1Y are the same option expiry"):
+        VolGrid((("12M", "5Y", 0.0, 0.009), ("1Y", "5Y", 0.0, 0.009)))
+    with pytest.raises(ValueError, match="same swap tenor"):
+        VolGrid((("1Y", "2Y", 0.0, 0.009), ("1Y", "24M", 0.0, 0.009)))
+
+
+def test_parse_reads_atm_labels_in_long_tables_and_names_the_table_row():
+    long = pd.DataFrame({"expiry": ["1Y"] * 3, "tenor": ["5Y"] * 3, "offset_bp": ["-25bp", "ATM", "ATM+25"],
+                         "vol": [90.0, 88.0, 89.0]})  # fmt: skip
+    grid, issues = parse_vol_grid(long)
+    assert not issues and [r[2] for r in grid.rows] == [-25.0, 0.0, 25.0]
+    minus = pd.DataFrame([{"expiry": "1Y", "tenor": "5Y", "\u221225": 90.0, "ATM": 88.0, "+25": 89.0}])
+    assert parse_vol_grid(minus)[0].smile("1Y", "5Y")[0].tolist() == [-25.0, 0.0, 25.0]
+    # Wide tables: errors cite the row of the user's table, once per row (not once per offset column)
+    wide = pd.DataFrame([{"expiry": "1Y", "tenor": "5Y", "-25": 90.0, "ATM": 88.0, "+25": 89.0},
+                         {"expiry": "2Y", "tenor": "5Y", "-25": 90.0, "ATM": "abc", "+25": 89.0},
+                         {"expiry": "3Q", "tenor": "5Y", "-25": 90.0, "ATM": 88.0, "+25": 89.0}])  # fmt: skip
+    grid, issues = parse_vol_grid(wide)
+    messages = [i.message for i in issues]
+    assert grid is None and len(messages) == 2, messages
+    assert "row 2 (2Yx5Y ATM): vol 'abc' is not a number" in messages
+    assert sum(m.startswith("row 3: ") for m in messages) == 1
+    nan = pd.DataFrame([{"expiry": "1Y", "tenor": "5Y", "ATM": "nan"}])
+    assert "vol 'nan' is not a finite number" in parse_vol_grid(nan)[1][0].message
+
+
 def test_a_point_with_too_few_strikes_gets_a_flat_smile(market):
     table = pd.DataFrame({"expiry": ["1Y", "2Y"], "tenor": ["5Y", "5Y"], "-50": [None, 99.0], "ATM": [95.0, 92.0],
                           "+50": [None, 94.0], "+100": [None, 97.0]})  # fmt: skip

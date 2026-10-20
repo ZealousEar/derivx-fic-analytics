@@ -19,7 +19,7 @@ from derivx.rates.examples import EXAMPLE_ASOF, example_market, sofr_example_row
 from derivx.rates.indices import HullWhite
 from derivx.rates.multicurve import bootstrap_projection
 from derivx.rates.swaptions import Swaption, atm_straddle_approx_bp, forward_and_annuity, swaption_position
-from derivx.risk.scenarios import carry_market, parallel, run_scenario, theta, vegas
+from derivx.risk.scenarios import carry_market, parallel, run_scenario, shocked_market, theta, vegas
 from derivx.risk.sensitivities import rate_pv01_gamma
 
 D = dt.date.fromisoformat
@@ -260,7 +260,7 @@ def test_implied_vol_rejects_premiums_outside_the_bounds(usd):
         sw.implied_vol(float("nan"), usd)
 
 
-def test_expiry_day_is_intrinsic_and_after_expiry_raises(usd):
+def test_expiry_day_is_intrinsic_and_after_expiry_it_is_the_exercised_swap(usd):
     sw = Swaption(NOTIONAL, "1Y", "5Y", 0.0, "payer", 0.009)
     sw = replace(sw, strike=sw.atm_strike(usd) - 0.002).pinned(usd)
     assert sw.expiry is None and sw.expiry_date == D("2027-10-19")
@@ -270,11 +270,79 @@ def test_expiry_day_is_intrinsic_and_after_expiry_raises(usd):
     assert inputs.expiry_years == 0.0
     assert sw.pv(on_expiry) == pytest.approx(NOTIONAL * inputs.annuity * (inputs.forward - sw.strike), rel=1e-12)
     assert sw.greeks(on_expiry)["vega"] == 0.0
-    later = carry_market(usd, (sw.expiry_date - usd.asof).days + 1)
-    with pytest.raises(ValueError, match="expired"):
-        sw.pv(later)
     with pytest.raises(ValueError, match="no time value"):
         sw.implied_vol(sw.pv(on_expiry), on_expiry)
+    # After the expiry it is the swap it was exercised into (forwards realise on a rolled market) ...
+    later = carry_market(usd, (sw.expiry_date - usd.asof).days + 1)
+    swap = sw.exercised_into(later)
+    assert swap is not None and not swap.receive_fixed and swap.fixed_rate == sw.strike
+    assert swap.notional == NOTIONAL and swap.start == sw.underlying(usd).start
+    assert sw.pv(later) == pytest.approx(swap.pv(later), rel=1e-14) and sw.pv(later) > 0
+    assert replace(sw, notional=-NOTIONAL).pv(later) == pytest.approx(-swap.pv(later), rel=1e-14)
+    # ... or nothing: an out-of-the-money option lapses
+    otm = replace(sw, strike=sw.strike + 0.004)
+    assert otm.exercised_into(later) is None and otm.pv(later) == 0.0 and otm.cash(later, usd.asof, later.asof) == 0
+    # Greeks and implied vols stop at the expiry
+    for call in (lambda: sw.greeks(later), lambda: sw.inputs(later), lambda: sw.implied_vol(1.0, later)):
+        with pytest.raises(ValueError, match="expired"):
+            call()
+    # A market dated after the expiry with no curves from before it cannot tell whether it was exercised
+    quotes = [CurveQuote(r["kind"], r["tenor"], r["rate"]) for r in sofr_example_rows()]
+    late = Market(curve=bootstrap(later.asof, quotes, "USD SOFR"))
+    with pytest.raises(ValueError, match="no curves from on or before the expiry"):
+        sw.pv(late)
+
+
+@pytest.mark.parametrize("kind,offset_bp,side", [("payer", -20, "pay"), ("payer", 20, None), ("receiver", 20, "rec"),
+                                                 ("receiver", -20, None), ("straddle", 20, "rec"),
+                                                 ("straddle", -20, "pay")])  # fmt: skip
+def test_exercise_follows_the_forward_at_expiry_on_todays_curves(usd, kind, offset_bp, side):
+    sw = Swaption(NOTIONAL, "1M", "5Y", 0.0, kind, 0.009)
+    sw = replace(sw, strike=sw.atm_strike(usd) + offset_bp * 1e-4).pinned(usd)
+    later = carry_market(usd, 60)
+    assert later.asof > sw.expiry_date
+    swap = sw.exercised_into(later)
+    if side is None:
+        assert swap is None and sw.pv(later) == 0.0
+        return
+    assert swap.receive_fixed == (side == "rec")
+    forward, annuity = forward_and_annuity(swap, later)
+    w = -1.0 if swap.receive_fixed else 1.0
+    assert sw.pv(later) == pytest.approx(NOTIONAL * annuity * w * (forward - sw.strike), rel=1e-12)
+
+
+def test_euribor_swaption_exercises_on_the_projection_curve_of_the_day():
+    eur = _markets()["eur"]
+    sw = Swaption(NOTIONAL, "1M", "5Y", 0.0, "receiver", 0.008, index="EURIBOR 6M")
+    sw = replace(sw, strike=sw.atm_strike(eur) + 0.001).pinned(eur)
+    later = carry_market(eur, 45)
+    swap = sw.exercised_into(later)
+    assert swap is not None and swap.receive_fixed and swap.projection == "EURIBOR 6M"
+    assert sw.pv(later) == pytest.approx(swap.pv(later), rel=1e-14)
+
+
+def test_a_scenario_horizon_past_the_expiry_still_explains_every_position(usd):
+    short = Swaption(NOTIONAL, "1M", "5Y", 0.0, "payer", 0.009)
+    short = replace(short, strike=short.atm_strike(usd) - 0.001)
+    long = Swaption(NOTIONAL, "1Y", "10Y", 0.035, "receiver", 0.009)
+    positions = [swaption_position(short, usd), swaption_position(long, usd)]
+    shock = replace(parallel(10.0), horizon_days=60, normal_vol_bp=2.0)
+    rows = run_scenario(positions, usd, shock)
+    assert [r["position"] for r in rows] == [p.name for p in positions]
+    expired, live = rows
+    assert expired["vol"] == 0.0 and live["vol"] != 0.0  # an exercised swaption has no vol left
+    for row in rows:
+        assert abs(row["residual"]) < 0.02 * abs(row["pnl"]) + 1.0, row
+    exercised = positions[0].details["trade"].exercised_into(carry_market(usd, 60))
+    assert expired["shocked_pv"] == pytest.approx(exercised.pv(shocked_market(usd, shock)), rel=1e-12)
+
+
+def test_black_has_no_shift():
+    with pytest.raises(ValueError, match="Black has no shift"):
+        Swaption(NOTIONAL, "1Y", "5Y", 0.04, "payer", 0.25, "black", 0.02)
+    sw = Swaption(NOTIONAL, "1Y", "5Y", 0.04, "payer", 0.25, "black")
+    g = sw.greeks(example_market())
+    assert g["vega_lognormal_pt"] == pytest.approx(g["vega"], rel=1e-12)  # the trade's own lognormal vega
 
 
 def test_pinned_swaption_keeps_its_dates_on_a_rolled_market(usd):

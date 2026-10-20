@@ -353,23 +353,47 @@ def quote_vegas(
     bump: Optional[float] = None,
 ) -> pd.DataFrame:
     """P&L of ``cf`` (priced on the caplet vols stripped from the quotes) for
-    +1bp normal / +1 vol point on each quoted flat vol, re-stripped (central
-    difference). Rows: maturity, vega."""
+    +1bp normal / +1 vol point on each quoted flat vol, re-stripped. Rows:
+    maturity, vega, difference.
+
+    A central difference by default. Next to the edge of what can be
+    stripped (flat vols falling about as fast as non-negative caplet vols
+    allow, or a vol within ``bump`` of zero) one side of the bump has no
+    caplet vols; that quote then takes the one-sided difference of the side
+    that strips (``difference`` says which), and only a quote that cannot
+    be moved either way raises."""
 
     unit = 1e-4 if cf.model == "bachelier" else 0.01
     bump = unit if bump is None else bump
+    if not math.isfinite(bump) or bump <= 0:
+        raise ValueError(f"the vol bump must be a positive number, got {bump!r}")
     flat = np.asarray(flat_vols, dtype=float)
 
     def value(vols: np.ndarray) -> float:
         curve = strip_caplet_vols(market, maturities, vols, strike, method, cf.model, cf.shift, terms).curve
         return CapFloor(**{**_fields(cf), "vol": curve}).pv(market)
 
+    base = value(flat)
     rows = []
     for i, m in enumerate(maturities):
-        up, down = flat.copy(), flat.copy()
-        up[i] += bump
-        down[i] -= bump
-        rows.append({"maturity": m, "vega": (value(up) - value(down)) / 2.0 * unit / bump})
+        moved: Dict[str, float] = {}
+        failed: Dict[str, str] = {}
+        for side, sign in (("up", 1.0), ("down", -1.0)):
+            vols = flat.copy()
+            vols[i] += sign * bump
+            try:
+                moved[side] = value(vols)
+            except ValueError as exc:
+                failed[side] = str(exc)
+        if len(moved) == 2:
+            vega, how = (moved["up"] - moved["down"]) / 2.0, "central"
+        elif "up" in moved:
+            vega, how = moved["up"] - base, "up only"
+        elif "down" in moved:
+            vega, how = base - moved["down"], "down only"
+        else:
+            raise ValueError(f"the {m} quote cannot be moved by +/-{bump:g} and re-stripped: {failed['up']}")
+        rows.append({"maturity": m, "vega": vega * unit / bump, "difference": how})
     return pd.DataFrame(rows)
 
 

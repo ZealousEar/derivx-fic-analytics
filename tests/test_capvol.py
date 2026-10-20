@@ -245,3 +245,43 @@ def test_vega_by_expiry_and_by_quote(usd):
     # +1bp on every quoted flat vol moves every caplet vol by about 1bp: the sum is close to the caplet vega.
     assert by_quote["vega"].sum() == pytest.approx(cap.vega(usd), rel=0.02)
     assert (by_quote["vega"].iloc[:5] != 0).all()
+
+
+def test_quote_vegas_next_to_the_stripping_limit_go_one_sided(usd):
+    """A 30Y quote barely above the lowest flat vol that non-negative
+    caplet vols allow: the -1bp bump cannot be stripped, so that quote's
+    vega is the +1bp one-sided difference instead of the whole table
+    raising (the CAP-FLOOR tab showed a traceback)."""
+
+    atm = illustrative_cap_atm("USD")
+    mats, flat = list(atm["maturity"]), atm["vol_bp"].to_numpy() * 1e-4
+
+    def strips(vol_30y: float) -> bool:
+        vols = flat.copy()
+        vols[-1] = vol_30y
+        try:
+            strip_caplet_vols(usd, mats, vols, terms=USD_TERMS)
+        except ValueError:
+            return False
+        return True
+
+    lo, hi = 1e-4, flat[-1]
+    for _ in range(40):  # lowest strippable 30Y flat vol
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if strips(mid) else (mid, hi)
+    edge = flat.copy()
+    edge[-1] = hi + 0.4e-4
+    assert not strips(edge[-1] - 1e-4)
+    curve = strip_caplet_vols(usd, mats, edge, terms=USD_TERMS).curve
+    K = CapFloor(1.0, "cap", 0.03, "30Y", 0.01, **USD_TERMS).atm_strike(usd)
+    cap = CapFloor(10_000_000.0, "cap", K, "30Y", curve, **USD_TERMS)
+    table = quote_vegas(cap, usd, mats, edge, terms=USD_TERMS)
+    assert table.set_index("maturity").loc["30Y", "difference"] == "up only"
+    assert (table["difference"].iloc[:-2] == "central").all()
+    up = edge.copy()
+    up[-1] += 1e-4
+    moved = CapFloor(10_000_000.0, "cap", K, "30Y", strip_caplet_vols(usd, mats, up, terms=USD_TERMS).curve,
+                     **USD_TERMS).pv(usd)  # fmt: skip
+    assert table["vega"].iloc[-1] == pytest.approx(moved - cap.pv(usd), rel=1e-12)
+    with pytest.raises(ValueError, match="positive"):
+        quote_vegas(cap, usd, mats, edge, terms=USD_TERMS, bump=0.0)
