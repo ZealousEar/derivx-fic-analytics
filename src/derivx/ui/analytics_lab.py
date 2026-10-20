@@ -11,16 +11,14 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.interpolate import CubicSpline
 
-from derivx.calibration.production import CalibratedSlice, calibrate_with_constraints
+from derivx.calibration.production import CalibratedSlice, calibrate_chain
 from derivx.data.market_data import apply_liquidity_filters, compute_moneyness, fetch_option_chain
-from derivx.models.comparison import compare_models
+from derivx.models.comparison import ModelComparison, fit_models, select_expiry
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import PLOTLY_2D_CONFIG
 from derivx.validation.backtest import walk_forward_test
-from derivx.vol.sabr import calibrate_sabr_smile, hagan_sabr_iv
-from derivx.vol.svi import fit_svi_strike_slice, svi_iv
+from derivx.vol.svi import svi_iv
 
 ANALYTICS_TABS = [
     "Market Data",
@@ -39,7 +37,7 @@ state_defaults = {
     "walkforward_meta": {},
     "model_comp_metrics": pd.DataFrame(),
     "model_comp_slice": pd.DataFrame(),
-    "model_comp_models": ["svi", "sabr", "local_vol"],
+    "model_comp_models": ["svi", "sabr", "spline"],
     "chain_fetch_nonce": 0,
     "walk_fetch_nonce": 0,
 }
@@ -190,7 +188,7 @@ def _plot_calibration_smile(cal_slice: CalibratedSlice) -> go.Figure:
     strikes = cal_slice.strikes
     forward = cal_slice.forward
     strikes_dense = np.linspace(strikes.min(), strikes.max(), 200)
-    fitted = [svi_iv(k, cal_slice.params, F=forward) for k in strikes_dense]
+    fitted = np.asarray(svi_iv(strikes_dense, cal_slice.params, F=forward, T=cal_slice.tau))
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -258,57 +256,36 @@ def _plot_walkforward(metrics: pd.DataFrame) -> go.Figure:
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def _fit_models_cached(slice_df: pd.DataFrame, models: tuple) -> ModelComparison:
+    """Clean the slice and fit/score the models once per (slice, models)."""
+
+    return fit_models(slice_df, models=models)
+
+
 def _plot_model_comparison(slice_df: pd.DataFrame, models: Iterable[str]) -> go.Figure:
-    df = slice_df.sort_values("strike")
-    strikes = df["strike"].to_numpy()
-    forward = float(df.get("underlying_price", df["strike"]).iloc[0])
+    comp = _fit_models_cached(slice_df, tuple(models))
+    quotes = comp.quotes
+    strikes = quotes["strike"].to_numpy()
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=strikes,
-            y=df["implied_vol"],
+            y=quotes["implied_vol"],
             mode="markers",
-            name="Market",
+            name="Market (OTM, cleaned)",
             marker=dict(color="#FFFFFF", size=8, line=dict(color="#000000", width=1)),
         )
     )
     grid = np.linspace(strikes.min(), strikes.max(), 200)
-    if "svi" in models:
-        params = fit_svi_strike_slice(strikes, df["implied_vol"], F=forward)
-        svi_curve = [svi_iv(k, params, F=forward) for k in grid]
-        fig.add_trace(
-            go.Scatter(x=grid, y=svi_curve, mode="lines", name="SVI", line=dict(width=3, color="#FF4444"))
-        )
-    if "sabr" in models:
-        tau = max(
-            (
-                (pd.to_datetime(df["expiry"].iloc[0]) - pd.to_datetime(df["trade_date"].iloc[0]))
-                / np.timedelta64(1, "D")
-                / 365.0
-            ),
-            1e-6,
-        )
-        params = calibrate_sabr_smile(strikes, df["implied_vol"], T=tau, F=forward, beta=0.5)
-        sabr_curve = [hagan_sabr_iv(forward, k, tau, **params) for k in grid]
-        fig.add_trace(
-            go.Scatter(x=grid, y=sabr_curve, mode="lines", name="SABR", line=dict(width=3, dash="dash", color="#FFA500"))
-        )
-    if "local_vol" in models and len(strikes) >= 4:
-        logm = np.log(strikes / forward)
-        try:
-            spline = CubicSpline(logm, df["implied_vol"], bc_type="natural")
-            local_curve = spline(np.log(grid / forward))
-            fig.add_trace(
-                go.Scatter(
-                    x=grid,
-                    y=local_curve,
-                    mode="lines",
-                    name="Local Vol",
-                    line=dict(width=3, dash="dot", color="#00FFFF"),
-                )
-            )
-        except Exception:
-            pass
+    styles = {
+        "svi": dict(name="SVI", line=dict(width=3, color="#FF4444")),
+        "sabr": dict(name="SABR", line=dict(width=3, dash="dash", color="#FFA500")),
+        "spline": dict(name="Spline (IV in ln K/F)", line=dict(width=3, dash="dot", color="#00FFFF")),
+    }
+    for model in models:
+        if model in comp.fits:
+            fig.add_trace(go.Scatter(x=grid, y=comp.predict(model, grid), mode="lines", **styles[model]))
     fig.update_layout(
         paper_bgcolor="#000000",
         plot_bgcolor="#000000",
@@ -321,7 +298,7 @@ def _plot_model_comparison(slice_df: pd.DataFrame, models: Iterable[str]) -> go.
     bound_axes(
         fig,
         xaxis=axis_limits(strikes, floor=0.0),
-        yaxis=axis_limits(df["implied_vol"], pad=0.25, floor=0.0),
+        yaxis=axis_limits(quotes["implied_vol"], pad=0.25, floor=0.0),
     )
     return fig
 
@@ -365,7 +342,9 @@ def _render_market_data_tab():
                 st.warning("Yahoo Finance returned no quotes. Try again later or upload a saved chain.")
             else:
                 st.session_state["market_chain_raw"] = df
-                st.success(f"Fetched {meta.get('rows', len(df)):,} quotes across {meta.get('expiry_count', 0)} expiries.")
+                st.success(
+                    f"Fetched {meta.get('rows', len(df)):,} quotes across {meta.get('expiry_count', 0)} expiries."
+                )
 
     raw_chain = st.session_state.get("market_chain_raw", pd.DataFrame())
     if raw_chain.empty:
@@ -430,7 +409,14 @@ def _render_calibration_tab():
         help="Pick the maturity slices to include in the calibration run.",
     )
     band = st.slider("Moneyness band", 0.7, 1.3, (0.85, 1.15), step=0.01)
-    enforce = st.checkbox("Enforce no-arbitrage diagnostics", value=True)
+    enforce = st.checkbox(
+        "Enforce no-arbitrage (constrained refit: butterfly g(k) >= 0, Lee wings)",
+        value=True,
+        help=(
+            "An arbitrageable fit is replaced by a constrained SVI fit (or an arbitrage-free SSVI slice). "
+            "Butterfly (Gatheral g(k) >= 0), Lee wing and calendar checks are always reported."
+        ),
+    )
 
     run = st.button("Calibrate slices", width="stretch")
     if run:
@@ -440,14 +426,21 @@ def _render_calibration_tab():
         else:
             subset = chain
         with st.spinner("Calibrating SVI slices…"):
-            results = calibrate_with_constraints(
+            run_result = calibrate_chain(
                 subset,
                 enforce_arbitrage=enforce,
                 moneyness_band=band,
             )
+        results = run_result.slices
         st.session_state["calibration_results"] = results
+        if run_result.skipped:
+            with st.expander(f"{len(run_result.skipped)} slice(s) skipped"):
+                st.dataframe(
+                    pd.DataFrame([{"Expiry": s.expiry.date(), "Reason": s.reason} for s in run_result.skipped]),
+                    width="stretch",
+                )
         if not results:
-            st.warning("No slices passed the filters. Loosen the moneyness band or min points.")
+            st.warning("No slices passed the filters. Loosen the moneyness band (K/F).")
 
     results: List[CalibratedSlice] = st.session_state.get("calibration_results", [])
     if not results:
@@ -460,16 +453,28 @@ def _render_calibration_tab():
         rows.append(
             {
                 "Expiry": slc.expiry.date(),
+                "Forward": slc.forward,
+                "Forward from": diag.get("forward_method"),
+                "IVs": diag.get("iv_source"),
                 "Points": slc.n_points,
-                "RMSE": slc.rmse,
-                "Cond #": diag.get("condition_number"),
-                "No-Arb Viol (b)": diag.get("viol_b"),
-                "No-Arb Viol (rho)": diag.get("viol_rho"),
-                "SVI vs spline": bench.get("relative_improvement"),
-                "RMSE (spline)": bench.get("rmse_spline"),
+                "RMSE (vol bp)": slc.rmse * 1e4,
+                "CV RMSE (vol bp)": bench.get("rmse_svi_cv", np.nan) * 1e4,
+                "Spline CV RMSE (vol bp)": bench.get("rmse_spline_cv", np.nan) * 1e4,
+                "Butterfly OK": diag.get("butterfly_ok"),
+                "min g(k)": diag.get("butterfly_min_g"),
+                "Lee OK": diag.get("lee_ok"),
+                "Calendar OK": diag.get("calendar_ok"),
+                "Cond(J)": diag.get("condition_number"),
+                "At bound": ", ".join(diag.get("params_at_bound", [])),
             }
         )
     st.dataframe(pd.DataFrame(rows), width="stretch")
+    st.caption(
+        "Forward from: 'parity' = put-call parity on the slice's own mids; 'interpolated' = ln F linear in T between "
+        "the parity forwards of the other selected expiries; 'carry' = spot (no rate or dividend input here). "
+        "IVs: 'mid' = re-inverted from bid/ask mids with Black-76 on that forward at a 0% discount rate (the chain "
+        "carries no rate, so levels are biased low by roughly rate x T in price terms); 'quoted' = the vendor's vols."
+    )
 
     options = [f"{slc.expiry.date()}" for slc in results]
     selected = st.selectbox("Visualize expiry", options) if options else None
@@ -529,7 +534,6 @@ def _render_walkforward_tab():
                     st.session_state["walk_fetch_nonce"],
                 )
             st.session_state["walkforward_meta"] = meta
-            succeeded = meta.get("succeeded", [])
             failed = meta.get("failed", [])
             if dataset:
                 st.success(f"Fetched {len(dataset)} daily chains for {ticker} (failed: {len(failed)} days).")
@@ -628,11 +632,15 @@ def _render_model_comparison_tab():
         return
 
     expiries = sorted(pd.to_datetime(chain["expiry"]).dt.date.unique().tolist())
-    expiry = st.selectbox("Expiry", options=expiries)
+    try:  # default to the valid expiry nearest 30 days, not the first (often expired) one
+        default_index = expiries.index(select_expiry(chain, target_days=30.0).date())
+    except ValueError:
+        default_index = 0
+    expiry = st.selectbox("Expiry", options=expiries, index=default_index)
     models = st.multiselect(
         "Models",
-        options=["svi", "sabr", "local_vol"],
-        default=["svi", "sabr", "local_vol"],
+        options=["svi", "sabr", "spline"],
+        default=["svi", "sabr", "spline"],
     )
     if not models:
         st.warning("Select at least one model.")
@@ -644,7 +652,11 @@ def _render_model_comparison_tab():
         if slice_df.empty:
             st.warning("Selected expiry has no quotes after filtering.")
         else:
-            metrics = compare_models(slice_df, models=models)
+            try:
+                metrics = _fit_models_cached(slice_df, tuple(models)).table
+            except ValueError as exc:
+                st.error(f"Model comparison failed: {exc}")
+                metrics = pd.DataFrame()
             st.session_state["model_comp_metrics"] = metrics
             st.session_state["model_comp_slice"] = slice_df
             st.session_state["model_comp_models"] = models
@@ -657,7 +669,12 @@ def _render_model_comparison_tab():
     slice_df = st.session_state.get("model_comp_slice", pd.DataFrame())
     models = st.session_state.get("model_comp_models", [])
     if not slice_df.empty:
-        st.plotly_chart(_plot_model_comparison(slice_df, models), width="stretch", config=PLOTLY_2D_CONFIG)
+        try:
+            fig = _plot_model_comparison(slice_df, models)
+        except ValueError as exc:
+            st.error(f"Model comparison failed: {exc}")
+        else:
+            st.plotly_chart(fig, width="stretch", config=PLOTLY_2D_CONFIG)
 
 
 def render() -> None:

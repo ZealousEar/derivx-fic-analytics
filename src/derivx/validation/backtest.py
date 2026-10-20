@@ -1,7 +1,7 @@
 """Walk-forward validation utilities for calibrated volatility models."""
 from __future__ import annotations
 
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,20 @@ def _slice_chain(chain: pd.DataFrame, expiry: pd.Timestamp, band: Sequence[float
     return slice_df.loc[mask].sort_values("strike")
 
 
-def _prepare_prediction(prev_slice: pd.DataFrame, next_slice: pd.DataFrame, params: Dict[str, float]) -> pd.DataFrame:
+def _prepare_prediction(
+    prev_slice: pd.DataFrame,
+    next_slice: pd.DataFrame,
+    params: Dict[str, float],
+    tau: float,
+    forward: Optional[float] = None,
+    spot: Optional[float] = None,
+) -> pd.DataFrame:
+    """Prediction: yesterday's SVI smile (total-variance params for ``tau``,
+    fitted in k = ln(K/F) on yesterday's forward ``forward``) read at the
+    same k on the next day's forward, ``forward * spot_next / spot`` (the
+    forward moves with the spot; one day of carry is ignored). Without
+    ``forward``/``spot`` the next day's spot is used as the forward."""
+
     merged = pd.merge(
         prev_slice[["strike", "implied_vol"]].rename(columns={"implied_vol": "prev_iv"}),
         next_slice[["strike", "implied_vol", "underlying_price"]],
@@ -34,9 +47,10 @@ def _prepare_prediction(prev_slice: pd.DataFrame, next_slice: pd.DataFrame, para
     )
     if merged.empty:
         return merged
-    forward_next = float(merged["underlying_price"].iloc[0])
+    spot_next = float(merged["underlying_price"].iloc[0])
+    forward_next = spot_next if forward is None or not spot else float(forward) * spot_next / float(spot)
     strikes = merged["strike"].to_numpy()
-    merged["predicted_iv"] = [svi_iv(k, params, F=forward_next) for k in strikes]
+    merged["predicted_iv"] = svi_iv(strikes, params, F=forward_next, T=tau)
     return merged
 
 
@@ -73,13 +87,23 @@ def walk_forward_test(
         next_date = dates[idx + 1]
         chain_today = chains[trade_date]
         chain_next = chains[next_date]
-        slices = calibrate_with_constraints(chain_today, moneyness_band=moneyness_band)
+        # Quoted vols on both sides: the forecast is scored against the next day's quoted implied_vol.
+        slices = calibrate_with_constraints(
+            chain_today, moneyness_band=moneyness_band, hygiene={"recompute_iv": False}
+        )
         for cal_slice in slices:
             prev_slice = _slice_chain(chain_today, cal_slice.expiry, moneyness_band)
             next_slice = _slice_chain(chain_next, cal_slice.expiry, moneyness_band)
             if prev_slice.empty or next_slice.empty:
                 continue
-            pred_frame = _prepare_prediction(prev_slice, next_slice, cal_slice.params)
+            pred_frame = _prepare_prediction(
+                prev_slice,
+                next_slice,
+                cal_slice.params,
+                cal_slice.tau,
+                forward=cal_slice.forward,
+                spot=cal_slice.diagnostics.get("spot"),
+            )
             if pred_frame.empty:
                 continue
             err = measure_prediction_error(pred_frame)
