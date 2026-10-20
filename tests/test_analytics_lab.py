@@ -314,3 +314,17 @@ def test_every_expiry_comparison_reports_all_models_and_skips_with_reasons():
     statements = [m.value for m in at.markdown if "out-of-sample RMSE on" in m.value]
     assert len(statements) == 3 and not any("outperforms" in s for s in statements)
     assert stored["manifest"]["model"]["max_days"] == 10
+
+
+def test_the_equity_page_gets_standard_tenors_of_the_active_chain_with_provenance():
+    at = _lab()
+    chain = at.session_state["market_chain"]
+    days = sorted((pd.to_datetime(chain["expiry"]).dt.normalize() - pd.Timestamp("2026-10-20")).dt.days.unique())
+    assert len(days) <= 6 and 31 in days and min(days) >= 2  # nearest 1W, 1M, ... 1Y; never expired slices
+    meta = at.session_state["market_chain_meta"]
+    assert meta["ticker"] == "SPY" and "expiries nearest 1W, 1M" in meta["source"]
+    assert meta["data_sha256"] == load_sample_chain().fingerprint
+    at.sidebar.radio[0].set_value("[ EQUITY ]").run()
+    at.radio(key="eq_smile_src").set_value("MARKET").run()
+    assert not at.exception
+    assert len(at.selectbox(key="eq_smile_expiry").options) == len(days)

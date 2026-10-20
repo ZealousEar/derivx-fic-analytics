@@ -78,6 +78,7 @@ ANALYTICS_TABS = [
 UPLOAD_TYPES = ["csv", "gz", "parquet", "pq", "txt"]
 PULL_BUCKET_S = 300  # Yahoo pulls are shared between sessions within one 5-minute bucket
 MIN_FIT_DAYS = 2.0  # expiries closer than this are not fitted or scored
+PRICER_TENORS_DAYS = (7.0, 30.0, 61.0, 91.0, 182.0, 365.0)  # expiries handed to the EQUITY page's MARKET smile
 
 # session-state keys (results are per session; nothing here is shared)
 K_DATA = "lab_dataset"
@@ -440,6 +441,24 @@ def _load_controls() -> None:
                 st.markdown(f"- {w}")
 
 
+def _publish_to_pricer(ds: ChainDataset, prov: Mapping, filtered: pd.DataFrame, report: pd.DataFrame, filters) -> None:
+    """The EQUITY page's MARKET smile reads ``st.session_state['market_chain']``:
+    give it the expiries nearest the standard tenors (each one SVI fit there),
+    with the dataset's provenance."""
+
+    picks = _nearest(report, PRICER_TENORS_DAYS)
+    expiry = pd.to_datetime(filtered["expiry"]).dt.normalize()
+    st.session_state["market_chain"] = filtered[expiry.isin(set(picks))].reset_index(drop=True)
+    st.session_state["market_chain_meta"] = {
+        "ticker": ds.ticker,
+        "source": f"{ds.source}; expiries nearest 1W, 1M, 2M, 3M, 6M and 1Y: {', '.join(_day(p) for p in picks)}",
+        "trade_date": prov["trade_dates"][0],
+        "fetched_at_utc": ds.fetched_at_utc,
+        "data_sha256": prov["data_sha256"],
+        "filters": dict(filters),
+    }
+
+
 def _render_market_data_tab() -> Optional[Dict[str, object]]:
     """Draw the Market Data tab; returns the context the other tabs use
     (filtered chain, provenance, hygiene report and its fingerprint)."""
@@ -486,20 +505,13 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         raw, min_volume=filters["min_volume"], max_spread=filters["max_spread"], min_mid=filters["min_mid"]
     )
     data_key = _key(prov["data_sha256"], filters)
-    st.session_state["market_chain"] = filtered
-    st.session_state["market_chain_meta"] = {
-        "ticker": ds.ticker,
-        "source": ds.source,
-        "trade_date": prov["trade_dates"][0],
-        "fetched_at_utc": ds.fetched_at_utc,
-        "data_sha256": prov["data_sha256"],
-        "filters": filters,
-    }
     if filtered.empty:
+        st.session_state["market_chain"] = filtered
         st.warning("The liquidity filters removed every quote: loosen them to continue.")
         return None
     with st.spinner("Cleaning quotes (hygiene)..."):
         report = _hygiene(filtered, filters["rate_cc"])
+    _publish_to_pricer(ds, prov, filtered, report, filters)
     usable = report[(report["days"] >= MIN_FIT_DAYS) & (report["kept"] >= 8)] if not report.empty else report
     _stats(
         [
@@ -512,7 +524,8 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
     st.caption(
         f"{len(raw):,} raw quotes -> {len(filtered):,} after the liquidity filters (calls and puts both kept: "
         "put-call parity needs them) -> hygiene per expiry below (one OTM quote per strike). Spot is Yahoo's "
-        "regular-market price from the same response as the quotes."
+        "regular-market price from the same response as the quotes. The EQUITY page's MARKET smile gets the "
+        "expiries nearest 1W, 1M, 2M, 3M, 6M and 1Y of this filtered chain."
     )
     st.markdown("#### / QUOTE HYGIENE BY EXPIRY")
     st.dataframe(report, hide_index=True, width="stretch")
