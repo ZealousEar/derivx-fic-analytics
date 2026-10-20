@@ -222,3 +222,43 @@ def test_impossible_quotes_and_expiry_raise_clear_errors():
         build_smile(EURUSD_3M, Q25, SmileConventions(), "SVI")
     with pytest.raises(ValueError, match="strangle convention"):
         SmileConventions(strangle="broker")
+
+
+@pytest.mark.parametrize(
+    "m, quote, conventions, before",
+    [
+        (
+            FxMarket(150.0, 0.0814, 0.1405, 5.0, 5.0 + 2 / 365),
+            TenorQuote("5Y", 0.0473, 0.0101, 0.0133, 0.0210, 0.0288),
+            SmileConventions("spot_pa", "DNS", "smile"),
+            377_447,
+        ),
+        (
+            FxMarket(150.0, 0.0775, 0.0304, 2.0, 2.0 + 2 / 365),
+            TenorQuote("2Y", 0.5292, 0.1118, 0.1062, 0.1913, 0.3908),
+            SmileConventions("spot", "SPOT", "market"),
+            271_484,
+        ),
+    ],
+)
+def test_sabr_fit_on_extreme_quotes_stays_within_its_budget(monkeypatch, m, quote, conventions, before):
+    """Review: on quotes no SABR smile fits (found by fuzzing), every trial
+    smile's delta strikes spun through 100 fixed-point cycles: one tenor took
+    20-50 s (``before`` strike solves) and the page hung. Trial smiles now
+    fail fast and the fit has a deterministic evaluation budget, which never
+    binds on market-like quotes (the illustrative smiles are unchanged)."""
+
+    import derivx.fx.smile as smile_module
+
+    calls = [0]
+    solve = smile_module.strike_from_delta
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return solve(*args, **kwargs)
+
+    monkeypatch.setattr(smile_module, "strike_from_delta", counted)
+    smile = build_smile(m, quote, conventions, "SABR")
+    assert calls[0] < 40_000 < before / 5
+    assert any("misses" in note for note in smile.notes)  # the misfit is reported, not hidden
+    assert smile.errors["ATM"] == pytest.approx(0.0, abs=1e-12)

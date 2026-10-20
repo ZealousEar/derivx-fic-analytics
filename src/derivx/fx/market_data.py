@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import http.client
 import io
 import urllib.error
 import urllib.request
@@ -119,6 +120,10 @@ def fetch_ecb_rates(timeout: float = DEFAULT_TIMEOUT, observations: int = 5) -> 
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         raise FxDataError(f"ECB Data Portal not reachable: {reason}") from None
+    except http.client.HTTPException as exc:  # e.g. IncompleteRead: the connection dropped mid-response
+        raise FxDataError(f"ECB Data Portal response was cut off ({type(exc).__name__})") from None
+    except UnicodeDecodeError:
+        raise FxDataError("ECB Data Portal response is not UTF-8 text (not the CSV the page expects)") from None
     return parse_ecb_csv(text, origin="live")
 
 

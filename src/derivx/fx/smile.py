@@ -82,6 +82,12 @@ SABR_BETA = 1.0
 RHO_BOUND = 0.9999
 MATCH_TOL = 1e-9  # vol decimals (0.00001 vol bp): a quote is matched exactly when its error is below this
 NOTE_TOL = 1e-4  # 1 vol bp: a larger quote error gets a note on the page (every error is shown anyway)
+# Calibration budgets, deterministic (counts, not seconds); on market-like quotes the fit needs at most 4
+# fixed-point cycles per delta strike and 25 function evaluations per start, so they never bind there.
+STALL_CYCLES = 12  # a trial smile's delta strike fails when its fixed-point step has not halved in 12 cycles
+FIT_CYCLES = 30  # ... or after 30 cycles
+FIT_NFEV = 80  # function evaluations per least-squares start
+FIT_BUDGET = 400  # residual evaluations per SABR fit: no further starts once spent
 
 
 def _delta_grid(deltas: Sequence[int]) -> Tuple[Tuple[str, float, Optional[bool]], ...]:
@@ -197,14 +203,28 @@ def market_strangle(m: FxMarket, quote: TenorQuote, level: int, delta_type: str)
 
 
 def smile_delta_strikes(
-    m: FxMarket, vol_fn: Callable, deltas: Sequence[float], calls: Sequence[bool], delta_type: str, guess_vols
+    m: FxMarket,
+    vol_fn: Callable,
+    deltas: Sequence[float],
+    calls: Sequence[bool],
+    delta_type: str,
+    guess_vols,
+    stall_cycles: Optional[int] = None,
+    max_cycles: int = 100,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Strikes ``K_i`` with ``delta(K_i, sigma(K_i)) = deltas[i]`` on the smile
     ``vol_fn`` and their vols, all solved together by the fixed-point
     iteration ``K <- strike_from_delta(delta, sigma(K))`` (one smile
     evaluation per step for every strike; it contracts for any smile whose
     slope in strike is moderate). Raises ``ValueError`` when it does not
-    converge or the smile has no vol on the way."""
+    converge in ``max_cycles`` cycles, or the smile has no vol on the way.
+
+    The calibration's inner loop passes a smaller ``max_cycles`` and a
+    ``stall_cycles`` (give up as soon as the step has not halved in that
+    many cycles): market-like smiles converge in 2-4 cycles, and a smile
+    the optimiser merely tries should fail fast rather than spin through
+    100 cycles hundreds of times (that stalled the page for a minute on
+    extreme quotes)."""
 
     deltas, calls = list(deltas), list(calls)
     guess = np.broadcast_to(np.asarray(guess_vols, dtype=float), (len(deltas),))
@@ -223,13 +243,19 @@ def smile_delta_strikes(
         return bool(np.all(np.abs(new - old) <= 1e-14 * old))
 
     K = np.array([strike_from_delta(m, d, v, c, delta_type) for d, v, c in zip(deltas, guess, calls)])
-    for _ in range(100):  # Aitken-accelerated (Steffensen) fixed point: two map steps per cycle
+    best, stalled = math.inf, 0
+    for _ in range(max_cycles):  # Aitken-accelerated (Steffensen) fixed point: two map steps per cycle
         K1 = g(K)
         if done(K1, K):
             return K1, np.asarray(vol_fn(K1), dtype=float).reshape(K.shape)
         K2 = g(K1)
         if done(K2, K1):
             return K2, np.asarray(vol_fn(K2), dtype=float).reshape(K.shape)
+        if stall_cycles is not None:
+            step = float(np.max(np.abs(K2 - K1) / K1))
+            best, stalled = (step, 0) if step < 0.5 * best else (best, stalled + 1)
+            if stalled >= stall_cycles:
+                break
         denom = K2 - 2.0 * K1 + K
         with np.errstate(divide="ignore", invalid="ignore"):
             acc = K - (K1 - K) ** 2 / denom
@@ -302,6 +328,7 @@ class _SabrFit:
     nu: float
     residuals: np.ndarray  # quote conditions, vol decimals
     at_bound: Tuple[str, ...]
+    budget_spent: bool = False  # stopped by FIT_BUDGET / FIT_NFEV before converging
 
 
 def _quote_residuals(
@@ -312,10 +339,13 @@ def _quote_residuals(
     fn: Callable,
     levels: Sequence[int],
     guesses: Optional[Dict[Tuple[int, bool], float]] = None,
+    stall_cycles: Optional[int] = None,
+    max_cycles: int = 100,
 ) -> Tuple[np.ndarray, Dict[Tuple[int, bool], Tuple[float, float]]]:
     """Errors of the RR and BF quotes of ``levels`` on the smile ``fn`` (vol
     decimals, ``[RR, BF]`` per level) and the smile's own delta strikes and
-    vols ``{(level, call): (K, vol)}`` (module docs, step 5)."""
+    vols ``{(level, call): (K, vol)}`` (module docs, step 5);
+    ``stall_cycles`` and ``max_cycles`` as in :func:`smile_delta_strikes`."""
 
     keys = [(lv, call) for lv in levels for call in (True, False)]
     guess = []
@@ -323,7 +353,9 @@ def _quote_residuals(
         side = 0.5 * quote.rr(lv) if call else -0.5 * quote.rr(lv)
         guess.append((guesses or {}).get((lv, call), max(quote.atm + quote.bf(lv) + side, 0.5 * quote.atm)))
     deltas = [(lv if call else -lv) / 100.0 for lv, call in keys]
-    K, vols = smile_delta_strikes(m, fn, deltas, [c for _, c in keys], conventions.delta_type, guess)
+    K, vols = smile_delta_strikes(
+        m, fn, deltas, [c for _, c in keys], conventions.delta_type, guess, stall_cycles, max_cycles
+    )
     found = {key: (float(k), float(v)) for key, k, v in zip(keys, K, vols)}
     out = []
     for lv in levels:
@@ -359,10 +391,15 @@ def _calibrate_sabr(
         alpha = _sabr_alpha(F, T, k_atm, quote.atm, float(x[0]), float(x[1]))
         return alpha, lambda K: sabr_beta1_vol(F, K, T, alpha, float(x[0]), float(x[1]))
 
+    evaluations = [0]
+
     def resid(x: np.ndarray) -> np.ndarray:
+        evaluations[0] += 1
         try:
             _, fn = smile(x)
-            r, found = _quote_residuals(m, quote, conventions, strangles, fn, quote.levels, guesses)
+            r, found = _quote_residuals(
+                m, quote, conventions, strangles, fn, quote.levels, guesses, STALL_CYCLES, FIT_CYCLES
+            )
         except ValueError:
             return np.full(n_res, 1.0)  # 100 vol points: the expansion broke down or no delta strike
         guesses.update({key: vol for key, (_, vol) in found.items()})  # warm start the next evaluation
@@ -374,14 +411,20 @@ def _calibrate_sabr(
     seeds = [(0.25 * skew, 0.8 * scale), (0.0, 0.3 * scale), (0.6 * skew, 1.6 * scale)]
     if start is not None:
         seeds.insert(0, start)
-    best = None
+    best, spent = None, False
     for rho0, nu0 in seeds:
         x0 = np.clip([rho0, min(nu0, 0.9 * nu_max)], lb + 1e-9, ub - 1e-9)
-        res = least_squares(resid, x0, bounds=(lb, ub), x_scale="jac", xtol=1e-13, ftol=1e-13, gtol=1e-13)
+        res = least_squares(
+            resid, x0, bounds=(lb, ub), x_scale="jac", xtol=1e-13, ftol=1e-13, gtol=1e-13, max_nfev=FIT_NFEV
+        )
         if best is None or res.cost < best.cost:
             best = res
         if np.max(np.abs(res.fun)) <= 0.01 * MATCH_TOL or (start is not None and res.success):
             break
+        if evaluations[0] >= FIT_BUDGET:
+            spent = True
+            break
+    spent = spent or (best.status == 0)  # status 0: the start ran out of FIT_NFEV evaluations
     alpha, _ = smile(best.x)
     span = ub - lb
     at_bound = tuple(
@@ -389,7 +432,7 @@ def _calibrate_sabr(
         for name, x, lo, hi, s in zip(("rho", "nu"), best.x, lb, ub, span)
         if (x - lo <= 1e-4 * s and name == "rho") or hi - x <= 1e-4 * s
     )
-    return _SabrFit(alpha, float(best.x[0]), float(best.x[1]), np.asarray(resid(best.x)), at_bound)
+    return _SabrFit(alpha, float(best.x[0]), float(best.x[1]), np.asarray(resid(best.x)), at_bound, spent)
 
 
 def _newton(fn: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, h: float = 1e-5) -> Tuple[np.ndarray, bool]:
@@ -650,6 +693,11 @@ def build_smile(m: FxMarket, quote: TenorQuote, conventions: SmileConventions, m
         used = quote.levels
         if sabr.at_bound:
             notes.append(f"SABR {', '.join(sabr.at_bound)} ended at its bound: the quotes push the model to its limit.")
+        if sabr.budget_spent and not np.max(np.abs(sabr.residuals)) <= NOTE_TOL:
+            notes.append(
+                f"The SABR fit stopped at its evaluation budget ({FIT_BUDGET} smiles, {FIT_NFEV} per start) without "
+                "converging: no SABR smile is close to these quotes; see the quote errors."
+            )
 
     def safe(K) -> np.ndarray:
         return _safe_vols(vol_fn, K)
