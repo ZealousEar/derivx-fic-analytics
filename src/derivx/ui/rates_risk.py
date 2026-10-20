@@ -20,8 +20,37 @@ from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, SERIES, dark_layout
 
 CACHE_ENTRIES = 12
-NOISE = 0.005  # $ per bp: smaller buckets are rebuild rounding, shown as zero
+NOISE = 0.005  # currency per bp: smaller buckets are rebuild rounding, shown as zero
 FIXING_NAMES = {"USD": "SOFR", "EUR": "€STR", "GBP": "SONIA"}
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£"}
+
+
+def money(market: Market, key: str = DISCOUNT_KEY) -> str:
+    """Currency symbol of values priced on a market's curve ``key`` (the
+    swap curve's currency by default; the Treasury curve is USD)."""
+
+    if key == GOVT_KEY:
+        return "$"
+    conv = market.curve.conventions
+    currency = conv.currency if conv is not None else "USD"
+    return CURRENCY_SYMBOLS.get(currency, currency + " ")
+
+
+def ladder_sums(market: Market, ladders: Dict[str, Tuple[List[Dict[str, object]], np.ndarray]]) -> Tuple[float, float]:
+    """(sum of the rate-quote buckets, sum of the tenor basis spread
+    buckets) of per-curve ladders ``{curve key: (rows, values)}``. The first
+    is the P&L for +1bp on every rate quote (the PV01 with basis held); the
+    second for +1bp on every basis spread. Adding them would mix the two."""
+
+    rates = spreads = 0.0
+    for key, (rows, values) in ladders.items():
+        curve = market.get_curve(key)
+        for row, value in zip(rows, np.ravel(values)):
+            if curve.instruments[int(row["index"])].kind in SPREAD_KINDS:
+                spreads += float(value)
+            else:
+                rates += float(value)
+    return rates, spreads
 
 
 def curve_key(curve: Optional[Curve]) -> tuple:
@@ -160,11 +189,16 @@ def projection_chain(market: Market, index: Optional[str]) -> Tuple[str, ...]:
 
 
 def ladder_chart(
-    labels: Sequence[str], values: Sequence[float], residual: Optional[Sequence[float]] = None, name: str = "TRADE"
+    labels: Sequence[str],
+    values: Sequence[float],
+    residual: Optional[Sequence[float]] = None,
+    name: str = "TRADE",
+    unit: str = "$",
 ) -> go.Figure:
-    """Bars of a key-rate ladder (P&L per +1bp), optionally next to the
-    residual after a hedge; both axes bounded. Buckets below half a cent
-    are rounding noise of the rebuilds and are drawn as zero."""
+    """Bars of a key-rate ladder (P&L per +1bp, in currency ``unit``),
+    optionally next to the residual after a hedge; both axes bounded.
+    Buckets below half a cent are rounding noise of the rebuilds and are
+    drawn as zero."""
 
     clean = lambda vs: [0.0 if abs(float(v)) < NOISE else float(v) for v in vs]  # noqa: E731
     labels, values = list(labels), clean(values)
@@ -182,7 +216,7 @@ def ladder_chart(
         fig.add_trace(go.Bar(x=labels, y=res, name="AFTER HEDGE", marker=dict(color=ACCENT)))
         shown += res
         fig.update_layout(barmode="group")
-    dark_layout(fig, height=320, xtitle="CURVE QUOTE", ytitle="PV01 ($ PER +1BP)", legend=residual is not None)
+    dark_layout(fig, height=320, xtitle="CURVE QUOTE", ytitle=f"PV01 ({unit} PER +1BP)", legend=residual is not None)
     return bound_axes(
         fig,
         xaxis={"min": -0.5, "max": len(labels) - 0.5, "min_span": 1.0},

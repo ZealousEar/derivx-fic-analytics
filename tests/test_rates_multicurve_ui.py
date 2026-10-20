@@ -80,10 +80,15 @@ def test_euribor_swap_has_per_curve_ladders_and_a_multi_curve_hedge(eur):
     assert any(i.endswith("swap_ladder_chart_euribor_6m") for i in ladder_charts)
     assert float(_metric(eur, "LADDER RISK REMOVED (%)")) > 99.0
     hedge = next(d.value for d in eur.dataframe if "CURVE" in d.value.columns and "BENCHMARK" in d.value.columns)
-    used = hedge[hedge["NOTIONAL ($)"] > 0]
+    used = hedge[hedge["NOTIONAL (€)"] > 0]
     assert set(used["CURVE"]) == {"EURIBOR 6M (PROJECTION)"}  # a par swap is its own curve's 5Y quote
-    pv01 = float(_metric(eur, "PV01 ($, +1BP)").replace(",", ""))
+    pv01 = float(_metric(eur, "PV01 (€, +1BP)").replace(",", ""))
     assert pv01 < 0  # receiver
+    # Values are in euros, and the hedge's PV01 is its P&L for +1bp on every rate quote, as the swap's.
+    swap_labels = [m.label for m in eur.metric if m.label.startswith(("PV ", "PV01", "ANNUITY", "SWAP ", "HEDGED "))]
+    assert len(swap_labels) >= 5 and not any("$" in label for label in swap_labels), swap_labels
+    swap_pv01 = float(_metric(eur, "SWAP PV01 (€)").replace(",", ""))
+    assert swap_pv01 == pytest.approx(pv01, rel=1e-6, abs=0.01)
     _assert_bounded(eur)
 
 
@@ -141,3 +146,80 @@ def test_illustrative_prefill_is_consistent_with_the_ois_curve():
     three = illustrative_quotes(ois, "EURIBOR 3M", basis_curve=six)
     assert {q.kind for q in three} == {"DEPO", "FUT", "BASIS"}
     assert all(0.0 < q.rate < 0.002 for q in three if q.kind == "BASIS")  # 3s6s spread positive, a few bp
+
+
+def _eur_app() -> AppTest:
+    at = AppTest.from_file(str(APP), default_timeout=600)
+    at.run()
+    at.sidebar.radio[0].set_value("[ RATES ]").run()
+    at.selectbox(key="rates_conv").set_value("EUR ESTR").run()
+    assert not at.exception, [e.value for e in at.exception]
+    return at
+
+
+def _editors(at: AppTest) -> dict:
+    return {d.key: d.value for d in at.dataframe if d.key and d.key.startswith("rates_proj_")}
+
+
+def _futures_table(at: AppTest):
+    tables = (d.value for d in at.dataframe if "Convexity (bp)" in d.value.columns)
+    return next(t for t in tables if "FUT" in set(t["Instrument"]))
+
+
+def test_interpolation_and_convexity_inputs_keep_the_euribor_tables():
+    """The EURIBOR editors (and so the user's edits) survive a change of
+    interpolation or of the Hull-White inputs: the illustrative quotes are
+    inputs, not functions of those settings. The convexity inputs move the
+    3M curve under fixed futures prices (they used to re-price the
+    illustrative futures, so the 3M forwards never moved)."""
+
+    at = _eur_app()
+    before = _editors(at)
+    futures = _futures_table(at)
+    at.number_input(key="rates_hw_sigma").set_value(150.0).run()
+    assert not at.exception and not at.error
+    assert _editors(at).keys() == before.keys()
+    moved = _futures_table(at)
+    fut = futures["Instrument"] == "FUT"
+    assert list(moved["Price"][fut]) == list(futures["Price"][fut])  # the quotes stay
+    assert (moved["Convexity (bp)"][fut] > futures["Convexity (bp)"][fut]).all()  # more vol, more convexity
+    at.selectbox(key="rates_interp").set_value("linear_zero").run()
+    assert not at.exception and not at.error
+    assert _editors(at).keys() == before.keys()
+    for key, table in _editors(at).items():
+        assert table.equals(before[key])
+
+
+def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
+    """EUR trades are valued in euros; the cap caption compares the rate-quote
+    buckets with the PV01 (basis spreads held) and reports the 3s6s spread
+    buckets on their own; a carry horizon past a futures fixing revalues a
+    EURIBOR 3M book; a book with a dollar bond warns that totals mix
+    currencies."""
+
+    at = _eur_app()
+    at.radio(key="swap_kind").set_value("EURIBOR 3M").run()
+    assert not at.exception and not at.error, [e.value for e in at.error]
+    labels = [m.label for m in at.metric]
+    assert {"PV (€)", "PV01 (€, +1BP)", "ANNUITY (€ PER BP)"} <= set(labels)
+    hedge = next(d.value for d in at.dataframe if "CURVE" in d.value.columns and "BENCHMARK" in d.value.columns)
+    assert {"PV01 (€, +1BP)", "BASIS PV01 (€, +1BP)", "PAR SPREAD (BP)"} <= set(hedge.columns)
+    swap_caption = next(c.value for c in at.caption if "rate-quote buckets sum to" in c.value)
+    assert "basis-spread buckets" in swap_caption
+    ladder = json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith("swap_ladder_chart")).proto.spec)
+    assert ladder["layout"]["yaxis"]["title"]["text"] == "PV01 (€ PER +1BP)"
+
+    at.radio(key="cap_index").set_value("EURIBOR 3M").run()
+    assert not at.exception and not at.error
+    cap_caption = next(c.value for c in at.caption if "rate-quote buckets sum to" in c.value and "PV01 of" in c.value)
+    text = cap_caption.split("The rate-quote buckets sum to ")[1]
+    rate_sum = float(text.split(" against a PV01 of ")[0].replace(",", ""))
+    pv01 = float(text.split(" against a PV01 of ")[1].split(";")[0].rstrip(".").replace(",", ""))
+    assert rate_sum == pytest.approx(pv01, rel=1e-4, abs=0.05)
+    assert "basis-spread buckets" in cap_caption
+
+    at.number_input(key="scn_horizon").set_value(90).run()  # past the DEC26 futures fixing of the 3M curve
+    assert not at.exception and not at.error, [e.value for e in at.error]
+    assert any("without FX conversion" in w.value for w in at.warning)  # EUR swaps and caps with a USD bond
+    assert any(m.label.startswith("TOTAL P&L (") and "€" in m.label for m in at.metric)
+    _assert_bounded(at)

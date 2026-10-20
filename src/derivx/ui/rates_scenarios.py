@@ -79,16 +79,30 @@ EXPLAIN_LABELS = {
     "carry": "CARRY",
     "residual": "RESIDUAL",
 }
-TABLE_LABELS = {
-    "position": "POSITION",
-    "kind": "KIND",
-    "base_pv": "BASE PV ($)",
-    "shocked_pv": "HORIZON PV ($)",
-    "cash": "CASH ($)",
-    "pnl": "TOTAL P&L ($)",
-    **{k: f"{v} ($)" for k, v in EXPLAIN_LABELS.items()},
-}
 MONEY = st.column_config.NumberColumn(format="%,.2f")
+
+
+def _table_labels(c: str = "$") -> Dict[str, str]:
+    """Explain table columns, amounts in currency ``c``."""
+
+    return {
+        "position": "POSITION",
+        "kind": "KIND",
+        "base_pv": f"BASE PV ({c})",
+        "shocked_pv": f"HORIZON PV ({c})",
+        "cash": f"CASH ({c})",
+        "pnl": f"TOTAL P&L ({c})",
+        **{k: f"{v} ({c})" for k, v in EXPLAIN_LABELS.items()},
+    }
+
+
+def _book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
+    """(currency label of the book's values, whether it mixes currencies):
+    Treasury bonds are in dollars, swaps and caps in the swap curve's
+    currency. Values are added without FX conversion."""
+
+    symbols = sorted({rates_risk.money(market, "govt" if p.kind == "bond" else "curve") for p in positions})
+    return (symbols[0], False) if len(symbols) == 1 else (" + ".join(symbols), True)
 
 
 def _cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
@@ -432,7 +446,7 @@ def _curve_chart(
     )
 
 
-def _waterfall(total: Dict[str, float]) -> go.Figure:
+def _waterfall(total: Dict[str, float], c: str = "$") -> go.Figure:
     labels = [EXPLAIN_LABELS[c] for c in EXPLAIN_COLUMNS] + ["TOTAL P&L"]
     values = [total[c] for c in EXPLAIN_COLUMNS] + [total["pnl"]]
     fig = go.Figure(
@@ -447,7 +461,7 @@ def _waterfall(total: Dict[str, float]) -> go.Figure:
             hovertemplate="%{x}: %{y:,.2f}<extra></extra>",
         )
     )
-    dark_layout(fig, height=360, xtitle="P&L COMPONENT", ytitle="P&L ($)", legend=False)
+    dark_layout(fig, height=360, xtitle="P&L COMPONENT", ytitle=f"P&L ({c})", legend=False)
     levels = np.concatenate([np.cumsum([0.0] + values[:-1]), [values[-1], -1.0, 1.0]])  # at least +/-$1
     return bound_axes(
         fig,
@@ -456,11 +470,12 @@ def _waterfall(total: Dict[str, float]) -> go.Figure:
     )
 
 
-def _explain_table(rows: List[Dict[str, object]]) -> pd.DataFrame:
+def _explain_table(rows: List[Dict[str, object]], c: str = "$") -> pd.DataFrame:
     frame = pd.DataFrame(rows).drop(columns=["delta_by_curve"], errors="ignore")
     total = {"position": TOTAL, "kind": "", **frame.drop(columns=["position", "kind"]).sum().to_dict()}
     frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
-    return frame[list(TABLE_LABELS)].rename(columns=TABLE_LABELS)
+    labels = _table_labels(c)
+    return frame[list(labels)].rename(columns=labels)
 
 
 def _grid(positions: Sequence[Position], market: Market, shocks: Sequence[Shock]) -> Tuple[pd.DataFrame, List[str]]:
@@ -527,16 +542,24 @@ def _show_curves(market: Market, shock: Shock) -> None:
     )  # fmt: skip
 
 
-def _show_explain(rows: List[Dict[str, object]], market: Market, shock: Shock) -> None:
-    table = _explain_table(rows)
+def _show_explain(
+    rows: List[Dict[str, object]], market: Market, shock: Shock, positions: Sequence[Position] = ()
+) -> None:
+    c, mixed = _book_currency(positions, market) if positions else (rates_risk.money(market), False)
+    if mixed:
+        st.warning(
+            f"The book holds {market.curve.conventions.currency} swaps or caps and US Treasury bonds: totals add "
+            f"amounts in {c} without FX conversion. Read the P&L per position, or keep one currency in the book."
+        )
+    table = _explain_table(rows, c)
     total = {k: float(sum(r[k] for r in rows)) for k in ("pnl", *EXPLAIN_COLUMNS)}
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("TOTAL P&L ($)", _num(total["pnl"]))
-    m2.metric("EXPLAINED ($)", _num(total["pnl"] - total["residual"]))
-    m3.metric("RESIDUAL ($)", _num(total["residual"]))
+    m1.metric(f"TOTAL P&L ({c})", _num(total["pnl"]))
+    m2.metric(f"EXPLAINED ({c})", _num(total["pnl"] - total["residual"]))
+    m3.metric(f"RESIDUAL ({c})", _num(total["residual"]))
     share = abs(total["residual"]) / abs(total["pnl"]) * 100.0 if abs(total["pnl"]) > 1e-9 else None
     m4.metric("RESIDUAL (% OF P&L)", "n/a" if share is None else f"{share:.3f}")
-    st.plotly_chart(_waterfall(total), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
+    st.plotly_chart(_waterfall(total, c), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
     horizon = horizon_date(market, shock.horizon_days)
     st.caption(
         f"Horizon {horizon} ({shock.horizon_days} days). P&L = value at the horizon + cash received - value today, "
@@ -545,15 +568,15 @@ def _show_explain(rows: List[Dict[str, object]], market: Market, shock: Shock) -
         "its Greeks: delta = key-rate PV01 x quote move; gamma = 1/2 diagonal key-rate gamma x move^2; cross gamma "
         "= the rest of the second-order term along the shock; vol = vega x vol shock."
     )
-    money = {label: MONEY for label in list(TABLE_LABELS.values())[2:]}
+    money = {label: MONEY for label in list(_table_labels(c).values())[2:]}
     st.dataframe(table, hide_index=True, width="stretch", column_config=money)
     st.download_button("Download P&L explain CSV", _csv(table), file_name="scenario_explain.csv", key="scn_explain_csv")
     curves = sorted({k for r in rows for k in r.get("delta_by_curve", {})}, key=list(market.curve_keys).index)
     if market.is_multi_curve and curves:
         st.markdown("#### / DELTA BY CURVE")
         by_curve = pd.DataFrame(
-            [{"POSITION": r["position"], **{f"{_curve_label(market, k)} ($)": r["delta_by_curve"].get(k, 0.0)
-                                           for k in curves}} for r in rows]
+            [{"POSITION": r["position"], **{f"{_curve_label(market, k)} ({rates_risk.money(market, k)})":
+                                           r["delta_by_curve"].get(k, 0.0) for k in curves}} for r in rows]
         )  # fmt: skip
         st.dataframe(by_curve, hide_index=True, width="stretch",
                      column_config={c: MONEY for c in by_curve.columns[1:]})  # fmt: skip
@@ -648,5 +671,5 @@ def render(market: Market, positions: List[Position]) -> None:
         st.error(f"Cannot revalue the portfolio under this scenario: {exc}")
         rows = None
     if rows is not None:
-        _show_explain(rows, market, shock)
+        _show_explain(rows, market, shock, positions)
     _show_grid(positions, market, shock if rows is not None else None, key, store)

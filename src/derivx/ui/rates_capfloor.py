@@ -292,8 +292,9 @@ def render(market: Market) -> List[Position]:
             rows, values = ladders[key]
             st.markdown(f"#### {rates_risk.curve_title(market, key)}")
             chart_key = "cap_ladder_chart" if key == "curve" else f"cap_ladder_chart_{key.lower().replace(' ', '_')}"
-            st.plotly_chart(rates_risk.ladder_chart([r["label"] for r in rows], values, name=kind.upper()),
-                            width="stretch", config=PLOTLY_2D_CONFIG, key=chart_key)  # fmt: skip
+            st.plotly_chart(rates_risk.ladder_chart([r["label"] for r in rows], values, name=kind.upper(),
+                                                    unit=rates_risk.money(market)), width="stretch",
+                            config=PLOTLY_2D_CONFIG, key=chart_key)  # fmt: skip
         ladder_view = pd.DataFrame(
             {
                 "CURVE": [rates_risk.curve_title(market, key) for key in ladders for _ in ladders[key][0]],
@@ -306,9 +307,17 @@ def render(market: Market) -> List[Position]:
         "DOWNLOAD KEY-RATE PV01 CSV", ladder_view.to_csv(index=False), file_name=f"{kind}_key_rate_pv01.csv",
         mime="text/csv", on_click="ignore", key="cap_ladder_csv",
     )
+    if ladders is None:
+        sums = f"Buckets sum to {sum(r['pv01'] for r in ladder):,.2f} against a parallel PV01 of {pv01:,.2f}."
+    else:
+        rate_sum, spread_sum = rates_risk.ladder_sums(market, ladders)
+        sums = f"The rate-quote buckets sum to {rate_sum:,.2f} against a PV01 of {pv01:,.2f}"
+        if any(r["label"].endswith(" BASIS") for r in ladder):
+            sums += f"; the 3s6s basis-spread buckets (+1bp on a spread, not a rate) sum to {spread_sum:,.2f}"
+        sums += "."
     st.caption(
         "P&L for +1bp on one curve quote at a time (central difference, curve rebuilt"
         + ("; an OIS bump rebuilds the EURIBOR curves on it, quotes held" if ladders is not None else "")
-        + f"). Buckets sum to {sum(r['pv01'] for r in ladder):,.2f} against a parallel PV01 of {pv01:,.2f}."
+        + f"). {sums}"
     )
     return [position]
