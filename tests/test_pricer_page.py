@@ -1,6 +1,7 @@
-"""EQUITY / FX pricer page (AppTest): presets, input validation, expiry,
-the PUT surface, determinism, widget state across mode switches, the
-implied-vol solver, the smile sources and the hero card."""
+"""EQUITY pricer page (AppTest): presets, input validation, expiry, the PUT
+surface, determinism, widget state across mode switches, the implied-vol
+solver, the smile sources and the hero card. The FX page, with its market
+conventions, is tested in tests/test_fx_page.py."""
 
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ def _charts(at: AppTest) -> dict:
     return out
 
 
-@pytest.mark.parametrize("prefix, mode", [("eq", "[ EQUITY ]"), ("fx", "[ FX ]")])
+@pytest.mark.parametrize("prefix, mode", [("eq", "[ EQUITY ]")])
 def test_presets_set_the_inputs(prefix, mode):
     """UIE-03 / PP-08: choosing a preset writes the inputs and reprices."""
 
@@ -86,7 +87,7 @@ def test_presets_set_the_inputs(prefix, mode):
         assert _premium(at) == pytest.approx(36.2613, abs=1e-4)  # the audit's fresh-session value
 
 
-@pytest.mark.parametrize("mode, prefix", [("[ EQUITY ]", "eq"), ("[ FX ]", "fx")])
+@pytest.mark.parametrize("mode, prefix", [("[ EQUITY ]", "eq")])
 @pytest.mark.parametrize(
     "field, value, message",
     [
@@ -165,7 +166,7 @@ def test_scenario_grid_is_the_position_pnl():
     assert table.shape == (7, 9)
 
 
-@pytest.mark.parametrize("mode, prefix", [("[ EQUITY ]", "eq"), ("[ FX ]", "fx")])
+@pytest.mark.parametrize("mode, prefix", [("[ EQUITY ]", "eq")])
 def test_smallest_spot_shock_renders_the_whole_page(mode, prefix):
     """MAX SPOT SHOCK 0.5% (its minimum) printed two spot columns as
     '-0.1%': Arrow raised 'Duplicate column names found' and the surface,
@@ -196,12 +197,15 @@ def test_scenario_horizon_past_expiry_is_valued_at_intrinsic_and_says_so():
 
 
 def test_surface_domain_scales_with_vol_and_time_not_a_fixed_box():
-    """PP-09: the spot axis covers spot and strike +- n sigma sqrt(T)."""
+    """PP-09: the spot axis covers spot and strike +- n sigma sqrt(T), at
+    any price level (here an FX-like 1.08, which used to give 1e-6..11.08)."""
 
-    at = _app("[ FX ]")
+    at = _app()
+    for name, value in (("spot", 1.08), ("strike", 1.08), ("T", 0.25), ("vol", 0.08)):
+        at.number_input(key=f"eq_{name}").set_value(value).run()
     x = _arr(_charts(at)["surface"]["data"][0]["x"])
-    assert 0.9 < x[0] < 1.08 < x[-1] < 1.3  # FX level, not 1e-6..11.08
-    at.radio(key="fx_surf_axes").set_value("SPOT × TIME TO EXPIRY").run()
+    assert 0.9 < x[0] < 1.08 < x[-1] < 1.3
+    at.radio(key="eq_surf_axes").set_value("SPOT × TIME TO EXPIRY").run()
     surf = _charts(at)["surface"]
     y = _arr(surf["data"][0]["y"])
     assert y[0] == 0.0 and y[-1] == pytest.approx(0.25)
@@ -213,7 +217,7 @@ def _figures(at: AppTest) -> list:
     return [c.proto.spec for c in at.get("plotly_chart")]
 
 
-@pytest.mark.parametrize("mode", ["[ EQUITY ]", "[ FX ]"])
+@pytest.mark.parametrize("mode", ["[ EQUITY ]"])
 def test_reruns_are_deterministic(mode):
     """PP-01 / UIE-05 / VM-14 / G14: identical inputs give identical figures
     (no random 'MARKET' smile)."""
@@ -228,7 +232,8 @@ def test_reruns_are_deterministic(mode):
 
 
 def test_mode_round_trip_keeps_values_and_modes_do_not_share_keys():
-    """UIE-04: EQUITY -> RATES -> EQUITY keeps the inputs; FX has its own."""
+    """UIE-04: EQUITY -> RATES -> EQUITY keeps the inputs; FX has its own
+    (per-pair keys on the FX page)."""
 
     at = _app()
     at.number_input(key="eq_vol").set_value(0.33).run()
@@ -237,8 +242,8 @@ def test_mode_round_trip_keeps_values_and_modes_do_not_share_keys():
     at.slider(key="eq_surf_res").set_value(31).run()
     premium = _premium(at)
     at.sidebar.radio[0].set_value("[ FX ]").run()
-    assert _inputs(at, "fx")["spot"] == pytest.approx(1.08)  # not the equity market
-    at.number_input(key="fx_vol").set_value(0.123).run()
+    assert at.number_input(key="fx_spot_EURUSD").value == pytest.approx(1.1215)  # not the equity market
+    at.number_input(key="fx_spot_EURUSD").set_value(1.0123).run()
     at.sidebar.radio[0].set_value("[ RATES ]").run()
     at.sidebar.radio[0].set_value("[ EQUITY ]").run()
     assert not at.exception
@@ -246,7 +251,7 @@ def test_mode_round_trip_keeps_values_and_modes_do_not_share_keys():
     assert at.selectbox(key="eq_type").value == "PUT" and at.slider(key="eq_surf_res").value == 31
     assert _premium(at) == pytest.approx(premium)
     at.sidebar.radio[0].set_value("[ FX ]").run()
-    assert _inputs(at, "fx")["vol"] == pytest.approx(0.123)
+    assert at.number_input(key="fx_spot_EURUSD").value == pytest.approx(1.0123)
 
 
 def test_implied_vol_solver_round_trips_and_explains_bound_violations():
@@ -316,14 +321,9 @@ def test_hero_shows_context_and_no_dollar_sign_outside_usd():
     assert "$" not in hero
     at.selectbox(key="eq_ccy").set_value("OTHER").run()
     assert "USD" not in _hero(at) and "price units per one share" in _hero(at)
-    at.sidebar.radio[0].set_value("[ FX ]").run()
-    hero = _hero(at)
-    assert "$" not in hero and "USD" not in hero and "quote-currency units per 1 unit of base currency" in hero
-    at.number_input(key="fx_spot").set_value(1.0835).run()
-    assert "1.08350" in _hero(at)  # FX precision: the priced spot is what is shown
-    at.number_input(key="fx_spot").set_value(1.083456).run()  # typed with more decimals than the box shows
-    assert "<b>1.083456</b>" in _hero(at)  # was 1.08346, while 1.083456 was priced
-    assert _premium(at) == pytest.approx(float(bs_price(1.083456, 1.08, 0.25, 0.04, 0.08, q=0.025)), abs=1e-6)
+    at.number_input(key="eq_spot").set_value(100.123456).run()  # typed with more decimals than the box shows
+    assert "<b>100.123456</b>" in _hero(at)  # shown as priced (FX precision: tests/test_fx_page.py)
+    assert _premium(at) == pytest.approx(float(bs_price(100.123456, 100.0, 1.0, 0.05, 0.2)), abs=1e-4)
 
 
 def _loaded_chain() -> pd.DataFrame:
@@ -353,28 +353,3 @@ def test_market_smile_from_a_loaded_chain_is_labelled_and_fitted():
     assert any("MARKET</span>SYNTH" in m.value for m in at.markdown)
     at.run()
     assert _charts(at)["smile"] == smile  # cached and deterministic
-
-
-def test_fx_page_never_offers_an_equity_chain_as_its_market_smile():
-    at = AppTest.from_file(str(APP), default_timeout=120)
-    at.session_state["market_chain"] = _loaded_chain()
-    at.run()
-    at.sidebar.radio[0].set_value("[ FX ]").run()
-    assert not at.exception
-    assert not [r for r in at.radio if r.key == "fx_smile_src"]
-    assert _charts(at)["smile"]["data"][0]["name"] == "SABR (illustrative)"
-
-
-def test_fx_sabr_smile_warns_when_hagan_implies_a_negative_density():
-    """The illustrative SABR smile had no arbitrage check (the SVI one did):
-    with nu^2 T = 20 Hagan's expansion gives a negative density, now stated."""
-
-    at = _app("[ FX ]")
-    assert not any("Butterfly arbitrage" in w.value for w in at.warning)
-    at.number_input(key="fx_T").set_value(5.0).run()
-    at.number_input(key="fx_vol").set_value(0.5).run()
-    at.slider(key="fx_smile_rho").set_value(-0.5).run()
-    at.slider(key="fx_smile_curv").set_value(2.0).run()
-    assert not at.exception
-    assert any("Butterfly arbitrage" in w.value and "ν²T (here 20)" in w.value for w in at.warning)
-    assert _charts(at)["smile"]["data"][0]["name"] == "SABR (illustrative)"

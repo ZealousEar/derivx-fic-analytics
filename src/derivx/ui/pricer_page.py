@@ -1,22 +1,22 @@
-"""EQUITY and FX option pricer page: premium, Greeks in desk units, an
+"""EQUITY option pricer page: premium, Greeks in desk units, an
 implied-vol solver, a spot x vol scenario P&L grid, a risk surface and the
-smile.
+smile. FX options, with their market conventions, have their own page
+(:mod:`derivx.ui.fx_page`); this module also provides the card styles
+(``PAGE_CSS``) both pages share.
 
 Model: Black-Scholes-Merton on spot (:mod:`derivx.core.bs`), with ``q`` the
-dividend yield (EQUITY) or the foreign interest rate (FX, Garman-Kohlhagen).
-Units: spot, strike and premiums in price units (strike currency per one
-unit of underlying), T in years (ACT/365F), r, q and vols as per-annum
-decimals. Greeks are for a long option on one unit of underlying, signed as
-the P&L (or change in delta) for the stated move: +1% spot, +1 vol point,
-one calendar day, +1bp. FX market conventions (premium in pips or % of
-notional, delta conventions, ATM DNS, risk reversals) are not on this page.
+dividend yield. Units: spot, strike and premiums in price units (strike
+currency per one unit of underlying), T in years (ACT/365F), r, q and vols
+as per-annum decimals. Greeks are for a long option on one unit of
+underlying, signed as the P&L (or change in delta) for the stated move: +1%
+spot, +1 vol point, one calendar day, +1bp.
 
 Nothing here is random. The default smile is an ILLUSTRATIVE model smile
 from user-set parameters; a MARKET smile is offered only from a chain loaded
 in the ANALYTICS lab (``st.session_state['market_chain']``). Every chart is
 zoom-bounded by :mod:`derivx.ui.plot_limits` and styled by
-:mod:`derivx.ui.theme`. Widget keys are namespaced per mode (``eq_*``,
-``fx_*``) and persist across mode switches (:mod:`derivx.ui.state`).
+:mod:`derivx.ui.theme`. Widget keys are namespaced (``eq_*``; the FX page
+uses ``fx_*``) and persist across mode switches (:mod:`derivx.ui.state`).
 """
 
 from __future__ import annotations
@@ -78,7 +78,8 @@ VOL_MAX = 5.0  # VOL.σ input bound (500%)
 
 @dataclass(frozen=True)
 class ModeSpec:
-    """What differs between the EQUITY and FX pages."""
+    """Per-mode settings of the pricer page (EQUITY; FX has its own page,
+    :mod:`derivx.ui.fx_page`)."""
 
     name: str
     prefix: str  # widget-key namespace
@@ -115,27 +116,6 @@ MODES: Dict[str, ModeSpec] = {
             "HIGH VOL": {"spot": 100.0, "strike": 100.0, "T": 2.0, "r": 0.05, "q": 0.0, "vol": 0.6},
             "DEEP ITM": {"spot": 150.0, "strike": 80.0, "T": 1.0, "r": 0.05, "q": 0.0, "vol": 0.3},
             "FAR OTM": {"spot": 80.0, "strike": 120.0, "T": 0.5, "r": 0.05, "q": 0.0, "vol": 0.4},
-        },
-    ),
-    "FX": ModeSpec(
-        name="FX",
-        prefix="fx",
-        price_format="%.5f",
-        price_step=0.0001,
-        price_decimals=6,
-        r_label="DOM RATE.R (DECIMAL)",
-        q_label="FOR RATE.Q (DECIMAL)",
-        q_greek="RHO (FOR.Q)",
-        underlying="one unit of the base currency",
-        smile_model="SABR",
-        default_position=1_000_000.0,
-        position_help="Signed base-currency notional: +1,000,000 = long options on 1m of the base currency. "
-        "Scales the scenario P&L only.",
-        presets={
-            "DEFAULT": {"spot": 1.08, "strike": 1.08, "T": 0.25, "r": 0.04, "q": 0.025, "vol": 0.08},
-            "HIGH VOL": {"spot": 1.08, "strike": 1.08, "T": 1.0, "r": 0.04, "q": 0.025, "vol": 0.2},
-            "DEEP ITM": {"spot": 1.08, "strike": 0.98, "T": 0.5, "r": 0.04, "q": 0.025, "vol": 0.1},
-            "FAR OTM": {"spot": 1.08, "strike": 1.2, "T": 0.25, "r": 0.04, "q": 0.025, "vol": 0.1},
         },
     ),
 }
@@ -265,8 +245,6 @@ def _sidebar_inputs(spec: ModeSpec) -> Tuple[Optional[calc.Inputs], Dict[str, ob
 def _ccy_label(spec: ModeSpec, ccy: Optional[str]) -> Tuple[str, str]:
     """(currency suffix for the premium, unit line)."""
 
-    if spec.name == "FX":
-        return "", "quote-currency units per 1 unit of base currency (no FX premium conventions)"
     suffix = "" if ccy in (None, "OTHER") else ccy
     return suffix, f"{suffix or 'price units'} per {spec.underlying}"
 
@@ -276,7 +254,7 @@ def _hero(spec: ModeSpec, inp: calc.Inputs, g: BSGreeks, ccy: Optional[str]) -> 
     F = inp.forward
     std = inp.sigma * math.sqrt(inp.T)
     sd_text = f"{math.log(inp.K / F) / std:+.2f} SD" if std > 0 else "n/a (σ√T = 0)"
-    dec = 2 if spec.name == "EQUITY" else 5
+    dec = 2
     cells = [
         ("SPOT", calc.fmt_exact(inp.S, dec)),
         ("FORWARD", calc.fmt_fixed(F, dec)),
@@ -744,7 +722,7 @@ def _market_smile(spec: ModeSpec, inp: calc.Inputs, chain: pd.DataFrame) -> None
 
 def _smile(spec: ModeSpec, inp: calc.Inputs) -> None:
     st.markdown(f"### / {spec.smile_model} SMILE")
-    chain = _market_chain() if spec.name == "EQUITY" else None
+    chain = _market_chain()
     if chain is not None:
         src = st.radio(
             "SMILE SOURCE",
@@ -755,11 +733,7 @@ def _smile(spec: ModeSpec, inp: calc.Inputs) -> None:
         )
     else:
         src = "ILLUSTRATIVE"
-        st.caption(
-            "Load an option chain in the ANALYTICS lab to see a MARKET smile here."
-            if spec.name == "EQUITY"
-            else "A MARKET FX smile needs an FX vol surface, which is not loaded here."
-        )
+        st.caption("Load an option chain in the ANALYTICS lab to see a MARKET smile here.")
     if src == "MARKET" and chain is not None:
         _market_smile(spec, inp, chain)
     else:
@@ -792,18 +766,12 @@ def _model_check(inp: calc.Inputs, g: BSGreeks) -> None:
 
 
 def render(mode: str) -> None:
-    """Draw the EQUITY or FX pricer page."""
+    """Draw the pricer page for ``mode`` (a key of :data:`MODES`: EQUITY)."""
 
     spec = MODES[mode.upper()]
     _init_state(spec)
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
     st.markdown(f"## / {spec.name} OPTIONS")
-    if spec.name == "FX":
-        st.caption(
-            "Garman-Kohlhagen (Black-Scholes-Merton with q = foreign rate). Premiums are in quote-currency units per "
-            "1 unit of base currency; FX quoting conventions (pips, premium currency, delta conventions) are not "
-            "implemented yet."
-        )
     inp, extras = _sidebar_inputs(spec)
     if inp is None:
         st.info("Fix the inputs in the sidebar to price the option.")
