@@ -42,6 +42,7 @@ from derivx.risk.scenarios import (
     ibor_ois_basis,
     key_rates,
     parallel,
+    pca_factor,
     quote_risk,
     run_scenario,
     scenario_grid,
@@ -55,7 +56,10 @@ from derivx.ui import rates_data, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
-SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "Historical", "History window")
+SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "PCA factor", "Historical", "History window")
+PCA_FACTORS = {1: "PC1 LEVEL", 2: "PC2 SLOPE", 3: "PC3 CURVATURE"}
+PCA_LOOKBACKS = {"WHOLE DAILY HISTORY": None, "LAST 250 CHANGES": 250, "LAST 500 CHANGES": 500,
+                 "LAST 1000 CHANGES": 1000}  # fmt: skip
 BASIS_TYPES = ("IBOR-OIS basis", "Tenor basis")  # multi-curve markets only
 HISTORY_UPLOAD_KEY = "rates_user_history"
 FLAG_LABELS = {
@@ -103,6 +107,12 @@ def _book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, 
 
     symbols = sorted({rates_risk.money(market, "govt" if p.kind == "bond" else "curve") for p in positions})
     return (symbols[0], False) if len(symbols) == 1 else (" + ".join(symbols), True)
+
+
+def book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
+    """(currency label of the book's values, whether it mixes currencies)."""
+
+    return _book_currency(positions, market)
 
 
 def _cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
@@ -214,6 +224,8 @@ def _profile_inputs(kind: str, c2, c3, store: rh.HistoryStore, market: Market) -
         cols = st.columns(len(KEY_TENORS))
         moves = {t: _bp(col, f"{t} (BP)", 0.0, f"scn_kr_{t}") for t, col in zip(KEY_TENORS, cols)}
         return key_rates(moves)
+    if kind == "PCA factor":
+        return _pca_inputs(c2, c3, store, market)
     if kind == "Historical":
         name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
         scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
@@ -225,6 +237,51 @@ def _profile_inputs(kind: str, c2, c3, store: rh.HistoryStore, market: Market) -
     end = c3.selectbox("WINDOW END", dates, index=end_default, key="scn_win_end")
     scale = st.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_win_scale")
     return history_window(start, end, scale, store=store)
+
+
+def history_store(market: Market) -> rh.HistoryStore:
+    """The CURVE tab's store plus the user's swap history uploaded on this
+    tab (the RESEARCH tab reads the same store)."""
+
+    return _history_store(market)
+
+
+def book_risk(positions: Sequence[Position], market: Market) -> Tuple[tuple, Dict[str, QuoteRisk]]:
+    """(portfolio key, key-rate PV01s and gammas of the book to every curve
+    with quotes) on the valuation date, from the cache this tab's P&L
+    explain fills, so the RESEARCH tab does not bump the curves again.
+    Raises ValueError if a position has no finite value."""
+
+    key = (_market_key(market), _positions_key(positions, market))
+    out = {}
+    for which in shocked_curves(market):
+        if _has_quotes(market.get_curve(which)):
+            out[which] = _cached(f"risk_{which}", (key, 0), lambda w=which: quote_risk(positions, market, w))
+    return key, out
+
+
+def _pca_inputs(c2, c3, store: rh.HistoryStore, market: Market) -> Shock:
+    """PCA factor shock: n sd of PC1/PC2/PC3 of a history's daily changes up
+    to the valuation date."""
+
+    factor = c2.selectbox("FACTOR", list(PCA_FACTORS), format_func=PCA_FACTORS.get, key="scn_pca_factor")
+    n_sigma = c3.number_input(
+        "SIZE (STANDARD DEVIATIONS)", min_value=-10.0, max_value=10.0, value=2.0, step=0.5, key="scn_pca_sigma"
+    )
+    a, b, c = st.columns(3)
+    datasets = [k for k in store.datasets() if k != "FIXINGS" and len(store.dates(k)) > 1]
+    datasets.sort(key=lambda k: (k != "UST_PAR", k))
+    dataset = a.selectbox(
+        "FROM THE DAILY CHANGES OF", datasets, format_func=lambda k: rh.dataset_info(k).title, key="scn_pca_dataset"
+    )
+    lookback = b.selectbox("OVER", list(PCA_LOOKBACKS), key="scn_pca_lookback")
+    days = c.number_input(
+        "HOLDING PERIOD (BUSINESS DAYS)", min_value=1, max_value=250, value=1, step=1, key="scn_pca_days",
+        help="The one-day standard deviation is scaled by the square root of this (independent daily moves assumed).",
+    )  # fmt: skip
+    return pca_factor(
+        int(factor), float(n_sigma), store, dataset, end=market.asof, window=PCA_LOOKBACKS[lookback], days=int(days)
+    )
 
 
 def _history_store(market: Market) -> rh.HistoryStore:
@@ -367,7 +424,7 @@ def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
         horizon_days=int(horizon),
     )
     st.caption(f"{shock.name}: {shock.description}.")
-    if kind in ("Historical", "History window"):
+    if kind in ("Historical", "History window", "PCA factor"):
         _sources_table(shock, market)
     if not (shock.moves_rates or normal or lognormal or horizon):
         st.warning("This scenario moves nothing: pick a curve, a non-zero shock, a vol shock or a horizon.")

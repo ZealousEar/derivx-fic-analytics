@@ -9,6 +9,7 @@ from derivx.ui import (
     rates_bonds,
     rates_capfloor,
     rates_curve,
+    rates_research,
     rates_scenarios,
     rates_swap,
     rates_swaption,
@@ -37,7 +38,7 @@ elif mode == "FX":
     fx_page.render()
 elif mode == "RATES":
     st.markdown("## / INTEREST RATES")
-    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS"])
+    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS", "/ RESEARCH"])
     with tabs[0]:
         market = rates_curve.render()
     if market is None:
@@ -56,6 +57,8 @@ elif mode == "RATES":
             positions += rates_bonds.render(market)
         with tabs[5]:
             rates_scenarios.render(market, positions)
+        with tabs[6]:
+            rates_research.render(market, positions)
 elif mode == "ANALYTICS":
     analytics_lab.render()
 
