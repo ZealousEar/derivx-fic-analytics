@@ -329,37 +329,101 @@ def desk_greeks(g: BSGreeks, S) -> Dict[str, np.ndarray]:
     }
 
 
-def finite_difference_greeks(S, K, T, r, sigma, q=0.0, call=True) -> Dict[str, float]:
-    """Central finite differences of :func:`bs_price` for one option (a
-    check of the analytic Greeks against the pricer, raw units). Bumps:
-    spot 1e-4 S, vol 1e-5 (volga: second differences at 2e-3 and 1e-3 with
-    Richardson extrapolation), rates 1e-5, time ``min(1e-4, T / 4)`` years. Needs ``T > 0`` and ``sigma > 0``
-    (the price is smooth there)."""
+_FD_STEPS = 16  # step sizes h0 * 2**-k, k = 0..15, for the finite-difference check
+_FD_NOISE = 8.0  # rounding error of one price, in units of eps * (S e^{-qT} + K e^{-rT})
+
+
+@dataclass(frozen=True)
+class FiniteDifference:
+    """A finite-difference Greek (raw units) and an estimate of its own
+    numerical error (truncation plus rounding, same units)."""
+
+    value: float
+    error: float
+
+
+def _best_richardson(D: np.ndarray, noise: np.ndarray) -> FiniteDifference:
+    """Pick the best of the Richardson-extrapolated central differences
+    ``R_k = (4 D_{k+1} - D_k) / 3`` (step halving, O(h^4)). The error of
+    ``R_k`` is estimated as ``|R_k - R_{k-1}|`` (truncation, conservative)
+    plus the rounding noise of its prices; the smallest estimate wins."""
+
+    R = (4.0 * D[1:] - D[:-1]) / 3.0
+    noise_r = (4.0 * noise[1:] + noise[:-1]) / 3.0
+    err = np.abs(np.diff(R)) + noise_r[1:]
+    err = np.where(np.isfinite(err), err, np.inf)
+    j = int(np.argmin(err))
+    return FiniteDifference(float(R[j + 1]), float(err[j]))
+
+
+def finite_difference_estimates(S, K, T, r, sigma, q=0.0, call=True) -> Dict[str, FiniteDifference]:
+    """Central finite differences of :func:`bs_price` for one option, each
+    with an error estimate: an independent check of the analytic Greeks
+    against the pricer (raw units of :class:`BSGreeks`).
+
+    Steps follow the scales on which the price varies, so the check works
+    from hours to decades, for tiny and huge vols and deep in or out of the
+    money: with ``s = sigma sqrt(T)`` and ``d = max(1, |d1|, |d2|)``, the
+    first steps are ``S min(1/2, s/d) / 4`` (spot), ``sigma / (4 d^2)``
+    (vol), ``T / (4 d^2)`` (time) and ``min(1, s/d) / (4 T)`` (rates), each
+    halved 15 times; :func:`_best_richardson` picks the step. Mixed
+    derivatives (vanna, charm) bump both inputs together. Needs ``T > 0``
+    and ``sigma > 0`` (the price is smooth there)."""
 
     S, K, T, r, sigma, q = (float(x) for x in (S, K, T, r, sigma, q))
     if T <= 0 or sigma <= 0:
         raise ValueError("finite differences need T > 0 and sigma > 0 (the price has a kink otherwise)")
+    is_call = bool(call_flags(call))
+    _validated(S, K, T, r, sigma, q)
+    std = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q) * T) / std + 0.5 * std
+    d = max(1.0, abs(d1), abs(d1 - std))
+    t = 0.5 ** np.arange(_FD_STEPS)
+    hs = S * min(0.5, std / d) / 4.0 * t
+    hv = sigma / (4.0 * d * d) * t
+    ht = T / (4.0 * d * d) * t
+    hr = min(1.0, std / d) / (4.0 * T) * t
+    scale = _FD_NOISE * np.finfo(float).eps * (S * np.exp(-q * T) + K * np.exp(-r * T))
 
-    def v(s=S, t=T, rr=r, vol=sigma, qq=q) -> float:
-        return float(bs_price(s, K, t, rr, vol, q=qq, call=call))
+    def v(s=S, tt=T, rr=r, vol=sigma, qq=q) -> np.ndarray:
+        return np.asarray(bs_price(s, K, tt, rr, vol, q=qq, call=is_call), dtype=float)
 
-    hs, hv, hv2, hr, ht = 1e-4 * S, 1e-5, min(2e-3, sigma / 2.0), 1e-5, min(1e-4, T / 4.0)
     base = v()
 
-    def dv_ds(**kw) -> float:
-        return (v(s=S + hs, **kw) - v(s=S - hs, **kw)) / (2 * hs)
+    def first(up, dn, h) -> FiniteDifference:
+        return _best_richardson((up - dn) / (2.0 * h), scale / h)
 
-    def d2v_dvol2(h: float) -> float:
-        return (v(vol=sigma + h) - 2 * base + v(vol=sigma - h)) / h**2
+    def second(up, dn, h) -> FiniteDifference:
+        return _best_richardson((up - 2.0 * base + dn) / h**2, 4.0 * scale / h**2)
 
+    def mixed(pp, pm, mp, mm, h1, h2) -> FiniteDifference:
+        return _best_richardson((pp - pm - mp + mm) / (4.0 * h1 * h2), scale / (h1 * h2))
+
+    theta = first(v(tt=T - ht), v(tt=T + ht), ht)  # dV/dt = -dV/dT
+    charm = mixed(
+        v(s=S + hs, tt=T - ht), v(s=S + hs, tt=T + ht), v(s=S - hs, tt=T - ht), v(s=S - hs, tt=T + ht), hs, ht
+    )
     return {
-        "delta": dv_ds(),
-        "gamma": (v(s=S + hs) - 2 * base + v(s=S - hs)) / hs**2,
-        "vega": (v(vol=sigma + hv) - v(vol=sigma - hv)) / (2 * hv),
-        "theta": -(v(t=T + ht) - v(t=T - ht)) / (2 * ht),
-        "rho": (v(rr=r + hr) - v(rr=r - hr)) / (2 * hr),
-        "phi": (v(qq=q + hr) - v(qq=q - hr)) / (2 * hr),
-        "vanna": (dv_ds(vol=sigma + hv) - dv_ds(vol=sigma - hv)) / (2 * hv),
-        "volga": (4.0 * d2v_dvol2(hv2 / 2.0) - d2v_dvol2(hv2)) / 3.0,
-        "charm": -(dv_ds(t=T + ht) - dv_ds(t=T - ht)) / (2 * ht),
+        "delta": first(v(s=S + hs), v(s=S - hs), hs),
+        "gamma": second(v(s=S + hs), v(s=S - hs), hs),
+        "vega": first(v(vol=sigma + hv), v(vol=sigma - hv), hv),
+        "theta": theta,
+        "rho": first(v(rr=r + hr), v(rr=r - hr), hr),
+        "phi": first(v(qq=q + hr), v(qq=q - hr), hr),
+        "vanna": mixed(
+            v(s=S + hs, vol=sigma + hv),
+            v(s=S + hs, vol=sigma - hv),
+            v(s=S - hs, vol=sigma + hv),
+            v(s=S - hs, vol=sigma - hv),
+            hs,
+            hv,
+        ),
+        "volga": second(v(vol=sigma + hv), v(vol=sigma - hv), hv),
+        "charm": charm,
     }
+
+
+def finite_difference_greeks(S, K, T, r, sigma, q=0.0, call=True) -> Dict[str, float]:
+    """The values of :func:`finite_difference_estimates` (raw units)."""
+
+    return {name: fd.value for name, fd in finite_difference_estimates(S, K, T, r, sigma, q=q, call=call).items()}

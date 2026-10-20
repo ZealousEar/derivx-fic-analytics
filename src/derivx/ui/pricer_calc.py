@@ -13,8 +13,8 @@ is in price units of the strike currency.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,10 +22,11 @@ import pandas as pd
 from derivx.core.bs import (
     DAYS_PER_YEAR,
     GREEK_NAMES,
+    BSGreeks,
     bs_greeks,
     bs_price,
     desk_greeks,
-    finite_difference_greeks,
+    finite_difference_estimates,
     no_arbitrage_bounds,
 )
 from derivx.vol.sabr import hagan_sabr_iv, sabr_alpha_from_atm
@@ -163,6 +164,18 @@ def fmt_fixed(x: float, decimals: int) -> str:
     return f"{float(x):,.{decimals}f}"
 
 
+def fmt_exact(x: float, min_decimals: int) -> str:
+    """An input as priced: at least ``min_decimals`` decimals, more when the
+    value has them (1.083456 stays 1.083456 where 5 decimals would show
+    1.08346), with thousands separators."""
+
+    if x is None or not np.isfinite(x):
+        return "n/a"
+    text = np.format_float_positional(float(x), unique=True, trim="-")
+    decimals = len(text.split(".", 1)[1]) if "." in text else 0
+    return f"{float(x):,.{max(decimals, min_decimals)}f}"
+
+
 def tenor_text(T: float) -> str:
     """'1.0000Y · 365D' style tenor (ACT/365F days, 2 decimals below a day)."""
 
@@ -190,10 +203,37 @@ class ScenarioGrid:
     position: float
     dropped_vol_shocks: Tuple[float, ...]
 
+    @property
+    def spot_labels(self) -> List[str]:
+        """Spot shocks in percent ('+0.05%'), distinct for every allowed shock size."""
+
+        return [f"{text}%" for text in shock_labels(100.0 * self.spot_shocks)]
+
+    @property
+    def vol_labels(self) -> List[str]:
+        """Vol shocks in vol points ('-2.5'), distinct for every allowed shock size."""
+
+        return shock_labels(100.0 * self.vol_shocks)
+
     def table(self) -> pd.DataFrame:
-        cols = [f"{s:+.1%}" for s in self.spot_shocks]
-        rows = [f"{v * 100:+.1f} vol pts" for v in self.vol_shocks]
-        return pd.DataFrame(self.pnl, index=pd.Index(rows, name="vol shock"), columns=pd.Index(cols, name="spot shock"))
+        rows = [f"{text} vol pts" for text in self.vol_labels]
+        return pd.DataFrame(
+            self.pnl, index=pd.Index(rows, name="vol shock"), columns=pd.Index(self.spot_labels, name="spot shock")
+        )
+
+
+def shock_labels(values, max_decimals: int = 8) -> List[str]:
+    """Signed labels for shock sizes with the fewest decimals that keep every
+    label distinct and within 0.5% of its shock (a 0.5% grid has +-0.05%
+    steps, which one decimal would print twice as '+0.1%')."""
+
+    values = [float(v) for v in values]
+    for decimals in range(max_decimals + 1):
+        labels = [f"{v:+.{decimals}f}" for v in values]
+        close = all(abs(float(text) - v) <= 5e-3 * abs(v) for text, v in zip(labels, values))
+        if close and len(set(labels)) == len(labels):
+            return ["+0" if v == 0.0 else text for text, v in zip(labels, values)]
+    raise ValueError(f"shock sizes are not distinct to {max_decimals} decimals: {values}")
 
 
 def scenario_grid(
@@ -340,9 +380,14 @@ class IllustrativeSmile:
     fixed: Tuple[str, ...]
     notes: Tuple[str, ...]
     arbitrage_free: Optional[bool]
+    model_vol: Callable[[np.ndarray], np.ndarray] = field(repr=False, compare=False)  # strikes -> vols
 
     def vol_at(self, K: float) -> float:
-        return float(np.interp(math.log(K / self.F), np.log(self.strikes / self.F), self.vols))
+        """The model's vol at strike ``K`` (evaluated, not interpolated)."""
+
+        if not (np.isfinite(K) and K > 0):
+            raise ValueError(f"the strike must be > 0, got {K}")
+        return float(np.asarray(self.model_vol(np.asarray([float(K)])), dtype=float)[0])
 
 
 def illustrative_svi(F: float, T: float, atm_vol: float, rho: float, eta: float, n_sd: float = 3.0):
@@ -372,44 +417,116 @@ def illustrative_svi(F: float, T: float, atm_vol: float, rho: float, eta: float,
         )
     params = {f"SVI {name}": float(raw[name]) for name in ("a", "b", "rho", "m", "sigma")}
     return IllustrativeSmile(
-        "SVI", F, T, atm_vol, strikes, vols, params, (), tuple(notes), bool(fly.ok and lee["lee_ok"])
+        "SVI",
+        F,
+        T,
+        atm_vol,
+        strikes,
+        vols,
+        params,
+        (),
+        tuple(notes),
+        bool(fly.ok and lee["lee_ok"]),
+        lambda K: surf.implied_vol(np.log(np.asarray(K, dtype=float) / F), T),
     )
+
+
+def durrleman_g(k: np.ndarray, w: np.ndarray, dw: np.ndarray, d2w: np.ndarray) -> np.ndarray:
+    """Durrleman's density factor of a total-variance smile ``w(k)``,
+    ``k = ln(K / F)``: ``g = (1 - k w' / (2 w))^2 - w'^2 / 4 (1 / w + 1 / 4)
+    + w'' / 2``. The risk-neutral density is ``n(d2) g / sqrt(w)`` per unit
+    k, so ``g < 0`` is a butterfly arbitrage (negative density)."""
+
+    return (1.0 - k * dw / (2.0 * w)) ** 2 - dw**2 / 4.0 * (1.0 / w + 0.25) + d2w / 2.0
+
+
+def sabr_density_factor(F: float, T: float, strikes: np.ndarray, alpha: float, beta: float, rho: float, nu: float):
+    """``(k, g)``: :func:`durrleman_g` of Hagan's SABR smile at ``strikes``,
+    with ``w'`` and ``w''`` from central differences in k (step 1e-4)."""
+
+    k = np.log(np.asarray(strikes, dtype=float) / F)
+    h = 1e-4
+
+    def w(x):
+        return T * np.asarray(hagan_sabr_iv(F, F * np.exp(x), T, alpha, beta, rho, nu), dtype=float) ** 2
+
+    w0, up, dn = w(k), w(k + h), w(k - h)
+    return k, durrleman_g(k, w0, (up - dn) / (2.0 * h), (up - 2.0 * w0 + dn) / h**2)
 
 
 def illustrative_sabr(F: float, T: float, atm_vol: float, rho: float, nu: float, beta: float = 1.0, n_sd: float = 3.0):
     """Hagan SABR smile with ATM vol ``atm_vol`` at K = F (alpha solved from
     it), skew ``rho`` and vol of vol ``nu``; beta fixed (1 = lognormal
-    backbone, the usual FX choice)."""
+    backbone, the usual FX choice). Hagan's expansion is asymptotic in
+    ``nu^2 T``: the smile is checked for a negative implied density
+    (:func:`sabr_density_factor`) on the plotted strikes, with a note when
+    it has one."""
 
     strikes = smile_strikes(F, atm_vol, T, n_sd)
     alpha = sabr_alpha_from_atm(F, T, atm_vol, beta, rho, nu)
     vols = np.asarray(hagan_sabr_iv(F, strikes, T, alpha, beta, rho, nu), dtype=float)
+    k, g = sabr_density_factor(F, T, strikes, alpha, beta, rho, nu)
+    notes = []
+    ok = bool(np.all(g >= -1e-10))
+    if not ok:
+        i = int(np.argmin(g))
+        bad = strikes[g < -1e-10]
+        notes.append(
+            f"Butterfly arbitrage: Hagan's SABR expansion implies a negative density at {bad.size} of the "
+            f"{strikes.size} plotted strikes, between {bad.min():.6g} and {bad.max():.6g} (min g = {g[i]:.3g} at "
+            f"K = {strikes[i]:.6g}, k = {k[i]:+.3f}). The expansion is asymptotic in ν²T (here {nu * nu * T:.3g}); "
+            "lower ν or T for a usable smile."
+        )
     params = {"SABR α": alpha, "SABR β": beta, "SABR ρ": rho, "SABR ν": nu}
-    return IllustrativeSmile("SABR", F, T, atm_vol, strikes, vols, params, ("SABR β",), (), None)
+    return IllustrativeSmile(
+        "SABR",
+        F,
+        T,
+        atm_vol,
+        strikes,
+        vols,
+        params,
+        ("SABR β",),
+        tuple(notes),
+        ok,
+        lambda K: hagan_sabr_iv(F, K, T, alpha, beta, rho, nu),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Model check
 # ---------------------------------------------------------------------------
 
-FD_TOLERANCE = {"gamma": 5e-4, "vanna": 5e-4, "volga": 5e-4, "charm": 5e-4}  # second differences; others 2e-5
+FD_ERROR_MULTIPLE = 2.0  # analytic and FD agree when |analytic - FD| <= 2 x the FD's own error estimate
 
 
-def model_check(inp: Inputs) -> pd.DataFrame:
-    """Analytic Greeks against central finite differences of the pricer
-    (raw units), with the relative error and a pass flag; the error is
-    measured against ``|fd| + 1e-6 * scale`` so Greeks that are ~0 do not
-    fail on rounding. Raises ``ValueError`` at T = 0 or sigma = 0 (kink)."""
+def model_check(inp: Inputs, greeks: Optional[BSGreeks] = None) -> pd.DataFrame:
+    """Analytic Greeks (``greeks``, default :func:`bs_greeks` of ``inp``)
+    against central finite differences of the pricer, raw units. Each
+    finite difference carries an error estimate (truncation from step
+    halving plus rounding, :func:`derivx.core.bs.finite_difference_estimates`);
+    a Greek passes when ``|analytic - FD| <= 2 x error + 1e-10 |analytic|``.
+    A large error estimate means the finite difference cannot resolve that
+    Greek at these inputs (e.g. a gamma of 1e-13 deep in the money), not
+    that the Greek is wrong. Raises ``ValueError`` at T = 0 or sigma = 0
+    (the price has a kink there)."""
 
-    g = bs_greeks(inp.S, inp.K, inp.T, inp.r, inp.sigma, q=inp.q, call=inp.call)
-    fd = finite_difference_greeks(inp.S, inp.K, inp.T, inp.r, inp.sigma, q=inp.q, call=inp.call)
-    scale = {"delta": 1.0, "gamma": 1.0 / inp.S, "vanna": 1.0, "charm": 1.0}
+    g = greeks if greeks is not None else bs_greeks(inp.S, inp.K, inp.T, inp.r, inp.sigma, q=inp.q, call=inp.call)
+    fd = finite_difference_estimates(inp.S, inp.K, inp.T, inp.r, inp.sigma, q=inp.q, call=inp.call)
     rows = []
     for name in GREEK_NAMES:
-        a, b = float(getattr(g, name)), float(fd[name])
-        err = abs(a - b) / (abs(b) + 1e-6 * scale.get(name, inp.S))
-        tol = FD_TOLERANCE.get(name, 2e-5)
-        rows.append({"greek": name, "analytic": a, "finite difference": b, "relative error": err, "ok": err <= tol})
+        a, b, err = float(getattr(g, name)), fd[name].value, fd[name].error
+        diff = abs(a - b)
+        rows.append(
+            {
+                "greek": name,
+                "analytic": a,
+                "finite difference": b,
+                "FD error estimate": err,
+                "|difference|": diff,
+                "ok": bool(diff <= FD_ERROR_MULTIPLE * err + 1e-10 * abs(a)),
+            }
+        )
     return pd.DataFrame(rows)
 
 

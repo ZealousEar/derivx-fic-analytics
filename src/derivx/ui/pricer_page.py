@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from derivx.calibration.production import ChainCalibration, calibrate_chain
-from derivx.core.bs import BSGreeks, bs_greeks, bs_theta_1d, desk_greeks
+from derivx.core.bs import DAYS_PER_YEAR, BSGreeks, bs_greeks, bs_theta_1d, desk_greeks
 from derivx.ui import pricer_calc as calc
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
 from derivx.ui.state import PERSIST
@@ -278,9 +278,9 @@ def _hero(spec: ModeSpec, inp: calc.Inputs, g: BSGreeks, ccy: Optional[str]) -> 
     sd_text = f"{math.log(inp.K / F) / std:+.2f} SD" if std > 0 else "n/a (σ√T = 0)"
     dec = 2 if spec.name == "EQUITY" else 5
     cells = [
-        ("SPOT", calc.fmt_fixed(inp.S, dec)),
+        ("SPOT", calc.fmt_exact(inp.S, dec)),
         ("FORWARD", calc.fmt_fixed(F, dec)),
-        ("STRIKE", calc.fmt_fixed(inp.K, dec)),
+        ("STRIKE", calc.fmt_exact(inp.K, dec)),
         ("K / F", f"{inp.K / F:.4f}"),
         ("ln(K/F) / σ√T", sd_text),
         ("TENOR", calc.tenor_text(inp.T)),
@@ -392,8 +392,7 @@ def _scenario(spec: ModeSpec, inp: calc.Inputs, position: float, ccy: Optional[s
     days = _num("HORIZON (CALENDAR DAYS)", spec, "scn_days", container=c3, min_value=0.0, max_value=3650.0, step=1.0)
     grid = calc.scenario_grid(inp, position, float(max_spot) / 100.0, float(max_vol) / 100.0, float(days))
     table = grid.table()
-    x_labels = [f"{x * 100:+.3g}%" for x in grid.spot_shocks]
-    y_labels = [f"{v * 100:+.3g}" for v in grid.vol_shocks]
+    x_labels, y_labels = grid.spot_labels, grid.vol_labels
     fig = go.Figure(
         go.Heatmap(
             z=grid.pnl,
@@ -434,6 +433,11 @@ def _scenario(spec: ModeSpec, inp: calc.Inputs, position: float, ccy: Optional[s
         + (
             f" Vol shocks below -{inp.sigma * 100:.2f} pts are omitted (negative vol)."
             if grid.dropped_vol_shocks
+            else ""
+        )
+        + (
+            " The horizon reaches the expiry, so every cell is valued at intrinsic and the vol shocks do not matter."
+            if grid.horizon_days >= inp.T * DAYS_PER_YEAR
             else ""
         )
     )
@@ -632,6 +636,8 @@ def _illustrative_smile(spec: ModeSpec, inp: calc.Inputs, reason: str = "") -> N
         )
     )
     vol_k = smile.vol_at(inp.K) if smile.strikes[0] <= inp.K <= smile.strikes[-1] else None
+    if vol_k is not None and not (np.isfinite(vol_k) and vol_k > 0):
+        vol_k = None  # no usable model vol at K (never expected inside the plotted range)
     fig.add_trace(
         go.Scatter(
             x=[F],
@@ -772,13 +778,16 @@ def _model_check(inp: calc.Inputs, g: BSGreeks) -> None:
         if inp.T <= 0 or inp.sigma <= 0:
             st.caption("Finite differences skipped: at T = 0 or σ = 0 the price has a kink at the forward.")
             return
-        table = calc.model_check(inp)
+        table = calc.model_check(inp, g)
         status = "[OK]" if bool(table["ok"].all()) else "[!]"
         st.markdown(f"Analytic Greeks vs central differences of the pricer {status} (raw units: per 1.00, per year)")
-        st.dataframe(
-            table.assign(**{"relative error": table["relative error"].map(lambda e: f"{e:.1e}")}),
-            hide_index=True,
-            width="stretch",
+        shown = {c: table[c].map(lambda v: f"{v:.10g}") for c in ("analytic", "finite difference")}
+        shown.update({c: table[c].map(lambda e: f"{e:.3e}") for c in ("FD error estimate", "|difference|")})
+        st.dataframe(table.assign(**shown), hide_index=True, width="stretch")
+        st.caption(
+            "Each finite difference is Richardson-extrapolated over halving steps scaled to σ√T, with an error "
+            "estimate (truncation plus rounding). ok: |analytic − FD| ≤ 2 × that estimate. A large estimate means "
+            "the difference cannot resolve that Greek here (e.g. a gamma of 1e-13 deep in the money)."
         )
 
 

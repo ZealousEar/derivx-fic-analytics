@@ -87,7 +87,8 @@ def _undrawn_widget_keys() -> Optional[List[str]]:
 def keep_widget_values() -> List[str]:
     """Keep the values of keyed value widgets that this run did not draw
     (see the module docs); returns the keys kept. Call it once, after every
-    page has been drawn (the shell does, in a ``finally``)."""
+    page has been drawn (the shell does, as its last step; a run that a page
+    aborts with an exception skips it, so that run keeps nothing)."""
 
     global _warned
     try:

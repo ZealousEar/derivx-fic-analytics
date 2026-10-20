@@ -161,8 +161,38 @@ def test_scenario_grid_is_the_position_pnl():
     assert centre == pytest.approx(-200 * decay)  # a short option earns a week of decay
     corner = z[y.index("+5"), x.index("+10%")]
     assert corner == pytest.approx(-200 * (float(bs_price(110, 100, 1 - 7 / 365, 0.05, 0.25)) - 10.450583572185565))
-    table = _frame(at, "+10.0%")
+    table = _frame(at, "+10%")
     assert table.shape == (7, 9)
+
+
+@pytest.mark.parametrize("mode, prefix", [("[ EQUITY ]", "eq"), ("[ FX ]", "fx")])
+def test_smallest_spot_shock_renders_the_whole_page(mode, prefix):
+    """MAX SPOT SHOCK 0.5% (its minimum) printed two spot columns as
+    '-0.1%': Arrow raised 'Duplicate column names found' and the surface,
+    smile and model check below never rendered."""
+
+    at = _app(mode)
+    at.number_input(key=f"{prefix}_scn_spot").set_value(0.5).run()
+    at.number_input(key=f"{prefix}_scn_vol").set_value(0.7).run()
+    assert not at.exception
+    assert set(_charts(at)) == {"scenario", "surface", "smile"}
+    chart = _charts(at)["scenario"]["data"][0]
+    assert chart["x"] == ["-0.50%", "-0.25%", "-0.10%", "-0.05%", "+0%", "+0.05%", "+0.10%", "+0.25%", "+0.50%"]
+    table = _frame(at, "+0.05%")
+    assert table.columns.is_unique and list(table.columns) == chart["x"]
+    assert any(c.value.startswith("Each finite difference") for c in at.caption)  # the model check rendered
+
+
+def test_scenario_horizon_past_expiry_is_valued_at_intrinsic_and_says_so():
+    at = _app()
+    at.number_input(key="eq_scn_days").set_value(400.0).run()
+    assert not at.exception
+    chart = _charts(at)["scenario"]["data"][0]
+    z, x = _arr(chart["z"]), chart["x"]
+    spots = 100.0 * (1 + np.array([float(t.rstrip("%")) / 100 for t in x]))
+    intrinsic_pnl = 100.0 * (np.maximum(spots - 100.0, 0.0) - 10.450583572185565)  # position 100, base 10.4506
+    np.testing.assert_allclose(z, np.broadcast_to(intrinsic_pnl, z.shape))  # every vol row: vol no longer matters
+    assert any("reaches the expiry" in c.value for c in at.caption)
 
 
 def test_surface_domain_scales_with_vol_and_time_not_a_fixed_box():
@@ -266,6 +296,13 @@ def test_model_check_compares_analytic_greeks_with_finite_differences():
     assert list(table["greek"]) == ["delta", "gamma", "vega", "theta", "rho", "phi", "vanna", "volga", "charm"]
     assert bool(table["ok"].all())
     assert any("Analytic Greeks vs central differences of the pricer [OK]" in m.value for m in at.markdown)
+    assert float(table.set_index("greek").loc["vega", "FD error estimate"]) < 1e-6  # a tight check, shown
+    # Deep in the money at 1% vol for 10 years: the old fixed bumps showed '[!]' (volga FD 0.035 vs 0.052).
+    at.number_input(key="eq_strike").set_value(80.0).run()
+    at.number_input(key="eq_T").set_value(10.0).run()
+    at.number_input(key="eq_vol").set_value(0.01).run()
+    assert not at.exception and bool(_frame(at, "greek")["ok"].all())
+    assert any("Analytic Greeks vs central differences of the pricer [OK]" in m.value for m in at.markdown)
 
 
 def test_hero_shows_context_and_no_dollar_sign_outside_usd():
@@ -284,6 +321,9 @@ def test_hero_shows_context_and_no_dollar_sign_outside_usd():
     assert "$" not in hero and "USD" not in hero and "quote-currency units per 1 unit of base currency" in hero
     at.number_input(key="fx_spot").set_value(1.0835).run()
     assert "1.08350" in _hero(at)  # FX precision: the priced spot is what is shown
+    at.number_input(key="fx_spot").set_value(1.083456).run()  # typed with more decimals than the box shows
+    assert "<b>1.083456</b>" in _hero(at)  # was 1.08346, while 1.083456 was priced
+    assert _premium(at) == pytest.approx(float(bs_price(1.083456, 1.08, 0.25, 0.04, 0.08, q=0.025)), abs=1e-6)
 
 
 def _loaded_chain() -> pd.DataFrame:
@@ -322,4 +362,19 @@ def test_fx_page_never_offers_an_equity_chain_as_its_market_smile():
     at.sidebar.radio[0].set_value("[ FX ]").run()
     assert not at.exception
     assert not [r for r in at.radio if r.key == "fx_smile_src"]
+    assert _charts(at)["smile"]["data"][0]["name"] == "SABR (illustrative)"
+
+
+def test_fx_sabr_smile_warns_when_hagan_implies_a_negative_density():
+    """The illustrative SABR smile had no arbitrage check (the SVI one did):
+    with nu^2 T = 20 Hagan's expansion gives a negative density, now stated."""
+
+    at = _app("[ FX ]")
+    assert not any("Butterfly arbitrage" in w.value for w in at.warning)
+    at.number_input(key="fx_T").set_value(5.0).run()
+    at.number_input(key="fx_vol").set_value(0.5).run()
+    at.slider(key="fx_smile_rho").set_value(-0.5).run()
+    at.slider(key="fx_smile_curv").set_value(2.0).run()
+    assert not at.exception
+    assert any("Butterfly arbitrage" in w.value and "ν²T (here 20)" in w.value for w in at.warning)
     assert _charts(at)["smile"]["data"][0]["name"] == "SABR (illustrative)"

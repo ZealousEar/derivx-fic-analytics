@@ -20,6 +20,7 @@ from derivx.core.bs import (
     bs_theta_1d,
     call_flags,
     desk_greeks,
+    finite_difference_estimates,
     finite_difference_greeks,
     forward_price,
     no_arbitrage_bounds,
@@ -100,7 +101,15 @@ def test_textbook_reference_price():
     assert float(bs_price(100, 100, 1, 0.05, 0.2, call=False)) == pytest.approx(5.573526022256971, abs=1e-12)
 
 
+def _natural_scale(name: str, S: float) -> float:
+    return {"delta": 1.0, "gamma": 1.0 / S, "vanna": 1.0, "charm": 1.0}.get(name, S)
+
+
 def test_analytic_greeks_match_finite_differences_of_the_pricer():
+    """Typical inputs: every Greek agrees with the pricer's finite
+    difference within the difference's own error estimate, and that estimate
+    is tight (so the check would see a wrong Greek)."""
+
     rng = np.random.default_rng(20261020)
     for _ in range(200):
         S = float(rng.uniform(20, 300))
@@ -110,10 +119,55 @@ def test_analytic_greeks_match_finite_differences_of_the_pricer():
         sigma = float(rng.uniform(0.05, 0.8))
         call = bool(rng.integers(0, 2))
         g = bs_greeks(S, K, T, r, sigma, q=q, call=call)
-        fd = finite_difference_greeks(S, K, T, r, sigma, q=q, call=call)
+        fd = finite_difference_estimates(S, K, T, r, sigma, q=q, call=call)
+        values = finite_difference_greeks(S, K, T, r, sigma, q=q, call=call)
         for name in GREEK_NAMES:
-            tol = 5e-4 if name in ("gamma", "volga", "vanna", "charm") else 2e-5
-            assert float(getattr(g, name)) == pytest.approx(fd[name], rel=tol, abs=tol * max(S, 1.0) * 1e-3), name
+            a = float(getattr(g, name))
+            assert values[name] == fd[name].value
+            assert abs(a - fd[name].value) <= 2 * fd[name].error + 1e-10 * abs(a), (name, a, fd[name])
+            tight = 1e-4 if name in ("gamma", "vanna", "volga", "charm") else 1e-8
+            assert fd[name].error <= tight * _natural_scale(name, S), (name, fd[name])
+
+
+@pytest.mark.parametrize(
+    "S, K, T, r, q, sigma, call",
+    [
+        (100.0, 80.0, 10.0, -0.01, 0.03, 0.01, True),  # old volga step sigma / 2: FD 0.0353 vs 0.0516
+        (100.0, 50.0, 0.25, 0.05, 0.0, 0.2, True),  # deep ITM: gamma 4e-13, old FD noise -7e-11
+        (100.0, 50.0, 1 / 365, 0.05, 0.0, 5.0, True),  # one day, 500% vol: old theta step 4% of T
+        (100.0, 100.0, 50.0, 0.0, 0.0, 1e-4, True),  # on the forward, tiny vol: old q bump > sigma sqrt(T)
+        (100.0, 100.0, 1e-4, 0.05, 0.0, 1e-4, True),  # 53 minutes, 0.01% vol: old vol bump 10% of sigma
+        (100.0, 97.0, 1e-4, 0.05, 0.0, 1.0, False),
+        (100.0, 50.0, 50.0, 0.5, -0.5, 1e-4, True),  # F = 7e23 S: prices ~1e12, rounding dominates
+        (1.08, 1.2, 7 / 365, 0.04, 0.025, 0.08, False),
+        (5800.0, 4640.0, 30.0, 0.042, 0.013, 0.3, True),
+    ],
+)
+def test_finite_difference_check_has_no_false_alarms_at_extreme_inputs(S, K, T, r, q, sigma, call):
+    """The model check used to report '[!]' for about 1 in 5 valid inputs
+    (fixed bump sizes): scale-aware steps, Richardson extrapolation and an
+    error estimate fix that without loosening the check."""
+
+    g = bs_greeks(S, K, T, r, sigma, q=q, call=call)
+    fd = finite_difference_estimates(S, K, T, r, sigma, q=q, call=call)
+    for name in GREEK_NAMES:
+        a = float(getattr(g, name))
+        assert abs(a - fd[name].value) <= 2 * fd[name].error + 1e-10 * abs(a), (name, a, fd[name])
+
+
+def test_finite_difference_check_sees_small_greek_errors():
+    """A 1e-5 relative error in any Greek is outside the error estimate for
+    an ordinary option (the old 5e-4 / 2e-5 tolerances could not see it)."""
+
+    g = bs_greeks(100.0, 105.0, 0.75, 0.03, 0.25, q=0.01, call=False)
+    fd = finite_difference_estimates(100.0, 105.0, 0.75, 0.03, 0.25, q=0.01, call=False)
+    for name in GREEK_NAMES:
+        wrong = float(getattr(g, name)) * (1 + 1e-5)
+        assert abs(wrong - fd[name].value) > 2 * fd[name].error + 1e-10 * abs(wrong), name
+    with pytest.raises(ValueError, match="kink"):
+        finite_difference_estimates(100.0, 100.0, 0.0, 0.05, 0.2)
+    with pytest.raises(ValueError, match="kink"):
+        finite_difference_estimates(100.0, 100.0, 1.0, 0.05, 0.0)
 
 
 def test_expiry_limits_are_intrinsic_with_a_step_delta_and_no_nan():
