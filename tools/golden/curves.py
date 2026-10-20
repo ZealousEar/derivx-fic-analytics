@@ -119,8 +119,9 @@ def _irs_case() -> dict:
     }
 
 
-def _ust_case() -> dict:
-    day, rows = ust_par_rows()
+def _ust_case(on=None) -> dict:
+    day, rows = ust_par_rows(on)
+    set_evaluation_date(day)
     quotes, _, _ = clean_quotes(rows)
     ours = bootstrap(day, quotes, "USD UST")
     cal = CALENDARS["USGOV"]
@@ -139,7 +140,7 @@ def _ust_case() -> dict:
                 ql.Unadjusted,
                 ql.Unadjusted,
                 ql.DateGeneration.Backward,
-                False,
+                (inst.end + dt.timedelta(days=1)).month != inst.end.month,  # month-end maturities
             )
             helpers.append(
                 ql.FixedRateBondHelper(
@@ -174,4 +175,5 @@ def generate() -> dict:
     cases.append(_irs_case())
     set_evaluation_date(EXAMPLE_ASOF)
     cases.append(_ust_case())
+    cases.append(_ust_case(dt.date(2026, 8, 28)))  # spot on Aug 31: month-end coupon dates
     return {"asof": EXAMPLE_ASOF.isoformat(), "cases": cases}
