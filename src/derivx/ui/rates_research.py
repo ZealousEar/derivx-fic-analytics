@@ -27,6 +27,7 @@ from derivx.rates import pca as pca_mod
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
 from derivx.risk import var as var_mod
+from derivx.risk.scenarios import factor_risk as position_factor_risk
 from derivx.risk.scenarios import vegas as position_vegas
 from derivx.risk.sensitivities import Position
 from derivx.ui import rates_data, rates_risk, rates_scenarios
@@ -64,6 +65,12 @@ BP = st.column_config.NumberColumn(format="%.2f")
 
 def _csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
+
+
+def _download(label: str, data: bytes, file_name: str, key: str) -> None:
+    """CSV download that does not rerun the page when clicked."""
+
+    st.download_button(label, data, file_name=file_name, mime="text/csv", key=key, on_click="ignore")
 
 
 def _num(value: Optional[float], decimals: int = 2) -> str:
@@ -168,32 +175,49 @@ def _keep_in_range(key: str, lo: dt.date, hi: dt.date) -> None:
         st.session_state.pop(key, None)
 
 
+# The cached computations below are keyed on ``data`` = (store fingerprint, dataset, valuation date), which
+# fixes the ``_levels`` frame they read (left out of the hash: hashing a few thousand dated rows on every rerun
+# cost more than the cached work).
+
+
+def _data_key(store: rh.HistoryStore, dataset: str, end: dt.date) -> tuple:
+    return (store.fingerprint, dataset, end)
+
+
 @st.cache_data(show_spinner=False, max_entries=16)
-def _pca(levels: pd.DataFrame, tenors: Tuple[str, ...], start: Optional[dt.date], end: Optional[dt.date]):
-    return pca_mod.pca_curve_changes(levels, tenors, None, start=start, end=end)
+def _pca(data: tuple, tenors: Tuple[str, ...], start: Optional[dt.date], end: Optional[dt.date], _levels):
+    return pca_mod.pca_curve_changes(_levels, tenors, None, start=start, end=end)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def _rolling(levels: pd.DataFrame, tenors: Tuple[str, ...], window: int, start: dt.date, end: dt.date):
-    return pca_mod.rolling_loadings(levels, tenors, window, step=max(1, window // 12), start=start, end=end)
+def _rolling(data: tuple, tenors: Tuple[str, ...], window: int, start: dt.date, end: dt.date, _levels):
+    return pca_mod.rolling_loadings(_levels, tenors, window, step=max(1, window // 12), start=start, end=end)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
-def _stats(levels: pd.DataFrame, weights: Tuple[Tuple[str, float], ...], years: float) -> pd.DataFrame:
-    return rv.rolling_stats(rv.structure_series(levels, dict(weights)), years)
+def _stats(data: tuple, weights: Tuple[Tuple[str, float], ...], years: float, _daily) -> pd.DataFrame:
+    return rv.rolling_stats(rv.structure_series(_daily, dict(weights)), years)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def _rank(
-    levels: pd.DataFrame,
+    data: tuple,
     structures: Tuple[Tuple[str, Tuple[Tuple[str, float], ...]], ...],
     window: str,
     carry_bp: Optional[Tuple[Tuple[str, float], ...]],
     months: Optional[int],
+    _levels,
 ) -> pd.DataFrame:
     return rv.rank_structures(
-        levels, {n: dict(w) for n, w in structures}, window, dict(carry_bp) if carry_bp else None, months
+        _levels, {n: dict(w) for n, w in structures}, window, dict(carry_bp) if carry_bp else None, months
     )
+
+
+def _chart(name: str, key: tuple, build, widget_key: str) -> None:
+    """Draw a figure built once per ``key`` (building the Plotly figure of a
+    few thousand dated points is most of a rerun's time)."""
+
+    st.plotly_chart(_cached(f"fig_{name}", key, build), width="stretch", config=PLOTLY_2D_CONFIG, key=widget_key)
 
 
 def _bond_rows(market: Market, horizon: str, repo: float) -> List[carry.BondCarry]:
@@ -302,6 +326,7 @@ def _render_rv(store: rh.HistoryStore, market: Market) -> None:
     dataset = c1.selectbox("HISTORY", datasets, format_func=_label, key="rs_rv_dataset")
     window = c4.radio("Z-SCORE WINDOW", list(rv.WINDOWS), horizontal=True, key="rs_rv_window")
     levels = _levels(store, dataset, market.asof)
+    data = _data_key(store, dataset, market.asof)
     try:
         name, custom, legs, scheme = _structure_inputs(levels, c2, c3)
     except ValueError as exc:
@@ -311,7 +336,7 @@ def _render_rv(store: rh.HistoryStore, market: Market) -> None:
     if scheme == "PCA":
         pca_tenors = tuple(t for t in pca_mod.DEFAULT_TENORS if t in levels.columns) or tuple(levels.columns)
         try:
-            pca = _pca(levels, pca_tenors, pca_mod.recent_daily_start(levels, pca_tenors), market.asof)
+            pca = _pca(data, pca_tenors, pca_mod.recent_daily_start(levels, pca_tenors), market.asof, levels)
         except ValueError as exc:
             st.error(f"PCA weights need a PCA of this history: {exc}")
             return
@@ -332,11 +357,11 @@ def _render_rv(store: rh.HistoryStore, market: Market) -> None:
             "for statistics. Pick another history or a later valuation date, or use the LIVE source."
         )
         return
-    stats = _stats(daily, tuple(weights.items()), years)
+    stats = _stats(data, tuple(weights.items()), years, daily)
     series = stats["value"]
     snap = rv.snapshot(series, {window: years}).iloc[0]
     try:
-        hl = rv.half_life(series[series.index > series.index[-1] - dt.timedelta(days=int(365.25 * years))])
+        hl = rv.half_life(rv.trailing(series, years))
     except ValueError:
         hl = None
     m1, m2, m3 = st.columns(3)  # three cards a row: four wrap next to the sidebar
@@ -349,11 +374,12 @@ def _render_rv(store: rh.HistoryStore, market: Market) -> None:
     m6.metric("HALF-LIFE (BUS. DAYS)", "none" if hl is None or not hl.mean_reverting else _num(hl.days, 0))
     last = series.index[-1]
     source = _source(store, dataset, last)
-    st.plotly_chart(
-        _rv_chart(stats.dropna(subset=["mean"]), name.split(" (")[0], years, source, last),
-        width="stretch",
-        config=PLOTLY_2D_CONFIG,
-        key="rs_rv_chart",
+    title = name.split(" (")[0]
+    _chart(
+        "rv",
+        (data, tuple(weights.items()), years, title, source),
+        lambda: _rv_chart(stats.dropna(subset=["mean"]), title, years, source, last),
+        "rs_rv_chart",
     )
     covered = (last - snap["from"]).days if snap["from"] is not None else 0
     if covered < 0.9 * 365.25 * years:
@@ -371,7 +397,7 @@ def _render_rv(store: rh.HistoryStore, market: Market) -> None:
         "(Ornstein-Uhlenbeck), ln 2 / kappa business days; 'none' when the fit shows no mean reversion. Being long "
         "the structure means holding minus each weight in DV01 of that leg (a 2s10s steepener: long 2Y, short 10Y)."
     )
-    _rv_ranking(store, market, dataset, levels, window, scheme, pca, custom, name)
+    _rv_ranking(store, market, dataset, levels, data, window, scheme, pca, custom, name)
     _swap_spreads(store, market, window)
 
 
@@ -402,7 +428,7 @@ def _swap_spreads(store: rh.HistoryStore, market: Market, window: str) -> None:
               "z": "Z-SCORE", "pct": "PERCENTILE"}  # fmt: skip
     table = table[list(labels)].rename(columns=labels)
     st.dataframe(table, hide_index=True, width="stretch")
-    st.download_button("Download swap spreads CSV", _csv(table), file_name="swap_spreads.csv", key="rs_rv_spreads_csv")
+    _download("Download swap spreads CSV", _csv(table), file_name="swap_spreads.csv", key="rs_rv_spreads_csv")
     stale = table[[(market.asof - d).days > 10 for d in table["LAST DATE"]]]
     st.caption(
         "Swap spread = par swap rate minus the US Treasury par yield of the same tenor (bp), on the dates both are "
@@ -417,6 +443,7 @@ def _rv_ranking(
     market: Market,
     dataset: str,
     levels: pd.DataFrame,
+    data: tuple,
     window: str,
     scheme: str,
     pca: Optional[pca_mod.PCAResult],
@@ -446,11 +473,12 @@ def _rv_ranking(
     else:
         note = " Carry needs the US Treasury curve: it is shown for the US Treasury history only."
     table = _rank(
-        levels,
+        data,
         tuple((n, tuple(w.items())) for n, w in structures.items()),
         window,
         tuple(carry_bp.items()) if carry_bp else None,
         carry.HORIZONS[horizon],
+        levels,
     )
     if table.empty:
         st.info("No structure of the presets is quoted in this history.")
@@ -476,7 +504,7 @@ def _rv_ranking(
     }
     shown = table.rename(columns=labels)
     st.dataframe(shown, hide_index=True, width="stretch", column_config={c: BP for c in shown.columns[2:8]})
-    st.download_button("Download RV ranking CSV", _csv(shown), file_name="rv_ranking.csv", key="rs_rv_csv")
+    _download("Download RV ranking CSV", _csv(shown), file_name="rv_ranking.csv", key="rs_rv_csv")
     st.caption(
         f"Weights: {scheme} where the structure allows it. Daily vol = sd of the structure's daily changes over the "
         f"window. Carry + roll-down of being long the structure over {horizon}: minus the weighted carry + roll of "
@@ -561,18 +589,17 @@ def _render_carry(store: rh.HistoryStore, market: Market) -> None:
     except ValueError as exc:
         st.error(f"Cannot compute carry and roll-down: {exc}")
         return
-    st.plotly_chart(
-        _carry_chart(table, horizon, source, market.asof, what), width="stretch", config=PLOTLY_2D_CONFIG,
-        key="rs_carry_chart",
-    )  # fmt: skip
+    chart_key = (rates_risk.market_key(market), kind, horizon, round(repo, 10) if bonds else None, source)
+    _chart("carry", chart_key, lambda: _carry_chart(table, horizon, source, market.asof, what), "rs_carry_chart")
     if bonds:
         st.caption(
             f"Long par Treasuries (coupon = the curve's par yield for settlement T+1, price 100) financed in repo at "
             f"{repo:.4f}% ({repo_note}), horizon {horizon}: carry = coupon accrual - financing + pull to par at an "
             "unchanged yield; roll-down = price effect of the bond's yield sliding to its yield on today's Treasury "
-            "quotes rebuilt on the horizon date (static curve). bp = P&L / DV01 per 100 face; currency = bp x the DV01 "
-            "above. Roll-down reads the bootstrapped curve between its pillars, so a bond a month short of a pillar "
-            "can roll slightly negative even where par yields rise with maturity."
+            "curve held static in time to maturity (each remaining cash flow discounted at today's rate for its time "
+            "from the horizon). bp = P&L / DV01 per 100 face; currency = bp x the DV01 above. Between quoted tenors "
+            "the slide follows the bootstrapped curve's interpolation (the sidebar's INTERPOLATION), not a straight "
+            "line between par yields."
         )
         labels = {
             "tenor": "TENOR", "label": "BOND", "ytm": "YIELD", "ytm_roll": "YIELD AT HORIZON (STATIC CURVE)",
@@ -589,13 +616,14 @@ def _render_carry(store: rh.HistoryStore, market: Market) -> None:
         st.caption(
             f"Receive fixed in par OIS swaps on the {rates_risk.curve_title(market, 'curve')} curve ({source}). "
             f"Carry + roll ({horizon}) = forward-starting par minus spot par, F({horizon}, T) - S(0, T): what a "
-            "receiver of the forward-starting swap earns on a static curve. Roll-down = S(0, T) - S(0, T - horizon), "
-            "the slide down the curve; carry = the rest, about fixed minus floating over the horizon divided by the "
-            "duration. bp of swap rate; currency = bp x the DV01 above."
+            "receiver of the forward-starting swap earns on a static curve. Roll-down = S(0, T + horizon) - S(0, T), "
+            "the slide of the rate to the forward swap's end date from maturity T + horizon to T; carry = F(horizon, "
+            f"T) - S(0, T + horizon), the fixed rate against the {horizon} floating rate over the horizon spread over "
+            "the forward annuity. bp of swap rate; currency = bp x the DV01 above."
         )
         labels = {
             "tenor": "TENOR", "spot_par_pct": "SPOT PAR (%)", "forward_par_pct": f"{horizon} FWD PAR (%)",
-            "rolled_par_pct": "T - H PAR (%)", "short_par_pct": f"{horizon} PAR (%)", "carry_bp": "CARRY (BP)",
+            "long_par_pct": "T + H PAR (%)", "short_par_pct": f"{horizon} PAR (%)", "carry_bp": "CARRY (BP)",
             "roll_bp": "ROLL (BP)", "total_bp": "CARRY+ROLL (BP)", "carry_ccy": f"CARRY ({money})",
             "roll_ccy": f"ROLL ({money})", "total_ccy": f"CARRY+ROLL ({money})",
             "dv01_per_mm": f"DV01 PER 1MM ({money})",
@@ -606,8 +634,15 @@ def _render_carry(store: rh.HistoryStore, market: Market) -> None:
                 "The swap curve is built from ILLUSTRATIVE quotes (not market data), so these swap carry and roll "
                 "numbers are illustrative too: paste or upload real quotes on the CURVE tab."
             )
-    st.dataframe(shown, hide_index=True, width="stretch")
-    st.download_button(
+    money_columns = [col for col in shown.columns if col.endswith(f"({money})")]
+    st.dataframe(
+        shown,
+        hide_index=True,
+        width="stretch",
+        column_config={col: (MONEY if col in money_columns else BP) for col in shown.columns if col in money_columns
+                       or col.endswith("(BP)")},
+    )  # fmt: skip
+    _download(
         "Download carry and roll-down CSV", _csv(shown), file_name=f"carry_roll_{what.lower()}_{horizon}.csv",
         key="rs_carry_csv",
     )  # fmt: skip
@@ -706,17 +741,15 @@ def _heatmap(rolling: pca_mod.RollingPCA, factor: str) -> go.Figure:
 def _factor_risk(
     positions: Sequence[Position], market: Market, result: pca_mod.PCAResult, store: rh.HistoryStore
 ) -> Optional[pd.DataFrame]:
-    """P&L per +1 sd daily move of each factor, every curve moving along the
-    loadings (the book's key-rate PV01s x loadings)."""
+    """P&L per +1 sd daily move of each factor, every curve's rate quotes
+    moving along the loadings (the book's key-rate PV01s x loadings; basis
+    spread quotes held, as in the PCA factor shock and the VaR)."""
 
     if not positions:
         return None
     _, risk = rates_scenarios.book_risk(positions, market)
     k = min(3, len(result.tenors))
-    total = np.zeros((k, len(positions)))
-    for key, qr in risk.items():
-        total += pca_mod.factor_pv01(qr.pv01, qr.years, result, k)
-    per_sd = total * result.sigma_bp[:k, None]
+    per_sd = position_factor_risk(market, risk, result, k) * result.sigma_bp[:k, None]
     names = _unique([p.name for p in positions])
     frame = pd.DataFrame(per_sd.T, columns=[f"{pca_mod.factor_name(j)} +1 SD" for j in range(k)])
     frame.insert(0, "POSITION", names)
@@ -732,6 +765,7 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     c1, c2 = st.columns([1, 2])
     dataset = c1.selectbox("HISTORY", datasets, format_func=_label, key="rs_pca_dataset")
     levels = _levels(store, dataset, market.asof)
+    data = _data_key(store, dataset, market.asof)
     options = list(levels.columns)
     default = [t for t in pca_mod.DEFAULT_TENORS if t in options] or options[: min(6, len(options))]
     tenors_key = f"rs_pca_tenors_{dataset}"
@@ -752,7 +786,10 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
         return
     last = levels.index[-1]
     c3, c4, c5 = st.columns(3)
-    start_key, end_key = f"rs_pca_start_{dataset}", f"rs_pca_end_{dataset}"
+    # Keyed on the bounds: a new valuation date, history or tenor set (another daily start) starts the
+    # dates again from the whole daily history to the valuation date, instead of keeping a window chosen
+    # for other data.
+    start_key, end_key = f"rs_pca_start_{dataset}_{first}_{last}", f"rs_pca_end_{dataset}_{first}_{last}"
     _keep_in_range(start_key, first, last)
     _keep_in_range(end_key, first, last)
     start = c3.date_input("FROM", value=first, min_value=first, max_value=last, key=start_key)
@@ -763,7 +800,7 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
         )  # fmt: skip
     )
     try:
-        result = _pca(levels, tuple(tenors), start, end)
+        result = _pca(data, tuple(tenors), start, end, levels)
     except ValueError as exc:
         st.error(f"Cannot run the PCA: {exc}")
         return
@@ -771,9 +808,10 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     m = st.columns(3)
     for j in range(3):
         m[j].metric(f"{pca_mod.factor_name(j)} {pca_mod.FACTOR_LABELS[j]}", f"{100 * result.explained[j]:.1f}%")
-    st.plotly_chart(_loadings_chart(result, source), width="stretch", config=PLOTLY_2D_CONFIG, key="rs_pca_loadings")
-    st.plotly_chart(_explained_chart(result), width="stretch", config=PLOTLY_2D_CONFIG, key="rs_pca_explained")
-    st.plotly_chart(_scores_chart(result, source), width="stretch", config=PLOTLY_2D_CONFIG, key="rs_pca_scores")
+    view = (data, tuple(tenors), start, end, source)
+    _chart("pca_loadings", view, lambda: _loadings_chart(result, source), "rs_pca_loadings")
+    _chart("pca_explained", view, lambda: _explained_chart(result), "rs_pca_explained")
+    _chart("pca_scores", view, lambda: _scores_chart(result, source), "rs_pca_scores")
     dropped = f"; {result.dropped} spanning more than {pca_mod.MAX_GAP_DAYS} days left out" if result.dropped else ""
     st.caption(
         f"PCA of daily changes in bp of {source}, {result.start} to {result.end} ({result.n_obs} changes{dropped}"
@@ -784,13 +822,13 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
         "along each factor."
     )
     try:
-        rolling = _rolling(levels, tuple(tenors), window, start, end)
+        rolling = _rolling(data, tuple(tenors), window, start, end, levels)
     except ValueError as exc:
         st.warning(f"No rolling loadings: {exc}")
         rolling = None
     if rolling is not None:
         factor = st.radio("ROLLING LOADINGS OF", ["PC1", "PC2", "PC3"], horizontal=True, key="rs_pca_heat_factor")
-        st.plotly_chart(_heatmap(rolling, factor), width="stretch", config=PLOTLY_2D_CONFIG, key="rs_pca_heatmap")
+        _chart("pca_heatmap", (view, window, factor), lambda: _heatmap(rolling, factor), "rs_pca_heatmap")
         stable = rolling.stability[factor]
         st.caption(
             f"Loadings of {factor} on windows of {window} daily changes, one every {max(1, window // 12)} changes. "
@@ -804,15 +842,15 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     t1, t2 = st.columns(2)
     with t1:
         st.dataframe(loadings, hide_index=True, width="stretch")
-        st.download_button("Download loadings CSV", _csv(loadings), file_name="pca_loadings.csv", key="rs_pca_csv")
+        _download("Download loadings CSV", _csv(loadings), file_name="pca_loadings.csv", key="rs_pca_csv")
     with t2:
         st.dataframe(explained, hide_index=True, width="stretch")
-        st.download_button("Download explained variance CSV", _csv(explained), file_name="pca_explained.csv",
+        _download("Download explained variance CSV", _csv(explained), file_name="pca_explained.csv",
                            key="rs_pca_explained_csv")  # fmt: skip
     if rolling is not None:
         flat = rolling.loadings.copy()
         flat.columns = [f"{f}_{t}" for f, t in flat.columns]
-        st.download_button(
+        _download(
             "Download rolling loadings CSV", _csv(flat.reset_index()), file_name="pca_rolling_loadings.csv",
             key="rs_pca_rolling_csv",
         )  # fmt: skip
@@ -839,13 +877,13 @@ def _render_factor_risk(
     c, mixed = rates_scenarios.book_currency(positions, market)
     shown = frame.rename(columns={col: f"{col} ({c})" for col in frame.columns[1:]})
     st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[1:]})
-    st.download_button("Download factor risk CSV", _csv(shown), file_name="pca_factor_risk.csv", key="rs_pca_risk_csv")
+    _download("Download factor risk CSV", _csv(shown), file_name="pca_factor_risk.csv", key="rs_pca_risk_csv")
     sd = ", ".join(f"{pca_mod.factor_name(j)} {result.sigma_bp[j]:.2f}bp" for j in range(min(3, len(result.tenors))))
     st.caption(
         f"P&L for a +1 sd daily move of each factor ({sd} a day) on every curve of the book: key-rate PV01s (P&L per "
         "+1bp of each curve quote) times the loadings read at each quote's maturity (linear between the PCA tenors, "
-        f"flat beyond). Every curve moves with this {rh.dataset_info(dataset).title} factor: for the swap curve that "
-        "is a proxy (swap spreads held). Vols held."
+        f"flat beyond); basis spread quotes held, as in the PCA factor shock on SCENARIOS. Every curve moves with this "
+        f"{rh.dataset_info(dataset).title} factor: for the swap curve that is a proxy (swap spreads held). Vols held."
         + (" Totals add amounts in different currencies without FX conversion." if mixed else "")
     )
 
@@ -877,9 +915,11 @@ def _histogram(pnl: np.ndarray, var: float, es: float, c: str, label: str) -> go
     )
 
 
-def _scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> var_mod.VarScenarios:
-    key = (rates_risk.market_key(market), store.label, len(store.frame), lookback)
-    return _cached("var_scen", key, lambda: var_mod.build_scenarios(market, store, lookback))
+def _scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tuple[tuple, var_mod.VarScenarios]:
+    """(cache key, scenarios): keyed on the market and the store's content."""
+
+    key = (rates_risk.market_key(market), store.fingerprint, lookback)
+    return key, _cached("var_scen", key, lambda: var_mod.build_scenarios(market, store, lookback))
 
 
 def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Position]) -> None:
@@ -894,22 +934,32 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     )  # fmt: skip
     try:
         key, risk = rates_scenarios.book_risk(positions, market)
-        scen = _scenarios(market, store, int(lookback))
+        scen_key, scen = _scenarios(market, store, int(lookback))
     except ValueError as exc:
         st.warning(f"No VaR for this valuation date: {exc}")
         return
+    if scen.short:
+        st.warning(
+            f"The daily US Treasury history up to {market.asof} holds only {scen.n} daily changes (from "
+            f"{scen.previous[0]}), not the {scen.lookback} asked for: this VaR uses those {scen.n} days. Pick a later "
+            "valuation date for the full window."
+        )
     names = _unique([p.name for p in positions])
     c, mixed = rates_scenarios.book_currency(positions, market)
     if mixed:
         st.warning(f"The book mixes currencies ({c}): book totals add them without FX conversion.")
-    try:
+
+    def measures():
         pnl = var_mod.sensitivity_pnl(scen, risk)
         delta = var_mod.sensitivity_pnl(scen, risk, gamma=False)
-        table = var_mod.var_table(pnl, names, float(confidence), delta)
+        return pnl, delta, var_mod.var_table(pnl, names, float(confidence), delta)
+
+    try:
+        pnl, delta, table = _cached("var_measures", (key, scen_key, float(confidence)), measures)
     except ValueError as exc:
         st.error(f"Cannot compute VaR: {exc}")
         return
-    full_key = (key, scen.dates, tuple(sorted((k, v.shape) for k, v in scen.bumps.items())), scen.sources)
+    full_key = (key, scen_key)
     full_store = st.session_state.setdefault("_rs_var_full", {})
     sources = scen.sources_table()
     sources["flag"] = sources["flag"].map(FLAG_LABELS).fillna(sources["flag"])
@@ -943,7 +993,8 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     shown_pnl, label = (full, "FULL REVALUATION") if full is not None else (pnl, "DELTA + GAMMA")
     book = shown_pnl.sum(axis=1)
     v, e = var_mod.var_es(book, float(confidence))
-    st.plotly_chart(_histogram(book, v, e, c, label), width="stretch", config=PLOTLY_2D_CONFIG, key="rs_var_hist")
+    hist_key = (key, scen_key, float(confidence), label, c)
+    _chart("var_hist", hist_key, lambda: _histogram(book, v, e, c, label), "rs_var_hist")
     labels = {
         "position": "POSITION", "var": f"HIST VAR ({c})", "es": f"HIST ES ({c})", "worst_loss": f"WORST LOSS ({c})",
         "mean_pnl": f"MEAN P&L ({c})", "sd_pnl": f"SD P&L ({c})", "dn_sigma": f"DELTA-NORMAL SD ({c})",
@@ -955,27 +1006,33 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
         shown[f"FULL-REVAL VAR ({c})"] = full_table["var"].to_numpy()
         shown[f"FULL-REVAL ES ({c})"] = full_table["es"].to_numpy()
     st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[1:]})
-    st.download_button("Download VaR table CSV", _csv(shown), file_name="var_table.csv", key="rs_var_csv")
+    _download("Download VaR table CSV", _csv(shown), file_name="var_table.csv", key="rs_var_csv")
     try:
         vegas = _cached("vegas", key, lambda: position_vegas(positions, market))
     except ValueError:
         vegas = None
     report = var_mod.risk_report(names, risk, table, vegas, [p.vol_model for p in positions])
-    st.download_button(
+    _download(
         "Download risk report CSV (key-rate PV01, gamma, vega, VaR)", _csv(report), file_name="risk_report.csv",
         key="rs_var_report_csv",
     )  # fmt: skip
     worst = var_mod.worst_days(scen, book, 10)
-    worst = worst.rename(columns={"pnl": f"BOOK P&L ({c})", "date": "DATE", "from": "FROM"})
+    names_by_column = {"pnl": f"BOOK P&L ({c})", "date": "DATE", "from": "FROM"}
+    for curve_key in scen.bumps:
+        title = rates_risk.curve_title(market, curve_key)
+        names_by_column[f"{curve_key} max move (bp)"] = f"{title}: LARGEST QUOTE MOVE (BP)"
+        names_by_column[f"{curve_key} at"] = f"{title}: AT"
+    worst = worst.rename(columns=names_by_column)
     st.markdown("#### / WORST DAYS")
-    st.dataframe(worst, hide_index=True, width="stretch")
+    one_dp = st.column_config.NumberColumn(format="%.1f")
+    worst_format = {col: (MONEY if col.startswith("BOOK P&L") else one_dp) for col in worst.columns if "(BP)" in col
+                    or col.startswith("BOOK P&L")}  # fmt: skip
+    st.dataframe(worst, hide_index=True, width="stretch", column_config=worst_format)
     scenario_frame = pd.DataFrame(shown_pnl, columns=names)
     scenario_frame.insert(0, "from", list(scen.previous))
     scenario_frame.insert(0, "date", list(scen.dates))
     scenario_frame[var_mod.TOTAL] = book
-    st.download_button(
-        "Download scenario P&L CSV", _csv(scenario_frame), file_name="var_scenario_pnl.csv", key="rs_var_pnl_csv"
-    )
+    _download("Download scenario P&L CSV", _csv(scenario_frame), file_name="var_scenario_pnl.csv", key="rs_var_pnl_csv")
     st.caption(
         f"One-day {level} VaR and expected shortfall of the book on the valuation date ({market.asof}), from {scen.n} "
         f"daily changes {scen.previous[0]} to {scen.dates[-1]}: each day's change of each curve's history (table "

@@ -246,6 +246,20 @@ class HistoryStore:
         self._dates: Dict[Tuple[str, str], List[dt.date]] = {}
         self._moves: Dict[tuple, CurveMove] = {}
         self._par: Dict[Tuple[str, dt.date], Dict[str, float]] = {}
+        self._fingerprint: Optional[str] = None
+
+    @property
+    def fingerprint(self) -> str:
+        """SHA-256 of the store's rows (dataset, measure, date, tenor,
+        series, value, origin): equal for stores holding the same data, so
+        results computed from a store can be cached on it."""
+
+        if self._fingerprint is None:
+            columns = [c for c in ("dataset", "measure", "asof", "tenor", "series", "value_decimal", "origin")
+                       if c in self.frame.columns]  # fmt: skip
+            rows = pd.util.hash_pandas_object(self.frame[columns].astype(str), index=False).to_numpy()
+            self._fingerprint = hashlib.sha256(rows.tobytes()).hexdigest()
+        return self._fingerprint
 
     # -- coverage ----------------------------------------------------------
 

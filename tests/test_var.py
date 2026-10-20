@@ -205,3 +205,21 @@ def test_scenario_errors(market, store):
     old = rh.build_store([store.frame[store.frame["asof"] <= D("2013-06-28")]], "old")
     with pytest.raises(ValueError, match="daily US Treasury changes"):
         var.build_scenarios(market, old, 250, end=D("2013-06-28"))
+
+
+def test_the_window_is_the_most_recent_daily_stretch(market, store):
+    """Review finding: the last N daily pairs were taken from anywhere in the
+    history, so a VaR on 2015-06-30 over 250 days mixed the 2013 taper
+    tantrum episode window into the 2015 days (135 scenarios from
+    2013-04-29). The window now stops at the first gap and says it is
+    short."""
+
+    scen = var.build_scenarios(market, store, 250, end=D("2015-06-30"))
+    assert scen.previous[0] >= D("2014-12-31") and scen.dates[-1] == D("2015-06-30")
+    assert scen.n == len([d for d in store.dates("UST_PAR") if D("2014-12-31") < d <= D("2015-06-30")])
+    assert scen.short and scen.lookback == 250
+    full = var.build_scenarios(market, store, 250)
+    assert not full.short and full.n == full.lookback == 250
+    days = [D("2013-05-01"), D("2013-05-02"), D("2014-12-31"), D("2015-01-02"), D("2015-01-05")]
+    assert var.recent_daily_pairs(days) == [(D("2014-12-31"), D("2015-01-02")), (D("2015-01-02"), D("2015-01-05"))]
+    assert var.recent_daily_pairs([D("2015-01-02")]) == []
