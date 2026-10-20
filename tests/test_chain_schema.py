@@ -86,6 +86,10 @@ def test_missing_columns_are_listed_with_units_not_a_keyerror():
         ({"expiry": "next friday"}, "expiry: 6 value(s) are not dates"),
         ({"bid": -1.0}, "bid: 6 negative"),
         ({"ticker": ["SPY", "QQQ", "SPY", "SPY", "SPY", "SPY"]}, "several underlyings"),
+        # numbers that are not YYYYMMDD used to be read as nanoseconds since 1970 (session 1970-01-01)
+        ({"trade_date": 46315}, "trade_date: numbers are not dates"),
+        ({"expiry": 1.7952e18}, "expiry: numbers are not dates"),
+        ({"trade_date": "1900-01-02"}, "trade_date: 6 date(s) outside 1990-01-01 .. 2100-12-31"),
     ],
 )
 def test_bad_values_raise_a_readable_error(overrides, fragment):
@@ -177,3 +181,36 @@ def test_frames_hash_is_content_based():
     b[pd.Timestamp("2026-10-20")].loc[0, "bid"] = 0.99
     assert frames_hash(a) != frames_hash(b)
     assert load_sample_chain().fingerprint == load_sample_chain().fingerprint
+
+
+def test_a_file_without_volume_loads_with_a_note_on_the_volume_filter():
+    ds = validate_chain(_chain(), "no_volume.csv")
+    assert any("no volume column" in w and "set min volume to 0" in w for w in ds.warnings)
+    ds = validate_chain(_chain(volume=np.nan), "empty_volume.csv")
+    assert any("volume is empty on every row" in w for w in ds.warnings)
+
+
+def test_provenance_counts_distinct_expiries_and_names_row_sources():
+    two = pd.concat([_chain("2026-10-19", source="synthetic"), _chain("2026-10-20", source="synthetic")])
+    prov = validate_chain(two, "two.csv").provenance()
+    assert prov["expiries"] == 1 and prov["slices"] == 2  # one expiry date seen on two sessions
+    assert prov["row_sources"] == ["synthetic"]
+    assert load_sample_chain().provenance()["row_sources"] == ["yahoo"]
+
+
+def test_integer_yyyymmdd_dates_are_read_as_dates_not_epoch_nanoseconds():
+    """A CSV with 20261020-style dates reaches the validator as int64; it
+    used to become 1970-01-01 and every quote looked expired."""
+
+    raw = _chain(trade_date=20261020, expiry=20261120).to_csv(index=False).encode()
+    frame = read_chain_file("vendor.csv", raw)
+    assert frame["trade_date"].dtype.kind == "i"  # what pandas gives the validator
+    ds = validate_chain(frame, "vendor.csv")
+    assert ds.trade_dates == [pd.Timestamp("2026-10-20")]
+    assert set(ds.single()["expiry"]) == {pd.Timestamp("2026-11-20")}
+
+
+def test_numeric_last_trade_times_are_dropped_with_a_note_not_read_as_1970():
+    ds = validate_chain(_chain(last_trade_date=1_792_526_400), "epoch.csv")
+    assert "last_trade_date" not in ds.single().columns
+    assert any("last_trade_date holds numbers" in w for w in ds.warnings)

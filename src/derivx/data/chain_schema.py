@@ -162,15 +162,29 @@ class ChainDataset:
         return self._fingerprint
 
     def provenance(self) -> Dict[str, object]:
-        """JSON-friendly description for banners and run manifests."""
+        """JSON-friendly description for banners and run manifests:
+        ``expiries`` counts distinct expiry dates, ``slices`` the (trade
+        date, expiry) pairs; ``row_sources`` lists the distinct values of
+        the rows' ``source`` column (e.g. 'yahoo', 'synthetic'), so
+        synthetic rows are named even when the dataset label is a file
+        name."""
 
+        sources: set = set()
+        for df in self.chains.values():
+            if "source" in df.columns:
+                sources |= {str(s) for s in df["source"].dropna().unique()}
+        expiries: set = set()
+        for df in self.chains.values():
+            expiries |= set(pd.to_datetime(df["expiry"]).dt.normalize())
         return {
             "source": self.source,
             "ticker": self.ticker,
             "trade_dates": [d.date().isoformat() for d in self.trade_dates],
             "fetched_at_utc": self.fetched_at_utc,
             "rows": self.rows,
-            "expiries": int(sum(df["expiry"].nunique() for df in self.chains.values())),
+            "expiries": len(expiries),
+            "slices": int(sum(df["expiry"].nunique() for df in self.chains.values())),
+            "row_sources": sorted(sources),
             "files": list(self.files),
             "data_sha256": self.fingerprint,
         }
@@ -216,8 +230,30 @@ def _examples(values: pd.Series, n: int = 3) -> str:
     return ", ".join(repr(v) for v in values.astype(str).unique()[:n])
 
 
+DATE_MIN, DATE_MAX = pd.Timestamp("1990-01-01"), pd.Timestamp("2100-12-31")
+
+
 def _parse_dates(series: pd.Series, name: str, problems: List[str]) -> pd.Series:
-    if pd.api.types.is_datetime64_any_dtype(series):
+    """Dates of a column: ISO / common text formats, datetimes, or integer
+    YYYYMMDD (as vendor files and CSV readers give them). Other numbers
+    (epoch counts, spreadsheet serials) are refused rather than read as
+    nanoseconds since 1970, and dates outside 1990-2100 are reported."""
+
+    if pd.api.types.is_bool_dtype(series):
+        problems.append(f"{name}: true/false values are not dates")
+        return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if pd.api.types.is_numeric_dtype(series):
+        values = pd.to_numeric(series, errors="coerce")
+        finite = values.dropna()
+        yyyymmdd = bool(((finite % 1 == 0) & (finite >= 19000101) & (finite <= 21001231)).all())
+        if not yyyymmdd:
+            problems.append(
+                f"{name}: numbers are not dates (e.g. {_examples(series.dropna())}): use YYYY-MM-DD or YYYYMMDD"
+            )
+            return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+        series = values.map(lambda v: f"{int(v):08d}" if pd.notna(v) else None)
+        parsed = pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+    elif pd.api.types.is_datetime64_any_dtype(series):
         parsed = series
     else:
         with warnings.catch_warnings():  # "could not infer format": the mixed-format retry below handles it
@@ -234,7 +270,14 @@ def _parse_dates(series: pd.Series, name: str, problems: List[str]) -> pd.Series
         problems.append(f"{name}: {int(series.isna().sum())} empty value(s)")
     if getattr(parsed.dt, "tz", None) is not None:
         parsed = parsed.dt.tz_localize(None)  # keep the local calendar date
-    return parsed.dt.normalize().astype("datetime64[ns]")  # one unit everywhere (pandas 2.1 concat needs it)
+    out = parsed.dt.normalize().astype("datetime64[ns]")  # one unit everywhere (pandas 2.1 concat needs it)
+    outside = out.notna() & ((out < DATE_MIN) | (out > DATE_MAX))
+    if outside.any():
+        problems.append(
+            f"{name}: {int(outside.sum())} date(s) outside {DATE_MIN.date()} .. {DATE_MAX.date()} "
+            f"(e.g. {_examples(out[outside].dt.strftime('%Y-%m-%d'))})"
+        )
+    return out
 
 
 def _option_types(series: pd.Series, problems: List[str]) -> pd.Series:
@@ -314,7 +357,15 @@ def validate_chain(df: pd.DataFrame, source: str = "chain", *, ticker: Optional[
     data["trade_date"] = _parse_dates(data["trade_date"], "trade_date", problems)
     data["expiry"] = _parse_dates(data["expiry"], "expiry", problems)
     if "last_trade_date" in data.columns:
-        data["last_trade_date"] = pd.to_datetime(data["last_trade_date"], errors="coerce", utc=True, format="mixed")
+        if pd.api.types.is_numeric_dtype(data["last_trade_date"]) and not data["last_trade_date"].isna().all():
+            # epoch counts in unknown units would be read as nanoseconds since 1970 and flag every quote stale
+            warnings.append(
+                "last_trade_date holds numbers, not times: column dropped, so no staleness filter is applied "
+                "(give ISO-8601 times, e.g. 2026-10-20T19:59:00Z)"
+            )
+            data = data.drop(columns=["last_trade_date"])
+        else:
+            data["last_trade_date"] = pd.to_datetime(data["last_trade_date"], errors="coerce", utc=True, format="mixed")
     tickers: List[str] = []
     if "ticker" in data.columns:
         tickers = sorted({str(t).strip().upper() for t in data["ticker"].dropna() if str(t).strip()})
@@ -342,6 +393,10 @@ def validate_chain(df: pd.DataFrame, source: str = "chain", *, ticker: Optional[
         )
     if "mid" not in data.columns:
         data["mid"] = (data["bid"] + data["ask"]) / 2.0
+    if "volume" not in data.columns:
+        warnings.append("no volume column: a min volume filter cannot be applied (set min volume to 0)")
+    elif data["volume"].isna().all():
+        warnings.append("volume is empty on every row: a min volume filter above 0 removes every quote")
     expired = int((data["expiry"] < data["trade_date"]).sum())
     if expired:
         warnings.append(f"{expired} quote(s) expire before their trade date (dropped as expired before fitting)")

@@ -198,3 +198,43 @@ def test_synthetic_history_is_seeded_and_labelled():
     assert not a[list(a)[-1]]["implied_vol"].equals(c[list(c)[-1]]["implied_vol"])
     frame = a[list(a)[0]]
     assert set(frame["source"]) == {"synthetic"} and set(frame["ticker"]) == {"SYNTH"}
+
+
+def _dm_reference(d, h):
+    """Independent Diebold-Mariano with the Harvey-Leybourne-Newbold factor
+    (rectangular kernel, lags 0 .. h-1), written out term by term."""
+
+    d = np.asarray(d, dtype=float)
+    n, mean = d.size, d.mean()
+    acov = [sum((d[t] - mean) * (d[t - j] - mean) for t in range(j, n)) / n for j in range(h)]
+    var_mean = (acov[0] + 2 * sum(acov[1:])) / n
+    return mean / np.sqrt(var_mean) * np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+
+
+def test_diebold_mariano_accounts_for_overlapping_horizons():
+    rng = np.random.default_rng(3)
+    shocks = rng.standard_normal(41)
+    d = 0.3 + shocks[1:] + 0.8 * shocks[:-1]  # MA(1): what 2-day-ahead forecasts on daily origins produce
+    for h in (1, 2, 3):
+        assert diebold_mariano(d, horizon=h) == pytest.approx(_dm_reference(d, h), rel=1e-12)
+    assert diebold_mariano(d, horizon=1) == pytest.approx(d.mean() / (d.std(ddof=1) / np.sqrt(d.size)))
+    # positively autocorrelated differentials: the naive t overstates significance
+    assert abs(diebold_mariano(d, horizon=2)) < abs(diebold_mariano(d, horizon=1))
+    assert np.isnan(diebold_mariano([1.0, 2.0, 4.0], horizon=3))  # too few days for the horizon
+
+
+def test_summary_scores_days_and_uses_the_run_horizon_for_dm():
+    history = synthetic_history(6)
+    for horizon in (1, 2):
+        res = run_walk_forward(history, horizon=horizon, max_days=45)
+        s = res.summary.set_index("predictor")
+        d = res.daily.set_index("target").sort_index()
+        mse = res.quotes.groupby("target")[["err_svi_sticky_strike", "err_persistence"]].apply(lambda g: (g**2).mean())
+        diff = (mse["err_svi_sticky_strike"] - mse["err_persistence"]).sort_index()
+        assert s.loc["svi_sticky_strike", "dm_t"] == pytest.approx(diebold_mariano(diff, horizon=horizon))
+        wins = int((d["rmse_bp_svi_sticky_strike"] < d["rmse_bp_persistence"]).sum())
+        assert s.loc["svi_sticky_strike", "day_win_n"] == len(d) == s.loc["svi_sticky_strike", "n_days"]
+        assert s.loc["svi_sticky_strike", "day_win_rate"] == pytest.approx(wins / len(d))
+        lo, hi = wilson_interval(wins, len(d))
+        assert (s.loc["svi_sticky_strike", "day_win_lo"], s.loc["svi_sticky_strike", "day_win_hi"]) == (lo, hi)
+        assert s.loc["persistence", "day_win_n"] == 0 and np.isnan(s.loc["persistence", "day_win_rate"])

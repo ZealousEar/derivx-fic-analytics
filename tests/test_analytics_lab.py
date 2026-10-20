@@ -17,12 +17,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from _fake_yahoo import FakeTicker
+from _fake_yahoo import Clock, FakeTicker
 from streamlit.testing.v1 import AppTest
 
 from derivx.data import market_data
-from derivx.data.chain_schema import chain_to_csv, load_chain_file
+from derivx.data.chain_schema import REQUIRED_COLUMNS, chain_to_csv, load_chain_file
 from derivx.data.samples import load_sample_chain
+from derivx.data.synthetic import synthetic_history
 from derivx.ui import analytics_lab as lab
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
@@ -38,6 +39,7 @@ def no_network(monkeypatch):
     def fake_fetch(ticker, **kw):
         calls.append((ticker, kw.get("max_expiries")))
         kw.setdefault("backoff", market_data.Backoff(sleep=lambda s: None))
+        kw.setdefault("now", Clock())  # the recorded session's evening: the test does not depend on today's date
         return market_data.fetch_option_chain(ticker, client_factory=lambda s: FakeTicker(s), request_pause=0.0, **kw)
 
     monkeypatch.setattr(lab, "fetch_option_chain", fake_fetch)
@@ -85,8 +87,10 @@ def test_every_tab_renders_on_the_bundled_sample_without_network(no_network):
     text = _text(at)
     assert "genuine daily snapshots" in text and "tools/download_spy_chains.py" in text
     assert not at.error and no_network == []
-    report = at.dataframe[0].value  # hygiene by expiry
+    report = next(d.value for d in at.dataframe if "removed_itm" in d.value.columns)  # hygiene by expiry
     assert len(report) == 31 and "removed_itm" in report.columns
+    # the sample's recorded fetch status is shown, with the spot drift across its expiry responses
+    assert any(e.label.startswith("Fetch status: ok, spot drift +0.0 bp of spot") for e in at.expander)
     # the pricer page sees the filtered sample with its provenance
     assert at.session_state["market_chain_meta"]["ticker"] == "SPY"
 
@@ -328,3 +332,85 @@ def test_the_equity_page_gets_standard_tenors_of_the_active_chain_with_provenanc
     at.radio(key="eq_smile_src").set_value("MARKET").run()
     assert not at.exception
     assert len(at.selectbox(key="eq_smile_expiry").options) == len(days)
+
+
+def test_a_file_with_only_the_required_columns_never_crashes_the_lab():
+    """volume is optional in the schema: the default min volume filter used to
+    raise a ValueError traceback (with server paths) on such a file."""
+
+    at = _lab()
+    chain = load_sample_chain().single()
+    chain = chain[chain["expiry"] <= "2026-12-31"][list(REQUIRED_COLUMNS)]
+    at.file_uploader(key="lab_upload").set_value(("minimal.csv", chain_to_csv(chain), "text/csv")).run()
+    assert not at.exception and _active(at).source == "upload: minimal.csv"
+    err = "\n".join(e.value for e in at.error)
+    assert "no 'volume' column" in err and "set min volume to 0" in err and "Traceback" not in err
+    at.number_input(key="lab_minvol").set_value(0).run()
+    assert not at.exception and not at.error
+    at.button(key="lab_cal_run").click().run()
+    at.button(key="lab_mc_run").click().run()
+    assert not at.exception and at.session_state[lab.K_CAL]["result"].slices
+
+
+def test_walkforward_files_without_volume_explain_the_filter_instead_of_crashing():
+    at = _lab()
+    files = [
+        (f"d{i}.csv", chain_to_csv(df.drop(columns=["volume"])), "text/csv")
+        for i, df in enumerate(synthetic_history(3).values())
+    ]
+    at.file_uploader(key="lab_wf_upload").set_value(files).run()
+    assert not at.exception
+    assert any("data note(s) on these files" in e.label for e in at.expander)
+    at.number_input(key="lab_wf_maxdays").set_value(20).run()
+    at.button(key="lab_wf_run").click().run()
+    assert not at.exception and lab.K_WF not in at.session_state
+    assert any("no 'volume' column" in e.value for e in at.error)
+    at.number_input(key="lab_wf_minvol").set_value(0).run()
+    at.button(key="lab_wf_run").click().run()
+    assert not at.exception and not at.session_state[lab.K_WF]["result"].empty
+
+
+def test_spot_drift_across_expiry_responses_is_flagged(monkeypatch):
+    class Drifting(FakeTicker):
+        def option_chain(self, expiry):
+            self.spot *= 1.001  # the spot moves 10 bp between consecutive expiry responses
+            return super().option_chain(expiry)
+
+    def drifting_fetch(ticker, **kw):
+        kw["backoff"] = market_data.Backoff(sleep=lambda s: None)
+        return market_data.fetch_option_chain(
+            ticker, client_factory=lambda s: Drifting(s), request_pause=0.0, now=Clock(), **kw
+        )
+
+    monkeypatch.setattr(lab, "fetch_option_chain", drifting_fetch)
+    at = _lab()
+    at.number_input(key="lab_max_exp").set_value(3).run()
+    at.button(key="lab_pull").click().run()
+    assert not at.exception and _active(at).source.startswith("Yahoo Finance")
+    assert any(e.label == "Fetch status: ok, spot drift +20.0 bp of spot" for e in at.expander)
+    assert any("Spot moved +20.0 bp between the first and the last expiry response" in w.value for w in at.warning)
+    assert "SPOT RANGE" in "\n".join(m.value for m in at.markdown)
+
+
+def test_a_model_comparison_error_is_not_shown_against_other_data(monkeypatch):
+    def broken(*a, **k):
+        raise ValueError("4 usable quotes after hygiene; need 8")
+
+    monkeypatch.setattr(lab, "fit_models", broken)
+    at = _lab()
+    at.button(key="lab_mc_run").click().run()
+    assert any("Model comparison failed for this slice" in e.value for e in at.error)
+    chain = load_sample_chain().single()
+    chain = chain[chain["expiry"] <= "2027-03-31"]
+    at.file_uploader(key="lab_upload").set_value(("other.csv", chain_to_csv(chain), "text/csv")).run()
+    assert not any("Model comparison failed" in e.value for e in at.error)
+
+
+def test_synthetic_rows_are_labelled_even_under_a_file_name():
+    at = _lab()
+    day = list(synthetic_history(1).values())[0]
+    at.file_uploader(key="lab_upload").set_value(("my_chain.csv", chain_to_csv(day), "text/csv")).run()
+    assert not at.exception
+    banner = _banners(at)[0]
+    assert "source: upload: my_chain.csv" in banner and "SYNTHETIC ROWS: not market data" in banner
+    assert "dx-lab-banner synthetic" in banner

@@ -52,7 +52,10 @@ def refuse_past_dates(dates: Sequence[Optional[str]], now: Optional[pd.Timestamp
     for value in dates:
         if value is None:
             continue
-        day = pd.Timestamp(dt.date.fromisoformat(value))
+        try:
+            day = pd.Timestamp(dt.date.fromisoformat(value))
+        except ValueError:
+            return f"{value!r} is not a date in YYYY-MM-DD form"
         if day < session:
             return (
                 f"refusing {day.date()}: Yahoo serves only the current chain (the {session.date()} session), so "

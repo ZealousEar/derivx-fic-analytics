@@ -38,9 +38,14 @@ target quotes: a forecast error at that level is within the quoted market.
 ``skill = 1 - RMSE / RMSE(benchmark)`` (> 0: better than the benchmark).
 ``win_rate`` is the share of informative quotes (actual move larger than
 the target's half spread) on which the forecast error is smaller than the
-benchmark's, with a Wilson 95% interval. ``dm_t`` is a Diebold-Mariano
-statistic on the daily mean squared-error differential (clustered by
-target day; negative favours the forecast; needs 3+ days).
+benchmark's, with a Wilson 95% interval that treats quotes as independent
+(quotes of one day move together, so it is too narrow); ``day_win_rate``
+is the share of target days on which the forecast's mean squared error is
+below the benchmark's, with a Wilson interval on days. ``dm_t`` is a
+Diebold-Mariano statistic on the daily mean squared-error differential
+(clustered by target day; overlapping multi-day horizons handled with
+autocovariances up to lag horizon - 1 and the Harvey-Leybourne-Newbold
+correction; negative favours the forecast; needs 3+ days).
 
 Regimes: a constant-maturity 30-day ATM vol per snapshot (ATM vol of each
 slice at k = 0, total variance linear in T between the two expiries that
@@ -149,15 +154,34 @@ def wilson_interval(wins: int, n: int, z: float = 1.96) -> Tuple[float, float]:
     return float(centre - half), float(centre + half)
 
 
-def diebold_mariano(daily_diff: Iterable[float]) -> float:
-    """t-statistic of the mean of a daily loss differential (NaN for fewer
-    than 3 days or zero dispersion)."""
+def diebold_mariano(daily_diff: Iterable[float], horizon: int = 1) -> float:
+    """Diebold-Mariano statistic of the mean of a daily loss differential
+    ``d`` (one value per target day, in date order) with the Harvey,
+    Leybourne and Newbold (1997) small-sample factor ``sqrt((n + 1 - 2h +
+    h(h - 1)/n) / n)``.
+
+    Forecasts ``horizon`` (h) trading days ahead overlap, so consecutive
+    differentials are correlated up to lag h - 1: the variance of the mean
+    is ``(g_0 + 2 sum_{j=1}^{h-1} g_j) / n`` with ``g_j`` the lag-j
+    autocovariance (Diebold and Mariano 1995; Bartlett weights ``1 - j/h``
+    when that estimate is not positive). For h = 1 this is the plain
+    t-statistic ``mean / (sd / sqrt(n))``. NaN for fewer than 3 days, zero
+    dispersion, or too few days for the horizon."""
 
     d = np.asarray([x for x in daily_diff if np.isfinite(x)], dtype=float)
-    if d.size < 3:
+    n = d.size
+    h = max(1, int(horizon))
+    if n < 3:
         return float("nan")
-    sd = float(d.std(ddof=1))
-    return float(d.mean() / (sd / np.sqrt(d.size))) if sd > 0 else float("nan")
+    e = d - d.mean()
+    gamma = [float(np.dot(e[j:], e[: n - j]) / n) for j in range(min(h, n))]
+    var = gamma[0] + 2.0 * sum(gamma[1:])
+    if var <= 0 and len(gamma) > 1:
+        var = gamma[0] + 2.0 * sum((1.0 - j / h) * g for j, g in enumerate(gamma) if j > 0)
+    hln = (n + 1 - 2 * h + h * (h - 1) / n) / n
+    if not var > 0 or hln <= 0:
+        return float("nan")
+    return float(d.mean() / np.sqrt(var / n) * np.sqrt(hln))
 
 
 def constant_maturity_atm_vol(slices: Iterable[CleanSlice], tenor_days: float = 30.0) -> Tuple[float, str]:
@@ -446,8 +470,17 @@ def _daily(quotes: pd.DataFrame, bucket_of: Mapping[pd.Timestamp, str]) -> pd.Da
 
 
 def _summary(quotes: pd.DataFrame) -> pd.DataFrame:
+    """Per predictor, pooled over every scored quote. ``win_*``: quote
+    level (informative quotes only; the Wilson interval treats quotes as
+    independent, which they are not within a day, so it is too narrow);
+    ``day_win_*``: target days on which the forecast's mean squared error
+    is below its benchmark's, with a Wilson interval on days; ``dm_t``:
+    :func:`diebold_mariano` on the daily differential at the run's
+    horizon."""
+
     if quotes.empty:
         return pd.DataFrame()
+    horizon = int(quotes["horizon_td"].max())
     informative = np.abs(quotes["iv_target"] - quotes["iv_origin"]) > quotes["half_spread"].fillna(0.0)
     rows = []
     for name, description in PREDICTORS.items():
@@ -466,16 +499,27 @@ def _summary(quotes: pd.DataFrame) -> pd.DataFrame:
             e_b = quotes[f"err_{bench}"].to_numpy(float)
             row["benchmark_rmse_bp"] = _rmse(e_b) * 1e4
             row["skill"] = _skill(row["rmse_bp"], row["benchmark_rmse_bp"])
-            sq = pd.DataFrame({"day": quotes["target"], "d": err**2 - e_b**2})
-            row["dm_t"] = diebold_mariano(sq.groupby("day")["d"].mean())
-            mask = informative.to_numpy() & np.isfinite(err) & np.isfinite(e_b)
+            both = np.isfinite(err) & np.isfinite(e_b)
+            sq = pd.DataFrame({"day": quotes["target"].to_numpy()[both], "f": err[both] ** 2, "b": e_b[both] ** 2})
+            daily = sq.groupby("day", sort=True)[["f", "b"]].mean()
+            row["dm_t"] = diebold_mariano(daily["f"] - daily["b"], horizon=horizon)
+            mask = informative.to_numpy() & both
             wins = int((np.abs(err[mask]) < np.abs(e_b[mask])).sum())
             n = int(mask.sum())
             lo, hi = wilson_interval(wins, n)
             row.update(win_rate=wins / n if n else np.nan, win_n=n, win_lo=lo, win_hi=hi)
+            day_wins, n_days = int((daily["f"] < daily["b"]).sum()), int(len(daily))
+            dlo, dhi = wilson_interval(day_wins, n_days)
+            row.update(
+                day_win_rate=day_wins / n_days if n_days else np.nan,
+                day_win_n=n_days,
+                day_win_lo=dlo,
+                day_win_hi=dhi,
+            )
         else:
             row.update(benchmark_rmse_bp=np.nan, skill=np.nan, dm_t=np.nan, win_rate=np.nan, win_n=0)
             row.update(win_lo=np.nan, win_hi=np.nan)
+            row.update(day_win_rate=np.nan, day_win_n=0, day_win_lo=np.nan, day_win_hi=np.nan)
         row["description"] = description
         rows.append(row)
     return pd.DataFrame(rows)

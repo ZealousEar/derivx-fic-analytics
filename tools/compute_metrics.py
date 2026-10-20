@@ -119,8 +119,17 @@ def compute(
         if any(not s.empty for s in scores)
         else pd.DataFrame()
     )
-    skipped_df = pd.concat(skipped, ignore_index=True) if skipped else pd.DataFrame()
-    calib_df = pd.concat(calib, ignore_index=True) if calib else pd.DataFrame()
+    # concatenate only non-empty frames (pandas warns about empty ones, and they add nothing)
+    skipped_df = (
+        pd.concat([k for k in skipped if not k.empty], ignore_index=True)
+        if any(not k.empty for k in skipped)
+        else pd.DataFrame(columns=["trade_date", "expiry", "reason"])
+    )
+    calib_df = (
+        pd.concat([c for c in calib if not c.empty], ignore_index=True)
+        if any(not c.empty for c in calib)
+        else pd.DataFrame()
+    )
     per_model = summarise_comparison(scores_df)
     pairs = {
         f"{a}_vs_{b}": pairwise_wins(scores_df, a, b)
@@ -218,11 +227,20 @@ def report_markdown(summary: Dict[str, object]) -> str:
             f"{r['mean_rmse_cv_bp']:.1f} | {r['max_rmse_cv_bp']:.1f} | {r['best_on']} |"
         )
     lines += [""] + [f"- {s}" for s in mc["statements"]]
+    scope = (
+        "These are single-snapshot fit metrics, not forecasts."
+        if summary.get("snapshots", 1) == 1
+        else f"These are fit metrics of each expiry of each of the {summary['snapshots']} snapshots, pooled; they "
+        "are not forecasts (see the walk-forward section)."
+    )
     lines += [
         "",
         "The spline interpolates the quotes, so it is scored out of sample only; with dense strikes it is a strong "
-        "interpolation baseline. These are single-snapshot fit metrics, not forecasts.",
+        f"interpolation baseline. {scope}",
     ]
+    synthetic = [s for s in data.get("row_sources") or [] if "synthetic" in str(s).lower()]
+    if synthetic:
+        lines[2:2] = [f"**SYNTHETIC DATA, NOT MARKET DATA**: rows with source {', '.join(map(str, synthetic))}.", ""]
     cal = summary.get("calibration")
     if cal:
         lines += [
@@ -239,13 +257,31 @@ def report_markdown(summary: Dict[str, object]) -> str:
     wf = summary["walk_forward"]
     lines += ["", "## Walk-forward", ""]
     if wf["status"] == "ok":
-        lines += ["| predictor | RMSE (vol bp) | benchmark | skill | win rate | days |", "|---|---|---|---|---|---|"]
+        lines += [
+            "| predictor | RMSE (vol bp) | benchmark | skill | days won | quote win rate | DM | days |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
         for r in wf["summary"]:
-            skill = "" if r["skill"] is None or not np.isfinite(r["skill"]) else f"{r['skill']:+.3f}"
-            win = "" if r["win_rate"] is None or not np.isfinite(r["win_rate"]) else f"{r['win_rate']:.3f}"
-            lines.append(
-                f"| {r['predictor']} | {r['rmse_bp']:.1f} | {r['benchmark']} | {skill} | {win} | {r['n_days']} |"
+
+            def fmt(key: str, spec: str) -> str:
+                v = r.get(key)
+                return "" if v is None or not np.isfinite(v) else format(v, spec)
+
+            days_won = (
+                f"{round(r['day_win_rate'] * r['day_win_n'])} of {r['day_win_n']}"
+                if r["benchmark"] and r.get("day_win_n")
+                else ""
             )
+            lines.append(
+                f"| {r['predictor']} | {r['rmse_bp']:.1f} | {r['benchmark']} | {fmt('skill', '+.3f')} | {days_won} | "
+                f"{fmt('win_rate', '.3f')} | {fmt('dm_t', '+.2f')} | {r['n_days']} |"
+            )
+        lines += [
+            "",
+            "Days won: target days on which the forecast's mean squared error is below its benchmark's. The quote "
+            "win rate treats quotes as independent (they are not within a day). DM: Diebold-Mariano statistic on the "
+            "daily squared-error differential (negative favours the forecast).",
+        ]
     else:
         lines.append(f"{wf['status']}: {wf['reason']}")
     return "\n".join(lines) + "\n"
@@ -294,19 +330,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"Loaded {ds.rows:,} rows, {len(ds.chains)} snapshot(s) from {ds.source}")
-    result = compute(
-        ds,
-        rate=args.rate,
-        min_volume=args.min_volume,
-        min_mid=args.min_mid,
-        max_spread=args.max_spread,
-        min_days=args.min_days,
-        max_days=args.max_days,
-        sabr_beta=args.sabr_beta,
-        folds=args.folds,
-        calibration=not args.no_calibration,
-        expiries=args.expiries,
-    )
+    try:
+        result = compute(
+            ds,
+            rate=args.rate,
+            min_volume=args.min_volume,
+            min_mid=args.min_mid,
+            max_spread=args.max_spread,
+            min_days=args.min_days,
+            max_days=args.max_days,
+            sabr_beta=args.sabr_beta,
+            folds=args.folds,
+            calibration=not args.no_calibration,
+            expiries=args.expiries,
+        )
+    except ValueError as exc:  # e.g. a min volume filter on files without a volume column
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     manifest = build_manifest(
         "metrics",
         inputs={"argv": list(argv) if argv is not None else sys.argv[1:], **result["summary"]["filters"]},

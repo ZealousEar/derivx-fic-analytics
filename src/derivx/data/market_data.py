@@ -227,11 +227,18 @@ def fetch_option_chain(
     request_pause: float = 0.2,
     client_factory: Optional[Callable[[str], Any]] = None,
     now: Callable[[], pd.Timestamp] = _utc_now,
+    min_days: Optional[float] = None,
 ) -> ChainFetch:
     """Download the current chain of ``ticker`` (see the module docs).
 
     ``expiries`` (YYYY-MM-DD, must all be listed by Yahoo) restricts the
-    request; ``max_expiries`` keeps the nearest N of them. ``backoff`` is
+    request; ``max_expiries`` keeps the nearest N of them. ``min_days``
+    (None: request everything listed) skips listed expiries fewer than that
+    many calendar days after the New York date of the fetch (after the
+    close Yahoo still lists the day's expired expiry; an analysis that
+    cannot fit short slices need not spend requests on them), before
+    ``max_expiries`` is applied; the skipped expiries are named in
+    ``status.notes``. ``backoff`` is
     the retry policy (default :class:`Backoff()`); ``request_pause`` seconds
     separate expiry requests. ``client_factory`` (tests) replaces
     ``yfinance.Ticker``. Never raises for network failures (see
@@ -284,6 +291,17 @@ def fetch_option_chain(
         targets = [e for e in available if e in set(wanted)]
     else:
         targets = list(available)
+    if min_days is not None:
+        today = session_date(pd.Timestamp(status.started_at_utc))
+        short = [e for e in targets if (pd.Timestamp(e) - today).days < float(min_days)]
+        if short:
+            targets = [e for e in targets if e not in set(short)]
+            status.notes.append(
+                f"not requested: {len(short)} expiry(ies) fewer than {float(min_days):g} days after "
+                f"{today.date()} (New York): {', '.join(short[:6])}{'...' if len(short) > 6 else ''}"
+            )
+        if not targets:
+            return finish("empty", f"no listed expiry is at least {float(min_days):g} days after {today.date()}")
     if max_expiries is not None:
         targets = targets[: int(max_expiries)]
     status.expiries_requested = targets
@@ -393,24 +411,35 @@ def apply_liquidity_filters(
     max_spread: Optional[float] = 0.2,
     min_mid: float = 0.1,
 ) -> pd.DataFrame:
-    """Keep quotes with ``volume >= min_volume`` (missing volume counts as
-    0), ``bid > 0``, ``ask > bid``, ``mid >= min_mid`` (premium per share)
-    and, unless ``max_spread`` is None, relative spread ``(ask - bid) / mid
-    <= max_spread``. Calls and puts are both kept (put-call parity needs
-    them); the OTM selection, dedupe, IV-placeholder, expiry and staleness
-    rules are :mod:`derivx.vol.quotes` hygiene, applied per slice before any
-    fit (see :func:`hygiene_report`)."""
+    """Keep quotes with ``volume >= min_volume`` (a missing volume on a row
+    counts as 0), ``bid > 0``, ``ask > bid``, ``mid >= min_mid`` (premium
+    per share) and, unless ``max_spread`` is None, relative spread ``(ask -
+    bid) / mid <= max_spread``. Calls and puts are both kept (put-call parity
+    needs them); the OTM selection, dedupe, IV-placeholder, expiry and
+    staleness rules are :mod:`derivx.vol.quotes` hygiene, applied per slice
+    before any fit (see :func:`hygiene_report`).
 
-    required = {"bid", "ask", "volume"}
-    missing = required - set(chain.columns)
+    ``volume`` is an optional column of the chain schema: without it the
+    volume filter cannot be applied, so ``min_volume`` must be 0 (raises
+    ``ValueError`` otherwise, rather than silently dropping every quote or
+    silently skipping the filter)."""
+
+    missing = {"bid", "ask"} - set(chain.columns)
     if missing:
         raise ValueError(f"chain is missing column(s) {sorted(missing)} needed by the liquidity filters")
     if min_volume < 0 or min_mid < 0 or (max_spread is not None and max_spread <= 0):
         raise ValueError("min_volume and min_mid must be >= 0 and max_spread > 0 (or None)")
+    if "volume" not in chain.columns and min_volume > 0:
+        raise ValueError(
+            f"this chain has no 'volume' column, so the min volume filter ({min_volume}) cannot be applied: "
+            "set min volume to 0 to use it without a volume filter"
+        )
     filtered = chain.copy()
     bid, ask = filtered["bid"].astype(float), filtered["ask"].astype(float)
     mid = (bid + ask) / 2.0
-    cond = filtered["volume"].fillna(0) >= min_volume
+    cond = pd.Series(True, index=filtered.index)
+    if min_volume > 0:
+        cond &= filtered["volume"].fillna(0) >= min_volume
     cond &= bid.fillna(0) > 0
     cond &= ask.fillna(0) > bid.fillna(0)
     cond &= mid.fillna(0) >= min_mid
