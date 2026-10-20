@@ -313,17 +313,17 @@ def test_bad_uploads_and_old_dates_are_explained_not_crashed():
 
 def test_a_date_missing_from_the_new_data_source_is_reported(monkeypatch):
     cache = DiskCache(Path(os.environ["DERIVX_CACHE_DIR"]))
-    text = (FIXTURES / "fred_ust.csv").read_text().replace("2026-10-13", "2015-06-15")
+    text = (FIXTURES / "fred_ust.csv").read_text().replace("2026-10-13", "2011-06-15")
     cache.store(cache.key("FRED", {"ids": "mid-month"}), rs.parse_fred_csv(text), b"x", {"source": "FRED", "url": "f"})
     monkeypatch.setattr(rh, "refresh_live", lambda *a, **kw: rh.LiveRefresh(ok={"FRED": True}))
     rates_data._refresh.clear()
     at = _rates()
     at.radio(key="rates_source").set_value("LIVE (CACHED)").run()
-    at.selectbox(key="rates_asof").set_value(dt.date(2015, 6, 15)).run()
-    assert not at.exception and _badge(at, "rates_treasury_chart").endswith("AS OF 2015-06-15")
+    at.selectbox(key="rates_asof").set_value(dt.date(2011, 6, 15)).run()  # the bundled sample has month ends in 2011
+    assert not at.exception and _badge(at, "rates_treasury_chart").endswith("AS OF 2011-06-15")
     at.radio(key="rates_source").set_value("BUNDLED SNAPSHOT").run()
     assert not at.exception and at.selectbox(key="rates_asof").value == EXAMPLE_ASOF
-    expected = "VALUATION DATE 2015-06-15 is not in the BUNDLED SNAPSHOT history; showing 2026-10-19 instead."
+    expected = "VALUATION DATE 2011-06-15 is not in the BUNDLED SNAPSHOT history; showing 2026-10-19 instead."
     assert any(w.value == expected for w in at.warning)
     rates_data._refresh.clear()
 

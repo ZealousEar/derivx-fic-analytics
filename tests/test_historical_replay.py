@@ -120,7 +120,7 @@ def test_history_window_replays_any_dates(store):
     with pytest.raises(ValueError, match="must be after"):
         history_window(EXAMPLE_ASOF, D("2026-09-01"))
     with pytest.raises(ValueError, match="within 7 days"):
-        history_window(D("2019-06-12"), D("2026-09-01"))  # mid-month 2019 is not in the sample
+        history_window(D("2011-06-15"), D("2026-09-01"))  # mid-month 2011 is not in the sample (daily from 2015)
 
 
 def test_uploaded_history_comes_first_and_missing_markets_fall_back(store):

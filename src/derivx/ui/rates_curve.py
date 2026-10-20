@@ -207,8 +207,8 @@ def _sidebar(data: rates_data.RatesData) -> Tuple[dt.date, str, str]:
         key="rates_asof",
         help=(
             f"Dates with a US Treasury par curve in the history store ({len(dates)} dates, {dates[-1]} to "
-            f"{dates[0]}): every business day of the bundled year, month ends before it, and whatever the live "
-            "cache or your uploads add."
+            f"{dates[0]}): every business day since 2015 (FRED H.15, then the Treasury's 2026 CSV), month ends "
+            "and the scenario episodes before that, and whatever the live cache or your uploads add."
         ),
     )
     rates_data.remember("rates_asof")
