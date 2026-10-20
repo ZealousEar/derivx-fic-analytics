@@ -243,3 +243,26 @@ def test_vectorised_solver_is_fast():
     ok = res.ok
     assert ok.mean() > 0.98
     np.testing.assert_allclose(black_price(F[ok], K[ok], T[ok], res.vol[ok], call[ok]), p[ok], rtol=1e-9, atol=1e-12)
+
+
+def test_price_within_rounding_of_the_bound_gets_no_vol():
+    """Review: an ITM put whose OTM-equivalent call sits at F to float
+    precision (std 40) came back 'ok' with 325% vol instead of 808%; the
+    ITM -> OTM parity subtraction loses more than 4 eps of the bound."""
+
+    F, K, T, vol = 3.064916374950069, 37.523517370675755, 24.97128674243225, 8.082468319588973
+    df = 0.97
+    p = black_price(F, K, T, vol, False, df)
+    res = implied_black_vol(p, F, K, T, False, df)
+    assert res.status == "above_upper_bound" and np.isnan(res.vol)
+    # the same vol at a shorter tenor is still identifiable and round-trips
+    p2 = black_price(F, K, 1.0, vol, False, df)
+    assert float(implied_black_vol(p2, F, K, 1.0, False, df).vol) == pytest.approx(vol, rel=1e-8)
+
+
+def test_subnormal_otm_price_has_no_identifiable_vol():
+    p = black_price(0.2613582326694147, 0.6404068907796372, 0.0014690485187696634, 0.6204575005611779, True)
+    assert 0 < p < np.finfo(float).tiny
+    res = implied_black_vol(p, 0.2613582326694147, 0.6404068907796372, 0.0014690485187696634, True)
+    assert res.status == "no_time_value"
+    assert implied_normal_vol(5e-324, 0.0095, 0.00147, 0.0298, False).status == "no_time_value"
