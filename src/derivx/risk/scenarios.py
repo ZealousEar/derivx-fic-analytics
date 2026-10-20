@@ -24,6 +24,14 @@ The Greeks are those of the rolled market, so a trade that matures before
 the horizon has no delta and the residual holds only third- and
 higher-order terms.
 
+Historical shocks (:func:`historical`, :func:`history_window`) replay
+each curve's own history where a free one exists: the Treasury curve moves
+by the Treasury's par yield changes, and the swap curve by the swap/OIS
+history of its currency (ICE USD swap rates before 2016-10-28, the Bank of
+England's OIS curve for GBP, or the user's uploaded history), otherwise by a
+flagged proxy (government yield changes, i.e. swap spreads held). Each shock
+records the data behind every curve in ``Shock.sources``.
+
 The key-rate gammas reuse the +/-1bp revaluations of the PV01s. On a
 bootstrapped curve the cross-gammas are not small (the 10Y swap's annuity
 moves with every shorter quote; diagonal gammas alone leave ~3% of a 100bp
@@ -36,23 +44,53 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
+from derivx.data.rates_history import EPISODE_TOLERANCE_DAYS, HistoryStore, bundled_store, dataset_info, user_dataset
 from derivx.rates.conventions import Date, parse_tenor
 from derivx.rates.curves import Curve, Market
-from derivx.rates.examples import DATA_DIR
 from derivx.risk.sensitivities import CURVE_FIELDS, Position
 
-HISTORICAL_CSV = DATA_DIR / "historical_curve_shocks.csv"
 NORMAL_VOL_UNIT = 1e-4  # 1bp of normal vol
 LOGNORMAL_VOL_UNIT = 0.01  # 1 lognormal vol point
 EXPLAIN_COLUMNS = ("delta", "gamma", "cross_gamma", "vol", "carry", "residual")
 ROW_COLUMNS = ("position", "kind", "base_pv", "shocked_pv", "cash", "pnl") + EXPLAIN_COLUMNS
 TOTAL = "TOTAL"
+GOVT_KINDS = ("BILL", "BOND")
+Profile = Tuple[Tuple[float, float], ...]
+
+# Named historical windows (nominal dates; each curve uses its nearest
+# complete curves within EPISODE_TOLERANCE_DAYS).
+EPISODES: Tuple[Tuple[str, dt.date, dt.date], ...] = (
+    ("2013 taper tantrum", dt.date(2013, 5, 2), dt.date(2013, 9, 5)),
+    ("2020 dash for cash", dt.date(2020, 3, 9), dt.date(2020, 3, 18)),
+    ("2022 hiking cycle", dt.date(2022, 1, 3), dt.date(2022, 10, 21)),
+    ("Sept 2022 gilt crisis week", dt.date(2022, 9, 21), dt.date(2022, 9, 28)),
+    ("2023 SVB", dt.date(2023, 3, 8), dt.date(2023, 3, 15)),
+)
+CURRENCIES = ("USD", "EUR", "GBP")
+GOVT_HISTORY = {"USD": "UST_PAR"}
+SWAP_HISTORY = {"USD": ("USD_SWAP_ICE",), "GBP": ("GBP_OIS_BOE",), "EUR": ()}  # real swap/OIS histories
+SWAP_PROXIES = {"USD": ("UST_PAR",), "GBP": ("UST_PAR",), "EUR": ("EUR_AAA_ECB", "UST_PAR")}
+
+
+@dataclass(frozen=True)
+class ReplaySource:
+    """The data a historical shock uses for one curve: ``selector`` is
+    ``"<curve field>:<currency>"``, ``flag`` one of ``"real"`` (the curve's
+    own market), ``"upload"`` (the user's history), ``"proxy"`` (another
+    market's moves, same currency) or ``"cross-currency proxy"``."""
+
+    selector: str
+    dataset: str
+    title: str
+    start: str
+    end: str
+    flag: str
+    note: str
 
 
 # --------------------------------------------------------------------------
@@ -83,15 +121,17 @@ class Shock:
     lognormal_vol_pts: float = 0.0
     horizon_days: int = 0
     description: str = ""
+    profiles: Tuple[Tuple[str, Profile], ...] = ()
+    sources: Tuple[ReplaySource, ...] = ()
 
     def __post_init__(self) -> None:
-        points = tuple(sorted((float(y), float(b)) for y, b in self.profile))
-        years = [y for y, _ in points]
-        if any(not math.isfinite(v) for p in points for v in p) or any(y < 0 for y in years):
-            raise ValueError("profile points must be finite (years >= 0, bp)")
-        if len(set(years)) != len(years):
-            raise ValueError(f"profile has two moves at the same tenor: {years}")
-        object.__setattr__(self, "profile", points)
+        object.__setattr__(self, "profile", _clean_profile(self.profile))
+        cleaned = tuple((str(sel), _clean_profile(prof)) for sel, prof in self.profiles)
+        selectors = [sel for sel, _ in cleaned]
+        if len(set(selectors)) != len(selectors) or any(":" not in sel for sel in selectors):
+            raise ValueError(f"profiles need distinct '<curve>:<currency>' selectors, got {selectors}")
+        object.__setattr__(self, "profiles", cleaned)
+        object.__setattr__(self, "sources", tuple(self.sources))
         optional = ("short_bp", "long_bp")
         for label in optional + ("normal_vol_bp", "lognormal_vol_pts"):
             value = getattr(self, label)
@@ -105,12 +145,29 @@ class Shock:
             raise ValueError("horizon_days must be a whole number of days >= 0")
         object.__setattr__(self, "horizon_days", int(days))
 
-    def points(self, span: Optional[Tuple[float, float]] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """(years, bp) of the profile, with the end anchors placed at
-        ``span`` = (shortest, longest) quote years when given."""
+    def profile_for(self, which: Optional[str] = None, currency: Optional[str] = None) -> Profile:
+        """The profile for one curve: ``profiles["<which>:<currency>"]``,
+        else ``profiles["<which>:*"]``, else ``profile``."""
 
-        xs = [y for y, _ in self.profile]
-        ys = [b for _, b in self.profile]
+        if which is not None:
+            table = dict(self.profiles)
+            for selector in (f"{which}:{currency}", f"{which}:*"):
+                if selector in table:
+                    return table[selector]
+        return self.profile
+
+    def points(
+        self,
+        span: Optional[Tuple[float, float]] = None,
+        which: Optional[str] = None,
+        currency: Optional[str] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """(years, bp) of the profile for a curve, with the end anchors
+        placed at ``span`` = (shortest, longest) quote years when given."""
+
+        profile = self.profile_for(which, currency)
+        xs = [y for y, _ in profile]
+        ys = [b for _, b in profile]
         if span is not None:
             lo, hi = span
             if self.short_bp is not None and (not xs or lo < xs[0]):
@@ -120,30 +177,50 @@ class Shock:
         return np.array(xs, dtype=float), np.array(ys, dtype=float)
 
     def bp_at(
-        self, years: Union[float, Sequence[float], np.ndarray], span: Optional[Tuple[float, float]] = None
+        self,
+        years: Union[float, Sequence[float], np.ndarray],
+        span: Optional[Tuple[float, float]] = None,
+        which: Optional[str] = None,
+        currency: Optional[str] = None,
     ) -> np.ndarray:
         """Move in bp at tenors in years (flat beyond the profile)."""
 
-        xs, ys = self.points(span)
+        xs, ys = self.points(span, which, currency)
         years = np.atleast_1d(np.asarray(years, dtype=float))
         if not xs.size:
             return np.zeros_like(years)
         return np.interp(years, xs, ys)
 
-    def quote_bumps(self, curve: Curve) -> np.ndarray:
-        """bp move of each of ``curve.quotes``."""
+    def quote_bumps(self, curve: Curve, which: Optional[str] = None) -> np.ndarray:
+        """bp move of each of ``curve.quotes``. ``which`` (``"curve"`` or
+        ``"govt"``) picks the per-curve profile; by default a curve built
+        only from bills and bonds is the government curve."""
 
         if not curve.instruments:
             raise ValueError("the curve has no quotes to shock; bootstrap it from quotes")
+        if which is None:
+            which = "govt" if all(inst.kind in GOVT_KINDS for inst in curve.instruments) else "curve"
+        currency = curve.conventions.currency if curve.conventions is not None else None
         years = np.array([inst.tenor.years for inst in curve.instruments])
-        return self.bp_at(years, (float(years.min()), float(years.max())))
+        return self.bp_at(years, (float(years.min()), float(years.max())), which, currency)
 
     @property
     def moves_rates(self) -> bool:
         """True if some quote of a curve the shock applies to moves."""
 
         moves = [b for _, b in self.profile] + [b for b in (self.short_bp, self.long_bp) if b is not None]
+        moves += [b for _, profile in self.profiles for _, b in profile]
         return (self.curve or self.govt) and any(b != 0.0 for b in moves)
+
+
+def _clean_profile(profile: Sequence[Tuple[float, float]]) -> Profile:
+    points = tuple(sorted((float(y), float(b)) for y, b in profile))
+    years = [y for y, _ in points]
+    if any(not math.isfinite(v) for p in points for v in p) or any(y < 0 for y in years):
+        raise ValueError("profile points must be finite (years >= 0, bp)")
+    if len(set(years)) != len(years):
+        raise ValueError(f"profile has two moves at the same tenor: {years}")
+    return points
 
 
 def _shock(name: str, profile, settings: Mapping[str, object], **fields) -> Shock:
@@ -235,52 +312,159 @@ def key_rates(moves: Mapping[Union[str, float], float], **settings) -> Shock:
 
 
 # --------------------------------------------------------------------------
-# Historical episodes
+# Historical episodes and windows
 # --------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
-def _historical() -> pd.DataFrame:
-    # round_trip keeps 1/12 years exact, so the 1M move lands on 1M quotes.
-    frame = pd.read_csv(HISTORICAL_CSV, float_precision="round_trip")
-    missing = {"episode", "start", "end", "tenor_years", "change_bp", "source"} - set(frame.columns)
-    if missing:
-        raise ValueError(f"{HISTORICAL_CSV.name} is missing columns {sorted(missing)}")
-    return frame
-
-
-def historical_table() -> pd.DataFrame:
-    """The shipped episodes: ``episode, start, end, tenor_years, change_bp,
-    source`` (US Treasury constant-maturity yield changes from FRED)."""
-
-    return _historical().copy()
-
-
 def historical_episodes() -> List[str]:
-    return list(dict.fromkeys(_historical()["episode"]))
+    return [name for name, _, _ in EPISODES]
 
 
-def historical(name: str, scale: float = 1.0, **settings) -> Shock:
-    """Replay a historical episode's Treasury yield changes (times
-    ``scale``) on the quotes; read from data/examples, no network."""
+def _episode(name: str) -> Tuple[dt.date, dt.date]:
+    for episode, start, end in EPISODES:
+        if episode == name:
+            return start, end
+    raise ValueError(f"unknown episode {name!r}; expected one of {historical_episodes()}")
 
-    frame = _historical()
-    rows = frame[frame["episode"] == name]
-    if rows.empty:
-        raise ValueError(f"unknown episode {name!r}; expected one of {historical_episodes()}")
-    start, end = rows["start"].iloc[0], rows["end"].iloc[0]
+
+def _replay_source(selector: str, move, flag: str, note: str) -> ReplaySource:
+    info = dataset_info(move.dataset)
+    return ReplaySource(selector, move.dataset, info.title, move.start.isoformat(), move.end.isoformat(), flag, note)
+
+
+def _swap_move(store: HistoryStore, currency: str, start: dt.date, end: dt.date, tolerance: int):
+    """(move, flag, note) for a currency's swap curve: the user's history,
+    then real swap/OIS history, then the proxies in order."""
+
+    candidates = [(user_dataset(currency), "upload")]
+    candidates += [(key, "real") for key in SWAP_HISTORY.get(currency, ())]
+    candidates += [(key, "proxy" if dataset_info(key).currency == currency else "cross-currency proxy")
+                   for key in SWAP_PROXIES.get(currency, ("UST_PAR",))]  # fmt: skip
+    errors = []
+    for key, flag in candidates:
+        if not store.has(key):
+            continue
+        try:
+            move = store.curve_move(key, start, end, tolerance)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        info = dataset_info(key)
+        if flag == "upload":
+            note = f"your uploaded {currency} swap history ({move.what})"
+        elif flag == "real":
+            note = f"{info.title}: {move.what}"
+            if key == "USD_SWAP_ICE":
+                note += " (LIBOR swaps: their moves stand in for SOFR swap moves before SOFR swaps traded)"
+        elif flag == "proxy":
+            note = (
+                f"no free {currency} swap history for these dates: {info.title} {move.what} "
+                "as a proxy (swap spreads held)"
+            )
+        else:
+            note = (
+                f"no {currency} history for these dates: {info.title} {move.what} as a cross-currency proxy; "
+                f"upload {currency} swap history for a real replay"
+            )
+        return move, flag, note
+    raise ValueError(f"no {currency} swap-curve or proxy history for {start} to {end}: " + "; ".join(errors))
+
+
+def _replay(
+    name: str, start: dt.date, end: dt.date, scale: float, store: Optional[HistoryStore], tolerance: int, settings
+) -> Shock:
+    store = store or bundled_store()
+    if not math.isfinite(scale):
+        raise ValueError("the scale must be a finite number")
+    govt = store.curve_move(GOVT_HISTORY["USD"], start, end, tolerance)
+    profiles, sources = [], [_replay_source("govt:USD", govt, "real", f"US Treasury {govt.what}")]
+    for currency in CURRENCIES:
+        move, flag, note = _swap_move(store, currency, start, end, tolerance)
+        profiles.append((f"curve:{currency}", tuple((y, b * scale) for y, b in move.profile)))
+        sources.append(_replay_source(f"curve:{currency}", move, flag, note))
     label = name if scale == 1.0 else f"{name} x{scale:g}"
     return _shock(
         label,
-        zip(rows["tenor_years"], rows["change_bp"] * float(scale)),
+        [(y, b * scale) for y, b in govt.profile],
         settings,
-        description=f"UST constant-maturity yield changes {start} to {end} (FRED)",
+        description=f"historical curve changes {start} to {end}, each curve from its own data (see sources)",
+        profiles=tuple(profiles),
+        sources=tuple(sources),
     )
 
 
-def standard_library() -> List[Shock]:
+def historical(name: str, scale: float = 1.0, store: Optional[HistoryStore] = None, **settings) -> Shock:
+    """Replay a named episode (:data:`EPISODES`) times ``scale``: the
+    Treasury curve by US Treasury par yield changes, each swap curve by its
+    currency's swap/OIS history or a flagged proxy (see ``Shock.sources``).
+    ``store`` defaults to the committed history sample (no network)."""
+
+    start, end = _episode(name)
+    return _replay(name, start, end, float(scale), store, EPISODE_TOLERANCE_DAYS, settings)
+
+
+def history_window(
+    start: dt.date,
+    end: dt.date,
+    scale: float = 1.0,
+    store: Optional[HistoryStore] = None,
+    tolerance_days: int = 7,
+    **settings,
+) -> Shock:
+    """Replay the curve changes between any two dates of the history store
+    (nearest complete curves within ``tolerance_days``), like
+    :func:`historical`."""
+
+    if end <= start:
+        raise ValueError(f"the window end ({end}) must be after its start ({start})")
+    return _replay(f"History {start} to {end}", start, end, float(scale), store, tolerance_days, settings)
+
+
+def historical_table(store: Optional[HistoryStore] = None) -> pd.DataFrame:
+    """US Treasury moves of every episode: ``episode, start, end,
+    tenor_years, change_bp, source`` (start/end are the dates used)."""
+
+    store = store or bundled_store()
+    rows = []
+    for name, start, end in EPISODES:
+        move = store.curve_move(GOVT_HISTORY["USD"], start, end, EPISODE_TOLERANCE_DAYS)
+        for years, bp, series in zip(move.years, move.change_bp, move.series):
+            rows.append(
+                {
+                    "episode": name,
+                    "start": move.start.isoformat(),
+                    "end": move.end.isoformat(),
+                    "tenor_years": years,
+                    "change_bp": bp,
+                    "source": series,
+                }
+            )
+    return pd.DataFrame(rows, columns=["episode", "start", "end", "tenor_years", "change_bp", "source"])
+
+
+def historical_sources(shock: Shock) -> pd.DataFrame:
+    """One row per curve and currency of a historical shock: which data it
+    replays, the dates used and whether it is the curve's own market."""
+
+    rows = [
+        {
+            "curve": "TREASURY" if src.selector.startswith("govt") else "SWAP",
+            "currency": src.selector.split(":", 1)[1],
+            "data": src.title,
+            "start": src.start,
+            "end": src.end,
+            "flag": src.flag,
+            "note": src.note,
+        }
+        for src in shock.sources
+    ]
+    return pd.DataFrame(rows, columns=["curve", "currency", "data", "start", "end", "flag", "note"])
+
+
+def standard_library(store: Optional[HistoryStore] = None) -> List[Shock]:
     """Parallel +/-25 and +/-100bp, 2s10s steepener/flattener of 25bp, a
-    2s5s10s fly and every historical episode (instantaneous, both curves)."""
+    2s5s10s fly and every historical episode (instantaneous, both curves;
+    episodes from ``store``, by default the committed sample)."""
 
     shocks = [parallel(bp) for bp in (25.0, -25.0, 100.0, -100.0)]
     shocks += [
@@ -288,7 +472,7 @@ def standard_library() -> List[Shock]:
         twist(5.0, 12.5, -12.5, short_years=2.0, long_years=10.0, name="2s10s flattener 25bp"),
         butterfly(0.0, 25.0, 5.0, wings=(2.0, 10.0), name="2s5s10s fly: 5Y +25bp"),
     ]
-    return shocks + [historical(name) for name in historical_episodes()]
+    return shocks + [historical(name, store=store) for name in historical_episodes()]
 
 
 # --------------------------------------------------------------------------
@@ -321,7 +505,7 @@ def _bumps(market: Market, shock: Shock) -> Dict[str, np.ndarray]:
             continue
         if not curve.instruments:
             raise ValueError(f"the {which!r} curve has no quotes to shock; bootstrap it from quotes")
-        bumps = shock.quote_bumps(curve)
+        bumps = shock.quote_bumps(curve, which)
         if np.any(bumps != 0.0):
             out[which] = bumps
     return out
