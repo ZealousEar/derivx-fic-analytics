@@ -5,11 +5,20 @@ checked against it (see ``tests/test_conventions.py``):
 
 * ``USGOV``  - US government bond market (SIFMA), QuantLib ``GovernmentBond``
 * ``USD``    - SOFR fixing calendar, QuantLib ``UnitedStates.SOFR``
+* ``USFED``  - Federal Reserve (Fedwire), QuantLib ``UnitedStates.FederalReserve``
+  (USD settlement for FX: Good Friday is a business day)
 * ``TARGET`` - euro area TARGET2
 * ``LONDON`` - UK settlement
+* ``TOKYO``  - Japan, QuantLib ``Japan``
+* ``ZURICH`` - Switzerland, QuantLib ``Switzerland``
+* ``TORONTO`` - Canada settlement, QuantLib ``Canada.Settlement``
+* ``SYDNEY`` - Australia settlement, QuantLib ``Australia.Settlement``
+* ``WELLINGTON`` / ``AUCKLAND`` - New Zealand, QuantLib ``NewZealand``
 * ``WEEKENDS`` - Saturdays and Sundays only
 
-Joint calendars are written ``"USD+LONDON"``.
+Joint calendars are written ``"USD+LONDON"``. Every named calendar is
+checked against QuantLib's holiday list for 1990-2080
+(``tests/test_conventions.py``, ``tests/test_fx_conventions.py``).
 """
 
 from __future__ import annotations
@@ -295,11 +304,225 @@ def _london_holidays(year: int) -> set:
     return hols
 
 
+def _monday_if_sunday(day: Date) -> Date:
+    return day + dt.timedelta(days=1) if day.weekday() == 6 else day
+
+
+def _monday_if_weekend(day: Date) -> Date:
+    """Saturday and Sunday holidays are observed on the next Monday."""
+
+    return day + dt.timedelta(days=(7 - day.weekday()) % 7) if day.weekday() >= 5 else day
+
+
+def _pair_mondayised(first: Date) -> set:
+    """Two consecutive holidays (Christmas and Boxing Day, 1 and 2 January)
+    observed on the next two weekdays when they fall on a weekend."""
+
+    second = first + dt.timedelta(days=1)
+    if first.weekday() == 5:  # Sat, Sun -> Mon, Tue
+        return {first + dt.timedelta(days=2), first + dt.timedelta(days=3)}
+    if first.weekday() == 6:  # Sun, Mon -> Tue for the first, Mon stays
+        return {first + dt.timedelta(days=2), second}
+    if first.weekday() == 4:  # Fri, Sat -> Mon for the second
+        return {first, first + dt.timedelta(days=3)}
+    return {first, second}
+
+
+def _us_fed_holidays(year: int) -> set:
+    """Federal Reserve (Fedwire) holidays, QuantLib ``UnitedStates.FederalReserve``:
+    the USD settlement calendar for FX. Sunday holidays move to Monday;
+    Saturday holidays are not moved (the Fed is open on the Friday)."""
+
+    hols = {_monday_if_sunday(Date(year, 1, 1))}
+    if year >= 1983:
+        hols.add(_nth_weekday(year, 1, 0, 3))  # Martin Luther King Jr. Day
+    hols.add(_nth_weekday(year, 2, 0, 3) if year >= 1971 else _monday_if_sunday(Date(year, 2, 22)))
+    hols.add(_nth_weekday(year, 5, 0, -1) if year >= 1971 else _monday_if_sunday(Date(year, 5, 30)))
+    if year >= 2022:
+        hols.add(_monday_if_sunday(Date(year, 6, 19)))  # Juneteenth
+    hols.add(_monday_if_sunday(Date(year, 7, 4)))  # Independence Day
+    hols.add(_nth_weekday(year, 9, 0, 1))  # Labor Day
+    if year >= 1971:
+        hols.add(_nth_weekday(year, 10, 0, 2))  # Columbus Day
+    if year <= 1970 or year >= 1978:
+        hols.add(_monday_if_sunday(Date(year, 11, 11)))  # Veterans Day
+    else:
+        hols.add(_nth_weekday(year, 10, 0, 4))
+    hols.add(_nth_weekday(year, 11, 3, 4))  # Thanksgiving
+    hols.add(_monday_if_sunday(Date(year, 12, 25)))  # Christmas
+    return hols
+
+
+def _japan_equinoxes(year: int) -> tuple:
+    """(vernal, autumnal) equinox days of the month, QuantLib's approximation."""
+
+    n = year - 2000
+    leaps = int(n / 4) + int(n / 100) - int(n / 400)  # C++ integer division: truncates towards zero
+    return int(20.69115 + n * 0.242194 - leaps), int(23.09 + n * 0.242194 - leaps)
+
+
+def _tokyo_holidays(year: int) -> set:
+    """Japanese bank holidays, QuantLib ``Japan``: national holidays with
+    their substitute Mondays, the bank holidays of 2-3 January and
+    31 December, the Happy Monday system and the one-off dates."""
+
+    def day(m: int, d: int) -> Date:
+        return Date(year, m, d)
+
+    def sub(d: Date) -> set:  # a Sunday holiday is also observed on Monday
+        return {d, d + dt.timedelta(days=1)} if d.weekday() == 6 else {d}
+
+    ve, ae = _japan_equinoxes(year)
+    hols = {day(1, 1), day(1, 2), day(1, 3), day(12, 31), day(5, 3), day(5, 4), day(5, 5)}
+    hols |= {_nth_weekday(year, 1, 0, 2)} if year >= 2000 else sub(day(1, 15))  # Coming of Age Day
+    hols |= sub(day(2, 11))  # National Foundation Day
+    if year >= 2020:
+        hols |= sub(day(2, 23))  # Emperor's Birthday (Naruhito)
+    hols |= sub(day(3, ve))  # Vernal Equinox
+    hols |= sub(day(4, 29))  # Showa / Greenery Day
+    may6 = day(5, 6)  # Golden Week holidays falling on a weekend are observed on 6 May
+    if may6.weekday() in (0, 1, 2):
+        hols.add(may6)
+    if (2003 <= year < 2020) or year >= 2022:  # Marine Day
+        hols.add(_nth_weekday(year, 7, 0, 3))
+    elif 1996 <= year < 2003:
+        hols |= sub(day(7, 20))
+    if (2016 <= year < 2020) or year >= 2022:  # Mountain Day
+        hols |= sub(day(8, 11))
+    if year >= 2003:  # Respect for the Aged Day, and a lone day before the Autumnal Equinox
+        aged = _nth_weekday(year, 9, 0, 3)
+        hols.add(aged)
+        if aged + dt.timedelta(days=2) == day(9, ae):
+            hols.add(aged + dt.timedelta(days=1))
+    else:
+        hols |= sub(day(9, 15))
+    hols |= sub(day(9, ae))  # Autumnal Equinox
+    if (2000 <= year < 2020) or year >= 2022:  # Health and Sports Day
+        hols.add(_nth_weekday(year, 10, 0, 2))
+    elif year < 2000:
+        hols |= sub(day(10, 10))
+    hols |= sub(day(11, 3))  # Culture Day
+    hols |= sub(day(11, 23))  # Labour Thanksgiving Day
+    if 1989 <= year < 2019:
+        hols |= sub(day(12, 23))  # Emperor's Birthday (Akihito)
+    special = {
+        1990: [day(11, 12)],  # Enthronement Ceremony (Akihito)
+        1993: [day(6, 9)],  # Marriage of Prince Naruhito
+        2019: [day(4, 30), day(5, 1), day(5, 2), day(10, 22)],  # Abdication, Enthronement
+        2020: [day(7, 23), day(7, 24), day(8, 10)],  # Olympics: Marine, Sports and Mountain Days moved
+        2021: [day(7, 22), day(7, 23), day(8, 9)],
+    }
+    hols.update(special.get(year, []))
+    return hols
+
+
+def _zurich_holidays(year: int) -> set:
+    """Swiss holidays, QuantLib ``Switzerland``."""
+
+    easter = easter_sunday(year)
+    return {
+        Date(year, 1, 1),
+        Date(year, 1, 2),  # Berchtoldstag
+        easter - dt.timedelta(days=2),  # Good Friday
+        easter + dt.timedelta(days=1),  # Easter Monday
+        easter + dt.timedelta(days=39),  # Ascension Day
+        easter + dt.timedelta(days=50),  # Whit Monday
+        Date(year, 5, 1),
+        Date(year, 8, 1),  # National Day
+        Date(year, 12, 25),
+        Date(year, 12, 26),
+    }
+
+
+def _toronto_holidays(year: int) -> set:
+    """Canadian settlement holidays, QuantLib ``Canada.Settlement``."""
+
+    hols = {
+        _monday_if_weekend(Date(year, 1, 1)),
+        easter_sunday(year) - dt.timedelta(days=2),  # Good Friday
+        _nth_weekday(year, 5, 0, -1) - dt.timedelta(days=7),  # Victoria Day: the Monday before 25 May
+        _monday_if_weekend(Date(year, 7, 1)),  # Canada Day
+        _nth_weekday(year, 8, 0, 1),  # Civic Holiday
+        _nth_weekday(year, 9, 0, 1),  # Labour Day
+        _nth_weekday(year, 10, 0, 2),  # Thanksgiving
+        _monday_if_weekend(Date(year, 11, 11)),  # Remembrance Day
+    }
+    if year >= 2008:
+        hols.add(_nth_weekday(year, 2, 0, 3))  # Family Day
+    if year >= 2021:
+        hols.add(_monday_if_weekend(Date(year, 9, 30)))  # National Day for Truth and Reconciliation
+    hols |= _pair_mondayised(Date(year, 12, 25))
+    return hols
+
+
+def _sydney_holidays(year: int) -> set:
+    """Australian settlement holidays, QuantLib ``Australia.Settlement``."""
+
+    easter = easter_sunday(year)
+    hols = {
+        _monday_if_weekend(Date(year, 1, 1)),
+        _monday_if_weekend(Date(year, 1, 26)),  # Australia Day
+        easter - dt.timedelta(days=2),
+        easter + dt.timedelta(days=1),
+        Date(year, 4, 25),  # ANZAC Day
+        _nth_weekday(year, 6, 0, 2),  # King's / Queen's Birthday
+        _nth_weekday(year, 8, 0, 1),  # Bank Holiday
+        _nth_weekday(year, 10, 0, 1),  # Labour Day
+    }
+    hols |= _pair_mondayised(Date(year, 12, 25))
+    if year == 2022:
+        hols.add(Date(2022, 9, 22))  # National Day of Mourning
+    return hols
+
+
+# Matariki (from 2022), as listed in the Te Kahui o Matariki Public Holiday Act 2022.
+_MATARIKI = {
+    2022: (6, 24), 2023: (7, 14), 2024: (6, 28), 2025: (6, 20), 2026: (7, 10), 2027: (6, 25), 2028: (7, 14),
+    2029: (7, 6), 2030: (6, 21), 2031: (7, 11), 2032: (7, 2), 2033: (6, 24), 2034: (7, 7), 2035: (6, 29),
+    2036: (7, 18), 2037: (7, 10), 2038: (6, 25), 2039: (7, 15), 2040: (7, 6), 2041: (7, 19), 2042: (7, 11),
+    2043: (7, 3), 2044: (6, 24), 2045: (7, 7), 2046: (6, 29), 2047: (7, 19), 2048: (7, 3), 2049: (6, 25),
+    2050: (7, 15), 2051: (6, 30), 2052: (6, 21),
+}  # fmt: skip
+
+
+def _new_zealand_holidays(year: int, city: str) -> set:
+    """New Zealand holidays, QuantLib ``NewZealand.Wellington`` /
+    ``NewZealand.Auckland`` (they differ in the Anniversary Day)."""
+
+    easter = easter_sunday(year)
+    hols = _pair_mondayised(Date(year, 1, 1)) | _pair_mondayised(Date(year, 12, 25))
+    if city == "WELLINGTON":  # Monday nearest 22 January
+        hols.add(_nth_weekday(year, 1, 0, 3) if _nth_weekday(year, 1, 0, 3).day >= 19 else _nth_weekday(year, 1, 0, 4))
+    else:  # Auckland: Monday nearest 29 January
+        last = _nth_weekday(year, 1, 0, -1)
+        hols.add(last if last.day >= 26 else last + dt.timedelta(days=7))
+    for month, dom in ((2, 6), (4, 25)):  # Waitangi Day, ANZAC Day: Mondayised from 2014
+        holiday = Date(year, month, dom)
+        hols.add(holiday)
+        if year > 2013:
+            hols.add(_monday_if_weekend(holiday))
+    hols |= {easter - dt.timedelta(days=2), easter + dt.timedelta(days=1)}
+    hols.add(_nth_weekday(year, 6, 0, 1))  # King's / Queen's Birthday
+    hols.add(_nth_weekday(year, 10, 0, 4))  # Labour Day
+    if year in _MATARIKI:
+        hols.add(Date(year, *_MATARIKI[year]))
+    if year == 2022:
+        hols.add(Date(2022, 9, 26))  # Queen Elizabeth II Memorial Day
+    return hols
+
+
 _RULES = {
     "USGOV": lambda y: _us_holidays(y, "GOV"),
     "USD": lambda y: _us_holidays(y, "SOFR"),
+    "USFED": _us_fed_holidays,
     "TARGET": _target_holidays,
     "LONDON": _london_holidays,
+    "TOKYO": _tokyo_holidays,
+    "ZURICH": _zurich_holidays,
+    "TORONTO": _toronto_holidays,
+    "SYDNEY": _sydney_holidays,
+    "WELLINGTON": lambda y: _new_zealand_holidays(y, "WELLINGTON"),
+    "AUCKLAND": lambda y: _new_zealand_holidays(y, "AUCKLAND"),
     "WEEKENDS": lambda y: set(),
 }
 
