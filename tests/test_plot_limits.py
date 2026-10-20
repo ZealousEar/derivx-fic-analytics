@@ -106,16 +106,33 @@ def test_every_pricer_chart_is_zoom_bounded(mode):
     at.sidebar.radio[0].set_value(mode).run()
     assert not at.exception
     charts = _charts(at)
-    # Equity/FX: scenario grid + risk surface + smile; Rates: every chart across its five tabs.
+    # Equity: scenario grid + risk surface + smile; FX: smile + tenor x delta surface + scenario grid;
+    # Rates: every chart across its five tabs.
     assert len(charts) == 3 if mode != "[ RATES ]" else len(charts) >= 5
     for spec, config in charts:
         _assert_bounded(spec, config)
     if mode != "[ RATES ]":
         named = {spec["layout"]["meta"]["chart"]: spec["layout"] for spec, _ in charts}
-        assert set(named) == {"scenario", "surface", "smile"}
-        smile = named["smile"]
+        expected = {"[ EQUITY ]": {"scenario", "surface", "smile"}, "[ FX ]": {"fx_smile", "fx_surface", "fx_scenario"}}
+        assert set(named) == expected[mode]
+        smile = named["smile" if mode == "[ EQUITY ]" else "fx_smile"]
         assert smile["xaxis"]["minallowed"] >= 0.0  # no negative strikes
         assert smile["yaxis"]["minallowed"] >= 0.0
+
+
+def test_fx_smile_in_delta_space_is_zoom_bounded():
+    at = AppTest.from_file(str(APP), default_timeout=180)
+    at.run()
+    at.sidebar.radio[0].set_value("[ FX ]").run()
+    at.radio(key="fx_space").set_value("DELTA").run()
+    assert not at.exception
+    charts = _charts(at)
+    assert len(charts) == 3
+    for spec, config in charts:
+        _assert_bounded(spec, config)
+    smile = next(spec for spec, _ in charts if spec["layout"]["meta"]["chart"] == "fx_smile")
+    n = len(smile["layout"]["xaxis"]["ticktext"])
+    assert smile["layout"]["xaxis"]["minallowed"] == -0.5 and smile["layout"]["xaxis"]["maxallowed"] == n - 0.5
 
 
 def test_every_analytics_chart_is_zoom_bounded():
