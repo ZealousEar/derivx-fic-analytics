@@ -414,7 +414,16 @@ def provenance(prefill: QuotePrefill, edited: pd.DataFrame) -> Tuple[str, int]:
     """(badge label, rows the user changed or added): a row is changed when
     its instrument, tenor or rate differ from the prefill row it started as."""
 
-    base = prefill.table.reset_index(drop=True)
+    changed = edited_rows(prefill.table, edited)
+    label = prefill.label if not changed else f"{prefill.label} (+{changed} rows edited by you)"
+    return label, changed
+
+
+def edited_rows(table: pd.DataFrame, edited: pd.DataFrame) -> int:
+    """Rows of ``edited`` that differ from the prefilled ``table`` (instrument,
+    tenor or rate changed, or added), plus rows deleted from it."""
+
+    base = table.reset_index(drop=True)
     changed = 0
     for i, row in edited.reset_index(drop=True).iterrows():
         if i >= len(base):
@@ -428,8 +437,7 @@ def provenance(prefill: QuotePrefill, edited: pd.DataFrame) -> Tuple[str, int]:
         elif not same_rate:
             changed += 1
     changed += max(0, len(base) - len(edited))
-    label = prefill.label if not changed else f"{prefill.label} (+{changed} rows edited by you)"
-    return label, changed
+    return changed
 
 
 # --------------------------------------------------------------------------

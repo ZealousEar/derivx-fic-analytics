@@ -293,16 +293,19 @@ def _ois_fixings(store: HistoryStore, currency: str, asof: dt.date) -> FixingsKe
 
 
 @st.cache_data(show_spinner=False)
-def _projection_prefill(discount_args: tuple, index: str, hw: Tuple[float, float]) -> Tuple[pd.DataFrame, Curve]:
+def _projection_prefill(discount_args: tuple, index: str) -> Tuple[pd.DataFrame, Curve]:
     """ILLUSTRATIVE quotes for a projection table (not market data): priced
-    off the prefilled OIS curve (:func:`_build` arguments) plus an assumed
-    basis, as a percent / price table, and the curve they build (the basis
-    curve of the next table)."""
+    off the prefilled OIS curve (:func:`_build` arguments, log-linear) plus
+    an assumed basis, as a percent / price table, and the curve they build
+    (the basis curve of the next table). Futures prices are set with the
+    default Hull-White inputs: quotes are inputs, so the sidebar's
+    interpolation and convexity settings change the curves built from them,
+    never the quotes (or the editor, which would drop the user's edits)."""
 
     discount = _build(*discount_args)
-    convexity = HullWhite(*hw)
+    convexity = HullWhite(HW_DEFAULTS[0] / 100.0, HW_DEFAULTS[1] / 1e4)
     basis_index = BASIS_OF.get(index)
-    basis = _projection_prefill(discount_args, basis_index, hw)[1] if basis_index else None
+    basis = _projection_prefill(discount_args, basis_index)[1] if basis_index else None
     quotes = illustrative_quotes(discount, index, convexity, basis_curve=basis)
     curve = bootstrap_projection(discount.asof, quotes, index, discount, basis=basis, convexity=convexity)
     profile = ", ".join(f"{y:g}Y {b:g}bp" for y, b in ILLUSTRATIVE_BASIS_BP[index])
@@ -312,6 +315,16 @@ def _projection_prefill(discount_args: tuple, index: str, hw: Tuple[float, float
         value = round(price_from_futures_rate(q.rate), 4) if q.kind in FUTURES_KINDS else round(100.0 * q.rate, 6)
         rows.append({"instrument": q.kind, "tenor": q.tenor, "rate": value, "source": label})
     return pd.DataFrame(rows, columns=["instrument", "tenor", "rate", "source"]), curve
+
+
+def _projection_source(changed: int, rows: int) -> str:
+    """Badge text for a projection curve's quotes."""
+
+    if not changed:
+        return "ILLUSTRATIVE quotes (not market data)"
+    if changed >= rows:
+        return "quotes entered by you"
+    return f"ILLUSTRATIVE quotes, {changed} rows changed by you"
 
 
 def _legend_below(fig: go.Figure) -> None:
@@ -393,9 +406,11 @@ def _projection_section(
     prefill_args: tuple,
     interpolation: str,
     hw: HullWhite,
+    edits: Dict[str, Tuple[int, int]],
 ) -> Optional[Dict[str, ProjectionCurve]]:
     """Editors and builds of the currency's projection curves; ``{}`` when it
-    is single-curve, None if a table cannot be built (reason shown)."""
+    is single-curve, None if a table cannot be built (reason shown).
+    ``edits`` receives {index: (rows edited or added by the user, rows)}."""
 
     indices = CURRENCY_INDICES.get(currency, ())
     st.markdown("### / PROJECTION CURVES (MULTI-CURVE)")
@@ -413,7 +428,9 @@ def _projection_section(
         "discounting every cash flow (dual curve). EURIBOR 6M: deposit, FRAs (AxB months), swaps fixed annual "
         "30/360 vs 6M; EURIBOR 3M: deposit, three-month futures (IMM, price = 100 - rate, Hull-White convexity) "
         "and 3s6s basis swaps (3M + spread vs 6M flat, spread in the table's units). No free EURIBOR quotes "
-        "exist: the tables start from ILLUSTRATIVE quotes; paste your own. Futures are entered as prices."
+        "exist: the tables start from ILLUSTRATIVE quotes; paste your own. Futures are entered as prices; the "
+        "illustrative ones were set with the default Hull-White inputs, so the sidebar convexity inputs move the "
+        "3M forwards under fixed prices."
     )
     built: Dict[str, ProjectionCurve] = {}
     tabs = st.tabs([f"/ {index}" for index in indices])
@@ -421,7 +438,7 @@ def _projection_section(
         with tab:
             basis_index = BASIS_OF.get(index)
             try:
-                table, _ = _projection_prefill(prefill_args, index, (hw.mean_reversion, hw.sigma))
+                table, _ = _projection_prefill(prefill_args, index)
             except ValueError as exc:
                 st.error(f"Could not prefill {index}: {exc}")
                 return None
@@ -443,10 +460,21 @@ def _projection_section(
             quotes, issues, _ = clean_quotes(rows, units=units, kinds=PROJECTION_KINDS, asof=asof)
             if not _show_issues(issues):
                 return None
+            changed = rates_data.edited_rows(table, edited)
+            edits[index] = (changed, len(edited))
+            if changed:
+                st.caption(f"{changed} rows edited, added or deleted by you; the others are ILLUSTRATIVE.")
             basis_args = None
             if any(q.kind == "BASIS" for q in quotes):
-                if basis_index is None or basis_index not in built:
-                    st.error(f"BASIS quotes on {index} need the {basis_index or 'other'} curve built first.")
+                if basis_index is None:
+                    others = ", ".join(k for k, v in BASIS_OF.items() if v == index)
+                    st.error(
+                        f"BASIS quotes go on the shorter tenor's curve ({others or 'none'}: its index plus the "
+                        f"spread vs {index}), not on {index}; quote {index} with DEPO, FRA or IRS rows."
+                    )
+                    return None
+                if basis_index not in built:
+                    st.error(f"BASIS quotes on {index} need the {basis_index} curve built first.")
                     return None
                 other = built[basis_index]
                 basis_args = (basis_index, tuple((q.kind, q.tenor, q.rate) for q in other.quotes), other.interpolation)
@@ -560,26 +588,36 @@ def render() -> Optional[Market]:
             "Download curve grid (CSV)", grid.to_csv(index=False).encode(), "swap_curve.csv", key="rates_grid_download"
         )
 
-    prefill_args = discount_args
-    if multi:  # projection prefills follow the prefilled OIS curve, so editing an OIS quote keeps their edits
+    # Projection prefills follow the prefilled OIS curve, log-linear, so neither editing an OIS quote nor changing
+    # the interpolation or the convexity inputs replaces them (and the user's edits to them).
+    prefill_args = (asof, discount_args[1], conv, "loglinear", hw_key, fixings)
+    if multi:
         base_rows = prefill.table.drop(columns=["source"], errors="ignore").to_dict("records")
         base_quotes, base_issues, _ = clean_quotes(base_rows, units="auto" if uploaded else "percent", kinds=kinds,
                                                    asof=asof)  # fmt: skip
         if base_quotes and not any(i.level == "error" for i in base_issues):
-            candidate = (asof, tuple((q.kind, q.tenor, q.rate) for q in base_quotes), conv, interpolation, hw_key,
+            candidate = (asof, tuple((q.kind, q.tenor, q.rate) for q in base_quotes), conv, "loglinear", hw_key,
                          fixings)  # fmt: skip
             try:
                 _build(*candidate)
                 prefill_args = candidate
             except ValueError:
                 pass
-    projections = _projection_section(asof, currency, discount_args, prefill_args, interpolation, hw)
+    edits: Dict[str, Tuple[int, int]] = {}
+    projections = _projection_section(asof, currency, discount_args, prefill_args, interpolation, hw, edits)
     if projections is None:
         return None
     market = Market(curve=curve, projections=projections)
+    proj_sources = {key: _projection_source(*edits.get(key, (0, 0))) for key in projections}
     if projections:
         names = " / ".join(projections)
-        mc_badge = f"{conv} + {names} | ILLUSTRATIVE EURIBOR quotes unless edited"
+        if all(src == _projection_source(1, 1) for src in proj_sources.values()):
+            mc_quotes = "EURIBOR quotes entered by you"
+        elif any(edits.get(key, (0, 0))[0] for key in projections):
+            mc_quotes = "EURIBOR quotes partly edited by you, the rest ILLUSTRATIVE"
+        else:
+            mc_quotes = "ILLUSTRATIVE EURIBOR quotes (not market data)"
+        mc_badge = f"{conv} + {names} | {mc_quotes}"
         st.markdown("#### / OIS VS PROJECTION FORWARDS")
         st.plotly_chart(_forward_chart(market, mc_badge), width="stretch", config=PLOTLY_2D_CONFIG,
                         key="rates_mc_forwards")  # fmt: skip
@@ -611,6 +649,6 @@ def render() -> Optional[Market]:
     with st.expander("Treasury repricing check"):
         st.dataframe(_repricing_table(treasury), width="stretch", hide_index=True)
     _market_data_panel(data.store, asof)
-    proj_badges = {key: (f"{key} | ILLUSTRATIVE quotes unless edited", asof) for key in projections}
+    proj_badges = {key: (f"{key} | {proj_sources[key]}", asof) for key in projections}
     rates_data.set_badges(curve=(curve_badge, asof), govt=(t_badge, asof), **proj_badges)
     return market.replace(govt=treasury)
