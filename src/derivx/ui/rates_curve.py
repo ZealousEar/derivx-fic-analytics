@@ -1,19 +1,22 @@
 """CURVE tab: build the swap curve from editable quotes and show the
-Treasury curve. Returns the Market every other Rates tab prices off."""
+Treasury curve, both from the market data the sidebar DATA SOURCE picks.
+Returns the Market every other Rates tab prices off."""
 
 from __future__ import annotations
 
 import datetime as dt
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from derivx.data.rates_history import HistoryStore, dataset_info
 from derivx.rates.curves import CONVENTIONS, INTERPOLATIONS, Curve, CurveQuote, Market, bootstrap
-from derivx.rates.examples import sofr_example_rows, ust_par_history, ust_par_rows
+from derivx.rates.market_quotes import treasury_quotes
 from derivx.rates.quotes import clean_quotes
+from derivx.ui import rates_data
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -23,7 +26,18 @@ INTERP_LABELS = {
     "linear_zero": "Linear zero rates",
     "monotone_convex": "Monotone convex (Hagan-West)",
 }
-SWAP_KINDS = ["DEPO", "OIS", "IRS"]
+SWAP_KINDS = list(rates_data.SWAP_KINDS)
+DATE_WIDGETS = ("bond_settle", "bond_maturity", "bond_dated", "swap_maturity")  # defaults follow the valuation date
+PREFILL_CAPTIONS = {
+    "real": "Real market data: {label}. The Bank of England publishes a fitted (smoothed) SONIA OIS curve, not "
+    "dealer quotes; its spot rates are converted to par OIS rates under GBP SONIA conventions, so bootstrapping "
+    "them gives back the published curve at every pillar.",
+    "proxy": "No free {ccy} OIS quotes exist, so the table starts from a labelled PROXY: {label}. Government "
+    "yields differ from OIS rates by the swap spread; paste or upload your own quotes for a market curve.",
+    "illustrative": "No free {ccy} swap quotes exist: the table starts from ILLUSTRATIVE quotes (not market "
+    "data){fix}. Edit, paste or upload your own.",
+    "upload": "Quotes from your {label}.",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -31,22 +45,8 @@ def _build(asof: dt.date, quotes: Tuple[Tuple[str, str, float], ...], convention
     return bootstrap(asof, [CurveQuote(*q) for q in quotes], conventions, interpolation)
 
 
-@st.cache_data(show_spinner=False)
-def _treasury(day: dt.date, interpolation: str) -> Curve:
-    _, rows = ust_par_rows(day)
-    quotes, _, _ = clean_quotes(rows)
-    return bootstrap(day, quotes, "USD UST", interpolation)
-
-
-def _default_table() -> pd.DataFrame:
-    rows = sofr_example_rows()
-    return pd.DataFrame(
-        {
-            "instrument": [r["kind"] for r in rows],
-            "tenor": [r["tenor"] for r in rows],
-            "rate": [round(100 * r["rate"], 4) for r in rows],
-        }
-    )
+def _treasury_quotes(store: HistoryStore, day: dt.date) -> Tuple[Tuple[str, str, float], ...]:
+    return tuple((q.kind, q.tenor, q.rate) for q in treasury_quotes(store.curve("UST_PAR", day).to_dict()))
 
 
 def _curve_grid(curve: Curve) -> pd.DataFrame:
@@ -65,7 +65,7 @@ def _curve_grid(curve: Curve) -> pd.DataFrame:
     )
 
 
-def _curve_chart(curve: Curve, grid: pd.DataFrame, title_zero: str) -> go.Figure:
+def _curve_chart(curve: Curve, grid: pd.DataFrame, title_zero: str, source: str) -> go.Figure:
     pillars = np.array([inst.tenor.years for inst in curve.instruments])
     quotes = np.array([inst.quote.rate for inst in curve.instruments]) * 100
     fig = go.Figure()
@@ -93,6 +93,7 @@ def _curve_chart(curve: Curve, grid: pd.DataFrame, title_zero: str) -> go.Figure
         )
     )
     dark_layout(fig, height=380, xtitle="TENOR (YEARS)", ytitle="RATE (%)")
+    rates_data.badge(fig, source, curve.asof)
     values = np.concatenate([grid["zero_cont"] * 100, grid["fwd_3m"] * 100, quotes])
     return bound_axes(fig, xaxis=axis_limits(grid["years"], pad=0.02, floor=0.0), yaxis=axis_limits(values, pad=0.15))
 
@@ -124,63 +125,118 @@ def _show_issues(issues) -> bool:
     return not any(i.level == "error" for i in issues)
 
 
-def render() -> Optional[Market]:
-    """Draw the CURVE tab; the Market for the other tabs, or None if the
-    quotes cannot be built into a curve (the reason is shown)."""
-
-    history = ust_par_history()
-    dates: List[dt.date] = list(history.index)
-    st.sidebar.markdown("### / RATES MARKET")
+def _sidebar(data: rates_data.RatesData) -> Tuple[dt.date, str, str]:
+    dates = data.store.dates("UST_PAR")[::-1]
+    if not dates:
+        raise ValueError("the history store has no US Treasury curve")
+    rates_data.sticky("rates_asof", dates)
     asof = st.sidebar.selectbox(
         "VALUATION DATE",
-        dates[::-1],
+        dates,
         key="rates_asof",
-        help="Dates covered by the shipped US Treasury par curve snapshot.",
+        help=(
+            f"Dates with a US Treasury par curve in the history store ({len(dates)} dates, {dates[-1]} to "
+            f"{dates[0]}): every business day of the bundled year, month ends before it, and whatever the live "
+            "cache or your uploads add."
+        ),
     )
+    rates_data.remember("rates_asof")
+    if st.session_state.get("_rates_asof_seen", asof) != asof:
+        for key in DATE_WIDGETS:  # dates chosen relative to the old valuation date start again from their defaults
+            st.session_state.pop(key, None)
+    st.session_state["_rates_asof_seen"] = asof
+    rates_data.sticky("rates_conv", SWAP_CURVES)
     conv = st.sidebar.selectbox("SWAP CURVE", SWAP_CURVES, key="rates_conv")
+    rates_data.remember("rates_conv")
+    rates_data.sticky("rates_interp", INTERPOLATIONS)
     interpolation = st.sidebar.selectbox(
         "INTERPOLATION", INTERPOLATIONS, format_func=INTERP_LABELS.get, key="rates_interp"
     )
+    rates_data.remember("rates_interp")
     c = CONVENTIONS[conv]
     st.sidebar.caption(
         f"{conv}: spot T+{c.spot_lag}, {c.calendar} calendar, OIS annual {c.ois_day_count}, "
         f"payment lag {c.payment_lag}d; IRS fixed {c.irs_fixed_months}M {c.irs_fixed_day_count}."
     )
+    return asof, conv, interpolation
+
+
+def _market_data_panel(store: HistoryStore, asof: dt.date) -> None:
+    with st.expander(f"Market data on {asof}: fixings and sources"):
+        fixings = store.fixings(asof)
+        if fixings.empty:
+            st.caption("No overnight fixings in the store on or before this date.")
+        else:
+            table = pd.DataFrame(
+                {
+                    "FIXING": [rates_data.FIXING_LABELS.get(f, f) for f in fixings["fixing"]],
+                    "RATE DATE": fixings["date"],
+                    "RATE (%)": (100 * fixings["rate"]).round(4),
+                    "DISTRIBUTOR": fixings["source"],
+                }
+            )
+            st.dataframe(table, hide_index=True, width="stretch")
+            st.caption(
+                "Overnight fixings in percent (SOFR, EFFR, OBFR, ESTR ACT/360; SONIA ACT/365F), dated by the day "
+                "the rate applies to; each is published the next business day."
+            )
+        coverage = []
+        for key in store.datasets():
+            span = store.coverage(key)
+            if span:
+                info = dataset_info(key)
+                coverage.append({"DATASET": info.title, "SOURCE": info.source, "FROM": span[0], "TO": span[1],
+                                 "DATES": len(store.dates(key))})  # fmt: skip
+        st.dataframe(pd.DataFrame(coverage), hide_index=True, width="stretch")
+
+
+def render() -> Optional[Market]:
+    """Draw the CURVE tab; the Market for the other tabs, or None if the
+    quotes cannot be built into a curve (the reason is shown)."""
+
+    st.sidebar.markdown("### / RATES MARKET")
+    data = rates_data.sidebar()
+    asof, conv, interpolation = _sidebar(data)
+    rates_data.show_notices(data.notices)
 
     st.markdown("### / SWAP CURVE")
+    if data.mode == rates_data.MODES[2] and data.uploaded is not None:
+        prefill = rates_data.uploaded_prefill(data.uploaded)
+    else:
+        prefill = rates_data.swap_prefill(data.store, conv, asof)
+    currency = CONVENTIONS[conv].currency
+    fixing_note = "" if "fixing" not in prefill.label else "; the ON quote is the real overnight fixing"
     st.caption(
-        "Illustrative quotes: there is no free feed of SOFR/€STR/SONIA swap rates, so edit, paste or upload your "
-        "own (instrument DEPO, OIS or IRS; tenor like ON, 1W, 3M, 10Y; rate in %, decimals or bp)."
+        PREFILL_CAPTIONS[prefill.kind].format(label=prefill.label, ccy=currency, fix=fixing_note)
+        + " Instrument DEPO, OIS or IRS; tenor like ON, 1W, 3M, 10Y; rate in %, decimals or bp."
     )
-    upload = st.file_uploader("Upload quotes (CSV with instrument, tenor, rate)", type=["csv"], key="rates_upload")
-    table = _default_table()
-    if upload is not None:
-        try:
-            raw = pd.read_csv(upload)
-            raw.columns = [str(col).strip().lower() for col in raw.columns]
-            if "kind" in raw.columns and "instrument" not in raw.columns:
-                raw = raw.rename(columns={"kind": "instrument"})
-            missing = {"instrument", "tenor", "rate"} - set(raw.columns)
-            if missing:
-                st.error(f"Uploaded file is missing columns: {', '.join(sorted(missing))}")
-            else:
-                table = raw[["instrument", "tenor", "rate"]]
-        except Exception as exc:  # malformed CSV
-            st.error(f"Could not read the uploaded file: {exc}")
+    for note in prefill.notes:
+        st.warning(note)
     edited = st.data_editor(
-        table,
+        prefill.table,
         num_rows="dynamic",
         width="stretch",
         hide_index=True,
-        key=f"rates_quotes_{upload.name if upload else 'default'}",
+        key=f"rates_quotes_{prefill.key}",
         column_config={
             "instrument": st.column_config.SelectboxColumn("INSTRUMENT", options=SWAP_KINDS, required=True),
             "tenor": st.column_config.TextColumn("TENOR", required=True),
             "rate": st.column_config.NumberColumn("RATE", format="%.4f"),
+            "source": st.column_config.TextColumn("SOURCE", disabled=True),
         },
     )
-    units = st.radio("Rate units", ["auto", "percent", "decimal", "bp"], horizontal=True, key="rates_units")
-    quotes, issues, used_units = clean_quotes(edited.to_dict("records"), units=units)
+    # Prefilled tables are in percent; an uploaded file's units are read from its magnitudes unless set.
+    uploaded = prefill.kind == "upload"
+    units = st.radio(
+        "Rate units",
+        ["auto", "percent", "decimal", "bp"],
+        index=0 if uploaded else 1,
+        horizontal=True,
+        key="rates_units_upload" if uploaded else "rates_units",
+        help="auto reads the magnitudes (0.04 decimal, 4 percent, 400 bp); near-zero rates need the unit set.",
+    )
+    quotes, issues, used_units = clean_quotes(edited.drop(columns=["source"], errors="ignore").to_dict("records"),
+                                              units=units)  # fmt: skip
     if not _show_issues(issues):
         return None
     try:
@@ -188,6 +244,8 @@ def render() -> Optional[Market]:
     except ValueError as exc:
         st.error(f"Curve could not be built: {exc}")
         return None
+    source, changed = rates_data.provenance(prefill, edited)
+    curve_badge = f"{conv} | {source}"
 
     repricing = _repricing_table(curve)
     worst = float(repricing["Error (bp)"].abs().max())
@@ -198,7 +256,10 @@ def render() -> Optional[Market]:
     cols[3].metric("10Y ZERO", f"{100 * curve.zero_rate(10.0):.3f}%")
     grid = _curve_grid(curve)
     st.plotly_chart(
-        _curve_chart(curve, grid, "ZERO (CONT.)"), width="stretch", config=PLOTLY_2D_CONFIG, key="rates_curve_chart"
+        _curve_chart(curve, grid, "ZERO (CONT.)", curve_badge),
+        width="stretch",
+        config=PLOTLY_2D_CONFIG,
+        key="rates_curve_chart",
     )
     st.caption(
         "Every quote reprices exactly on the bootstrapped curve (error column). Zero rates are continuously "
@@ -212,18 +273,22 @@ def render() -> Optional[Market]:
         )
 
     st.markdown("### / TREASURY CURVE")
-    treasury = _treasury(asof, interpolation)
-    t_grid = _curve_grid(treasury)
+    treasury = _build(asof, _treasury_quotes(data.store, asof), "USD UST", interpolation)
+    origin = data.store.origin("UST_PAR", asof)
+    t_badge = f"US Treasury par yields ({origin})"
     st.plotly_chart(
-        _curve_chart(treasury, t_grid, "ZERO (CONT.)"),
+        _curve_chart(treasury, _curve_grid(treasury), "ZERO (CONT.)", t_badge),
         width="stretch",
         config=PLOTLY_2D_CONFIG,
         key="rates_treasury_chart",
     )
     st.caption(
-        f"US Treasury daily par yield curve for {asof} (home.treasury.gov): bills up to 1Y as bond-equivalent "
-        "yields, 2Y-30Y as semiannual par coupons, settlement T+1. Bonds price off this curve."
+        f"US Treasury daily par yield curve for {asof} ({origin}): bills up to 1Y as bond-equivalent yields, "
+        "2Y-30Y as semiannual par coupons, settlement T+1. FRED's H.15 DGS* series are the same constant-maturity "
+        "par yields with fewer tenors. Bonds price off this curve."
     )
     with st.expander("Treasury repricing check"):
         st.dataframe(_repricing_table(treasury), width="stretch", hide_index=True)
+    _market_data_panel(data.store, asof)
+    rates_data.set_badges(curve=(curve_badge, asof), govt=(t_badge, asof))
     return Market(curve=curve, govt=treasury)
