@@ -8,6 +8,10 @@
     "fetched_at_utc": "2026-10-20T20:59:39+00:00",
     "rows": 10040,
     "expiries": 31,
+    "slices": 31,
+    "row_sources": [
+      "yahoo"
+    ],
     "files": [
       "data/examples/spy_2026-10-20.csv.gz"
     ],

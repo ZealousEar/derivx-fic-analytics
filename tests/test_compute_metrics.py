@@ -32,6 +32,7 @@ def quick():
 def test_committed_summary_belongs_to_the_committed_sample():
     summary = json.loads((COMMITTED / "summary.json").read_text())
     assert summary["data"]["data_sha256"] == load_sample_chain().fingerprint
+    assert summary["data"] == cm.jsonable(load_sample_chain().provenance())  # regenerated with the current code
     assert summary["data"]["trade_dates"] == ["2026-10-20"] and summary["snapshots"] == 1
     mc = summary["model_comparison"]
     assert mc["slices_scored"] + mc["slices_skipped"] == 31  # every expiry scored or reported
