@@ -220,3 +220,79 @@ def test_treasury_downloads_in_the_background(tmp_path, monkeypatch):
     assert rh.treasury_in_background(2026, cache) is None  # cached and fresh
     monkeypatch.setenv("DERIVX_OFFLINE", "1")
     assert rh.treasury_in_background(2025, cache) is None  # offline: never starts
+
+
+# --------------------------------------------------------------------------
+# Review regressions
+# --------------------------------------------------------------------------
+
+
+def test_bundled_boe_curves_are_dated_by_london_business_days(store):
+    """58 month-end curves were dated on weekends or UK holidays, so the GBP
+    prefill on, e.g., Friday 2013-08-30 took the July curve."""
+
+    from derivx.rates.conventions import get_calendar
+
+    london = get_calendar("LONDON")
+    days = store.dates("GBP_OIS_BOE")
+    assert days[0] == D("2009-01-30") and all(london.is_business_day(day) for day in days)
+    assert store.latest_on_or_before("GBP_OIS_BOE", D("2013-08-30")) == D("2013-08-30")
+    assert store.latest_on_or_before("GBP_OIS_BOE", D("2013-03-28")) == D("2013-03-28")
+
+
+def test_failing_live_requests_never_raise(tmp_path):
+    """Any exception from a request (not only SourceError/ValueError/OSError)
+    is a notice: the LIVE page must not show a traceback."""
+
+    def broken(**kw):
+        raise SyntaxError("unclosed token: line 2, column 788")  # what a truncated BoE sheet raised
+
+    result = rh.refresh_live(D("2026-10-20"), cache=DiskCache(tmp_path), requests={"UK OIS curve (BoE)": broken})
+    assert result.ok == {"UK OIS curve (BoE)": False}
+    assert "unclosed token" in result.notices[0] and "unavailable" in result.notices[0]
+
+
+def test_background_treasury_download_restarts_after_max_age(tmp_path, monkeypatch):
+    """It used to start only once per server process: after its first
+    success the Treasury CSV was never downloaded again."""
+
+    from concurrent.futures import Future
+
+    cache = DiskCache(tmp_path)
+    monkeypatch.setenv("DERIVX_OFFLINE", "0")
+    calls = []
+    monkeypatch.setattr(rs, "treasury_par_curve", lambda year, cache=None: calls.append(year))
+    done = Future()
+    done.set_result(None)
+    now = rs.utc_now().timestamp()
+    key = (2026, str(cache.root))
+    monkeypatch.setattr(rh, "_PENDING", {key: (done, now - 60.0)})
+    assert rh.treasury_in_background(2026, cache, max_age=3600.0) is None and calls == []  # finished a minute ago
+    rh._PENDING[key] = (done, now - 7200.0)
+    assert "background" in rh.treasury_in_background(2026, cache, max_age=3600.0)  # two hours ago: again
+    rh._PENDING[key][0].result(timeout=5)
+    assert calls == [2026]
+
+
+def test_auto_units_refuse_magnitudes_that_could_be_either():
+    """2020-21 rates in percent (0.15-0.30) were read as decimals (15-30%):
+    inside the accepted range, so every move came out 100x too large."""
+
+    from derivx.rates.quotes import ambiguous_units, clean_quotes
+
+    zirp = pd.DataFrame({"date": ["2021-01-04", "2021-02-01"], "2Y": [0.15, 0.20], "5Y": [0.25, 0.30]})
+    frame, issues, _ = rh.parse_history_upload(zirp, "USD")
+    assert frame.empty and any(i.level == "error" and "choose the units" in i.message for i in issues)
+    frame, _, units = rh.parse_history_upload(zirp, "USD", units="percent")
+    assert units == "percent" and frame["value_decimal"].max() == pytest.approx(0.003)
+    rows = [{"kind": "OIS", "tenor": t, "rate": r} for t, r in (("1Y", 0.12), ("2Y", 0.2), ("5Y", 0.35))]
+    quotes, issues, _ = clean_quotes(rows)
+    assert quotes == [] and "could be percent (0.2%) or decimals (20%)" in issues[-1].message
+    assert ambiguous_units([0.04, 0.045]) is None and ambiguous_units([4.1, 4.5]) is None  # clear-cut cases
+    assert ambiguous_units([450.0]) is None and ambiguous_units([]) is None
+
+
+def test_uploaded_treasury_origin_is_named_once():
+    text = (FIXTURES / "treasury_2026.csv").read_text()
+    store = rh.build_store([rh.treasury_upload(text, "t.csv")])
+    assert store.origin("UST_PAR", D("2026-10-19")) == "upload: t.csv"  # was "upload: t.csv, upload: t.csv"

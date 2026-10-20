@@ -41,6 +41,31 @@ def detect_units(rates: Iterable[float]) -> str:
     return "decimal"
 
 
+AMBIGUOUS_MEDIAN = (0.05, 0.5)  # |rates| with a median in here read as 5%-50% decimals or 0.05%-0.5% percent
+
+
+def ambiguous_units(rates: Iterable[float]) -> Optional[str]:
+    """Why ``auto`` cannot tell the units of ``rates`` apart, or None.
+
+    :func:`detect_units` calls a median of 0.25 decimal (25%), but near-zero
+    rates in percent look the same (0.25%), and so do 5-30% decimals; a
+    wrong guess moves every rate 100x and still passes the range check.
+    Tables whose every rate is that small need their units set. (With a
+    larger rate among them, the range check already refuses the guess.)"""
+
+    values = np.abs(np.asarray([r for r in rates if np.isfinite(r)], dtype=float))
+    if values.size == 0:
+        return None
+    median = float(np.median(values))
+    lo, hi = AMBIGUOUS_MEDIAN
+    if lo < median <= hi and float(values.max()) <= hi:
+        return (
+            f"rates around {median:g} could be percent ({median:g}%) or decimals ({median:.0%}); "
+            "choose the units instead of auto"
+        )
+    return None
+
+
 def clean_quotes(
     rows: Iterable[Mapping[str, object]],
     units: str = "auto",
@@ -50,7 +75,8 @@ def clean_quotes(
     (quotes in decimals, issues, units used).
 
     Blank rows are skipped. Unknown kinds or tenors, non-numeric or
-    out-of-range rates and duplicate tenors are errors.
+    out-of-range rates, duplicate tenors and (with ``auto``) magnitudes
+    whose units cannot be told apart (:func:`ambiguous_units`) are errors.
     """
 
     issues: List[Issue] = []
@@ -83,6 +109,9 @@ def clean_quotes(
         parsed.append((n, kind, tenor, rate))
 
     if units == "auto":
+        reason = ambiguous_units([r for *_, r in parsed])
+        if reason:
+            return [], issues + [Issue("error", reason)], units
         units = detect_units([r for *_, r in parsed])
         if units != "decimal" and parsed:
             issues.append(Issue("info", f"Rates read as {units} and converted to decimals"))

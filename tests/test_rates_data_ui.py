@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -214,7 +215,7 @@ def _historical_sources(at: AppTest) -> None:
 
 
 def _uploaded_swap_history(at: AppTest) -> None:
-    history = b"date,2Y,10Y\n2023-03-08,4.95,3.85\n2023-03-15,4.10,3.45\n"
+    history = "\ufeffdate,2Y,10Y\n2023-03-08,4.95,3.85\n2023-03-15,4.10,3.45\n".encode()  # Excel's BOM
     at.file_uploader(key="scn_hist_upload_0").set_value(("usd_swaps.csv", history, "text/csv")).run()
     assert not at.exception and not at.error
     assert any("Using usd_swaps.csv: 2 dates from 2023-03-08 to 2023-03-15, 2 tenors" in c.value for c in at.caption)
@@ -246,3 +247,95 @@ def test_historical_scenarios():
     at = _rates()
     _uploaded_swap_history(at)
     _historical_sources(at)
+
+
+# --------------------------------------------------------------------------
+# Review regressions
+# --------------------------------------------------------------------------
+
+
+def test_parse_quote_upload_normalises_cell_types():
+    """'3.5%' rates crashed the page in provenance(); numeric tenors (5, 10)
+    crashed st.data_editor (a TEXT column over integers)."""
+
+    table, error = rates_data.parse_quote_upload(b"instrument,tenor,rate,source\nOIS,1Y,3.5%,\nOIS,5,3.6,dealer\n")
+    assert error is None and table["rate"].tolist() == [3.5, 3.6] and table["rate"].dtype == float
+    assert table["tenor"].tolist() == ["1Y", "5"] and table["source"].tolist() == ["uploaded", "dealer"]
+    blank, error = rates_data.parse_quote_upload(b"instrument,tenor,rate\nOIS,1Y,\n")
+    assert error is None and np.isnan(blank["rate"].iloc[0])
+    _, error = rates_data.parse_quote_upload(b"instrument,tenor,rate\nOIS,1Y,3.5\nOIS,2Y,abc\n")
+    assert error == "row 2: rate 'abc' is not a number (use 4.25, 4.25% or 0.0425)"
+    assert rates_data.parse_quote_upload(b"instrument,tenor,rate\n") == (None, "the file has no quote rows")
+    excel, error = rates_data.parse_quote_upload("\ufeffInstrument,Tenor,Rate\nOIS,1Y,3.5\n".encode())  # UTF-8 BOM
+    assert error is None and excel["instrument"].tolist() == ["OIS"]
+    prefill = rates_data.QuotePrefill(pd.DataFrame({"instrument": ["OIS"], "tenor": ["1Y"], "rate": ["3.5%"]}),
+                                      "file", "upload", "k")  # fmt: skip
+    assert rates_data.provenance(prefill, prefill.table) == ("file", 0)
+    edited = prefill.table.assign(rate=["x"])
+    assert rates_data.provenance(prefill, edited)[1] == 1
+
+
+def test_badges_fit_a_phone_width_chart():
+    """At 390px the one-line badge was cut off after 'ILLUSTRATIVE quotes
+    (not mark', hiding the label that matters."""
+
+    import plotly.graph_objects as go
+
+    from derivx.ui.theme import dark_layout
+
+    fig = dark_layout(go.Figure())
+    source = "USD SOFR | ILLUSTRATIVE quotes (not market data) + SOFR (NY Fed) fixing for 2026-10-16"
+    rates_data.badge(fig, source, EXAMPLE_ASOF)
+    note = fig.layout.annotations[0]
+    lines = note.text.split("<br>")
+    assert max(len(line) for line in lines) <= rates_data.BADGE_WIDTH <= 48
+    assert " ".join(lines) == f"SOURCE: {source} | AS OF 2026-10-19"
+    assert note.xshift == -(fig.layout.margin.l - rates_data.BADGE_INSET)  # starts in the left margin
+    assert fig.layout.margin.t >= 30 + 16 * len(lines)
+
+
+def test_bad_uploads_and_old_dates_are_explained_not_crashed():
+    at = _rates()
+    at.radio(key="rates_source").set_value("UPLOAD").run()
+    _uploader(at, "SWAP QUOTES").set_value(("pct.csv", b"instrument,tenor,rate\nOIS,1Y,3.5%\nOIS,5Y,3.6%\n"
+                                            b"OIS,10Y,3.8%\n", "text/csv")).run()  # fmt: skip
+    assert not at.exception and not at.error
+    assert _metric(at, "PILLARS") == "3" and _quotes(at)["rate"].tolist() == [3.5, 3.6, 3.8]
+    _uploader(at, "SWAP QUOTES").set_value(("n.csv", b"instrument,tenor,rate\nOIS,1,3.5\nOIS,5,3.6\n",
+                                            "text/csv")).run()  # fmt: skip
+    assert not at.exception and any("row 1" in e.value and "'1'" in e.value for e in at.error)
+    # Illustrative quotes do not follow the valuation date: the page says so.
+    at.radio(key="rates_source").set_value("BUNDLED SNAPSHOT").run()
+    at.selectbox(key="rates_asof").set_value(dt.date(2020, 3, 31)).run()
+    assert not at.exception
+    assert any("fixed at 2026-10-19 levels" in w.value for w in at.warning)
+
+
+def test_a_date_missing_from_the_new_data_source_is_reported(monkeypatch):
+    cache = DiskCache(Path(os.environ["DERIVX_CACHE_DIR"]))
+    text = (FIXTURES / "fred_ust.csv").read_text().replace("2026-10-13", "2015-06-15")
+    cache.store(cache.key("FRED", {"ids": "mid-month"}), rs.parse_fred_csv(text), b"x", {"source": "FRED", "url": "f"})
+    monkeypatch.setattr(rh, "refresh_live", lambda *a, **kw: rh.LiveRefresh(ok={"FRED": True}))
+    rates_data._refresh.clear()
+    at = _rates()
+    at.radio(key="rates_source").set_value("LIVE (CACHED)").run()
+    at.selectbox(key="rates_asof").set_value(dt.date(2015, 6, 15)).run()
+    assert not at.exception and _badge(at, "rates_treasury_chart").endswith("AS OF 2015-06-15")
+    at.radio(key="rates_source").set_value("BUNDLED SNAPSHOT").run()
+    assert not at.exception and at.selectbox(key="rates_asof").value == EXAMPLE_ASOF
+    expected = "VALUATION DATE 2015-06-15 is not in the BUNDLED SNAPSHOT history; showing 2026-10-19 instead."
+    assert any(w.value == expected for w in at.warning)
+    rates_data._refresh.clear()
+
+
+def test_prefill_notes_say_what_is_not_market_data():
+    store = rh.bundled_store()
+    gbp = rates_data.swap_prefill(store, "GBP SONIA", dt.date(2013, 8, 30))  # took the July curve before the fix
+    assert gbp.kind == "real" and gbp.table["source"].iloc[-1].endswith("curve 2013-08-30, par OIS derived")
+    assert gbp.table["tenor"].iloc[-1] == "5Y" and any("reaches only 5Y" in n for n in gbp.notes)
+    assert not any("latest curve" in n for n in gbp.notes)
+    today = rates_data.swap_prefill(store, "GBP SONIA", EXAMPLE_ASOF)
+    assert today.table["tenor"].iloc[-1] == "25Y" and not today.notes
+    usd = rates_data.swap_prefill(store, "USD SOFR", dt.date(2020, 3, 31))
+    assert usd.kind == "illustrative" and any("fixed at 2026-10-19 levels" in n for n in usd.notes)
+    assert not rates_data.swap_prefill(store, "USD SOFR", EXAMPLE_ASOF).notes

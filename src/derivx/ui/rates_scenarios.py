@@ -241,7 +241,7 @@ def _history_upload(market: Market) -> None:
             sha = hashlib.sha256(payload + units.encode()).hexdigest()
             if uploads.get(currency, {}).get("sha") != sha:
                 try:
-                    raw = pd.read_csv(io.BytesIO(payload))
+                    raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig")  # Excel adds a BOM
                 except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
                     st.error(f"{file.name}: could not read the file ({exc})")
                     raw = None

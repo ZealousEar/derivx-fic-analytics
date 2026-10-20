@@ -59,6 +59,20 @@ def _list(text: str) -> List[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+def _units(text: str) -> Dict[str, str]:
+    """``ID=unit[,ID=unit]`` -> ``{ID: unit}`` (units as in
+    :data:`derivx.data.rates_sources.UNIT_SCALE`, or ``index``)."""
+
+    allowed = sorted(rs.UNIT_SCALE) + ["index"]
+    out: Dict[str, str] = {}
+    for part in _list(text):
+        sid, sep, unit = part.partition("=")
+        if not sep or not sid.strip() or unit.strip() not in allowed:
+            raise argparse.ArgumentTypeError(f"{part!r}: use SERIES=UNIT with UNIT one of {', '.join(allowed)}")
+        out[sid.strip().upper()] = unit.strip()
+    return out
+
+
 FRED_GROUPS = {
     "UST": rs.UST_FRED_IDS,  # Treasury par (CMT) yields, 1M-30Y
     "ICE": rs.ICE_SWAP_FRED_IDS,  # ICE USD swap rates, 2000-07 to 2016-10-28
@@ -119,8 +133,7 @@ def _fetch(args: argparse.Namespace) -> rs.Fetched:
         common["timeout"] = args.timeout
     source = args.source
     if source == "fred":
-        units = dict(u.split("=", 1) for u in args.units) if args.units else None
-        return rs.fred_series(args.ids, args.start, args.end, units=units, vintage=args.vintage, **common)
+        return rs.fred_series(args.ids, args.start, args.end, units=args.units, vintage=args.vintage, **common)
     if source == "treasury":
         return rs.treasury_par_curve(args.year, **common)
     if source == "nyfed":
@@ -189,7 +202,7 @@ def _register_pull(parser: argparse.ArgumentParser) -> None:
     )
     fred.add_argument("--start", type=_date)
     fred.add_argument("--end", type=_date)
-    fred.add_argument("--units", type=_list, help="units of unknown series, e.g. MYSERIES=percent")
+    fred.add_argument("--units", type=_units, help="units of unknown series, e.g. MYSERIES=percent,OTHER=bp")
     fred.add_argument("--vintage", type=_date, help="data as known on this date (ALFRED; needs $FRED_API_KEY)")
     treasury = add("treasury", "US Treasury daily par yield curve CSV for one year (slow endpoint)")
     treasury.add_argument("--year", type=int, default=dt.date.today().year)

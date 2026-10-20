@@ -42,7 +42,7 @@ from derivx.data import rates_sources as rs
 from derivx.data.cache import REPO_ROOT, DiskCache
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.market_quotes import OIS_PAR_TENORS, par_from_zero_rows
-from derivx.rates.quotes import RATE_RANGE, UNIT_SCALE, Issue, detect_units
+from derivx.rates.quotes import RATE_RANGE, UNIT_SCALE, Issue, ambiguous_units, detect_units
 
 EXAMPLES_DIR = REPO_ROOT / "data" / "examples"
 SAMPLE_DIR = EXAMPLES_DIR / "rates_history"
@@ -293,8 +293,8 @@ class HistoryStore:
                 out = wide.dropna(subset=core, how="any")
             else:
                 out = wide.dropna(how="all")
+            self._dates[key] = list(out.index)  # before _complete: _days() reads it once _complete has the key
             self._complete[key] = out
-            self._dates[key] = list(out.index)
         return self._complete[key]
 
     def _days(self, dataset: str, measure: Optional[str] = None) -> List[dt.date]:
@@ -339,7 +339,7 @@ class HistoryStore:
 
         rows = self.rows(dataset)
         rows = rows[rows["asof"] == day]
-        pairs = sorted({f"{s}, {o}" if o else s for s, o in zip(rows["source"], rows["origin"])})
+        pairs = sorted({f"{s}, {o}" if o and o != s else s for s, o in zip(rows["source"], rows["origin"])})
         return "; ".join(pairs)
 
     # -- curves on a date ----------------------------------------------------
@@ -561,7 +561,7 @@ def refresh_live(
     for name, future in futures.items():
         try:
             fetched = future.result()
-        except (rs.SourceError, ValueError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 - one failing source must never break the page
             out.ok[name] = False
             out.notices.append(f"{name}: unavailable ({exc}); using the cache or the bundled snapshot")
             continue
@@ -596,9 +596,9 @@ def treasury_in_background(year: int, cache: Optional[DiskCache] = None, max_age
         future, started = pending
         if not future.done():
             return running
-        if future.exception() is None:
-            return None
-        if now - started < max_age:
+        if now - started < max_age:  # finished recently: do not start again yet
+            if future.exception() is None:
+                return None
             return f"US Treasury CSV for {year}: background download failed ({future.exception()}); FRED H.15 used"
     _PENDING[key] = (_BACKGROUND.submit(rs.treasury_par_curve, int(year), cache=cache), now)
     return running
@@ -650,6 +650,9 @@ def parse_history_upload(
     if any(i.level == "error" for i in issues):
         return rs.empty_frame(), issues, units
     if units == "auto":
+        reason = ambiguous_units(values)
+        if reason:
+            return rs.empty_frame(), issues + [Issue("error", reason)], units
         units = detect_units(values)
         issues.append(Issue("info", f"Rates read as {units} and converted to decimals"))
     decimal = values * UNIT_SCALE[units]

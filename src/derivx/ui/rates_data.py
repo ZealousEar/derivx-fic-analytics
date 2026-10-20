@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+import math
 import textwrap
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -30,8 +31,9 @@ import streamlit as st
 
 from derivx.data import rates_history as rh
 from derivx.data.rates_history import HistoryStore
+from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import CONVENTIONS
-from derivx.rates.examples import sofr_example_rows
+from derivx.rates.examples import EXAMPLE_ASOF, sofr_example_rows
 
 MODES = ("BUNDLED SNAPSHOT", "LIVE (CACHED)", "UPLOAD")
 LIVE_MAX_AGE = 3600.0  # seconds a download is reused before it is fetched again
@@ -51,6 +53,7 @@ FIXING_LABELS = {
 }
 PROXY_DATASET = {"EUR": "EUR_AAA_ECB"}  # zero curves used as labelled proxies where no OIS curve is free
 REAL_DATASET = {"GBP": "GBP_OIS_BOE"}  # real OIS curves
+SHORT_CURVE_YEARS = 10.0  # a prefilled curve ending before this says that the rest is extrapolated
 
 
 @dataclass
@@ -226,12 +229,27 @@ def _upload_sidebar() -> Tuple[Optional[Dict[str, object]], List[pd.DataFrame], 
     return uploaded, frames, notices
 
 
+def _text_cell(value: object) -> str:
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def _rate_cell(value: object) -> float:
+    """A rate cell as a number (``4.25``, ``"4.25%"``, blank -> NaN);
+    ``ValueError`` if it is not a number."""
+
+    text = _text_cell(value).replace("%", "").strip()
+    return float(text) if text else float("nan")
+
+
 def parse_quote_upload(payload: bytes) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """Uploaded quotes CSV -> (table with instrument, tenor, rate[, source]),
-    or (None, reason). Rates keep the file's units; the page converts them."""
+    or (None, reason). Instrument and tenor become text (a bare ``5`` is
+    then reported as a bad tenor, not read as a number); rates become
+    numbers (a ``%`` sign is dropped) but keep the file's units, which the
+    page reads from their magnitudes unless the user sets them."""
 
     try:
-        raw = pd.read_csv(io.BytesIO(payload))
+        raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig", dtype=str, keep_default_na=False, na_values=[""])
     except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
         return None, f"could not read the file ({exc})"
     raw.columns = [str(col).strip().lower() for col in raw.columns]
@@ -240,8 +258,20 @@ def parse_quote_upload(payload: bytes) -> Tuple[Optional[pd.DataFrame], Optional
     missing = {"instrument", "tenor", "rate"} - set(raw.columns)
     if missing:
         return None, f"missing columns: {', '.join(sorted(missing))}"
-    table = raw[["instrument", "tenor", "rate"]].copy()
-    table["source"] = raw["source"].astype(str) if "source" in raw.columns else "uploaded"
+    table = pd.DataFrame({"instrument": raw["instrument"].map(_text_cell), "tenor": raw["tenor"].map(_text_cell)})
+    rates = []
+    for n, value in enumerate(raw["rate"], start=1):
+        try:
+            rates.append(_rate_cell(value))
+        except ValueError:
+            return None, f"row {n}: rate {value!r} is not a number (use 4.25, 4.25% or 0.0425)"
+    table["rate"] = pd.Series(rates, dtype=float)
+    if "source" in raw.columns:
+        table["source"] = [_text_cell(v) or "uploaded" for v in raw["source"]]
+    else:
+        table["source"] = "uploaded"
+    if table.empty:
+        return None, "the file has no quote rows"
     return table.reset_index(drop=True), None
 
 
@@ -335,6 +365,12 @@ def swap_prefill(store: HistoryStore, conventions: str, asof: dt.date) -> QuoteP
             label = source
             if day != asof:
                 notes.append(f"{info.title}: latest curve on or before {asof} is from {day}")
+            last = list(par)[-1]
+            if parse_tenor(last).years < SHORT_CURVE_YEARS:
+                notes.append(
+                    f"The {info.title} on {day} reaches only {last}: longer rates on this curve are flat-forward "
+                    "extrapolations, not market data."
+                )
     if not rows:
         if dataset:
             notes.append(
@@ -343,6 +379,11 @@ def swap_prefill(store: HistoryStore, conventions: str, asof: dt.date) -> QuoteP
             )
         rows = _illustrative_rows()
         label = "ILLUSTRATIVE quotes (not market data)"
+        if asof != EXAMPLE_ASOF:
+            notes.append(
+                f"The illustrative quotes are fixed at {EXAMPLE_ASOF} levels: they do not follow the valuation date "
+                f"{asof}. Paste or upload quotes for that date."
+            )
     if fixing is not None:
         rows = [r for r in rows if r["tenor"] not in ("ON", "1D")]
         rows.insert(0, fixing)
@@ -360,6 +401,15 @@ def uploaded_prefill(uploaded: Dict[str, object]) -> QuotePrefill:
     return QuotePrefill(table, f"uploaded file {uploaded['name']}", "upload", f"upload_{str(uploaded['sha'])[:10]}")
 
 
+def _number(value: object) -> float:
+    """A table cell as a float (NaN if blank or not a number)."""
+
+    try:
+        return _rate_cell(value)
+    except ValueError:
+        return float("nan")
+
+
 def provenance(prefill: QuotePrefill, edited: pd.DataFrame) -> Tuple[str, int]:
     """(badge label, rows the user changed or added): a row is changed when
     its instrument, tenor or rate differ from the prefill row it started as."""
@@ -371,7 +421,8 @@ def provenance(prefill: QuotePrefill, edited: pd.DataFrame) -> Tuple[str, int]:
             changed += 1
             continue
         ref = base.iloc[i]
-        same_rate = pd.notna(row.get("rate")) and abs(float(row["rate"]) - float(ref["rate"])) < 1e-9
+        mine, theirs = _number(row.get("rate")), _number(ref["rate"])
+        same_rate = (math.isnan(mine) and math.isnan(theirs)) or abs(mine - theirs) < 1e-9
         if str(row.get("instrument")) != str(ref["instrument"]) or str(row.get("tenor")) != str(ref["tenor"]):
             changed += 1
         elif not same_rate:
@@ -386,15 +437,19 @@ def provenance(prefill: QuotePrefill, edited: pd.DataFrame) -> Tuple[str, int]:
 # --------------------------------------------------------------------------
 
 
-BADGE_WIDTH = 96  # characters per badge line before it wraps
+BADGE_WIDTH = 48  # characters per badge line: the whole badge stays visible on a 390px phone
+BADGE_INSET = 4  # px from the figure's left edge (the badge starts in the left margin, not at the plot area)
 
 
 def badge(fig: go.Figure, source: str, asof: dt.date) -> go.Figure:
     """Stamp ``SOURCE ... | AS OF ...`` in the chart's top-left corner (kept
     when the chart is exported or zoomed), wrapped onto as many lines as it
-    needs."""
+    needs. Plotly does not wrap or shrink annotations, so lines are short
+    enough for a phone-width chart; anything cut off would hide labels such
+    as ``(not market data)``."""
 
     lines = textwrap.wrap(f"SOURCE: {source} | AS OF {asof.isoformat()}", BADGE_WIDTH)
+    left = fig.layout.margin.l if fig.layout.margin.l is not None else 80
     fig.add_annotation(
         text="<br>".join(lines),
         xref="paper",
@@ -403,6 +458,7 @@ def badge(fig: go.Figure, source: str, asof: dt.date) -> go.Figure:
         y=1.0,
         xanchor="left",
         yanchor="bottom",
+        xshift=-max(0, left - BADGE_INSET),
         showarrow=False,
         align="left",
         font=dict(family="IBM Plex Mono", size=11, color="#FFA500"),
