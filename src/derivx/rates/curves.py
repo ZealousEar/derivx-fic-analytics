@@ -193,17 +193,17 @@ class Instrument:
             self.end = cal.advance(spot, tenor, self.conv.bdc)
             unadj_end = _unadjusted_end(spot, tenor)
             if kind == "OIS":
-                dates = _schedule(spot, unadj_end, self.conv.ois_fixed_months, cal, self.conv.bdc)
+                dates = swap_schedule(spot, unadj_end, self.conv.ois_fixed_months, cal, self.conv.bdc)
                 lag = self.conv.payment_lag
                 for s, e in zip(dates[:-1], dates[1:]):
                     pay = cal.add_business_days(e, lag) if lag else e
                     self._fixed.append((s, e, pay, year_fraction(s, e, self.conv.ois_day_count)))
                     self._float.append((s, e, pay))
             else:
-                fixed = _schedule(spot, unadj_end, self.conv.irs_fixed_months, cal, self.conv.bdc)
+                fixed = swap_schedule(spot, unadj_end, self.conv.irs_fixed_months, cal, self.conv.bdc)
                 for s, e in zip(fixed[:-1], fixed[1:]):
                     self._fixed.append((s, e, e, year_fraction(s, e, self.conv.irs_fixed_day_count)))
-                flt = _schedule(spot, unadj_end, self.conv.irs_float_months, cal, self.conv.bdc)
+                flt = swap_schedule(spot, unadj_end, self.conv.irs_float_months, cal, self.conv.bdc)
                 self._float = [(s, e, e) for s, e in zip(flt[:-1], flt[1:])]
             self.end = self._fixed[-1][1]
             self.pillar = max(p for _, _, p, _ in self._fixed)
@@ -294,8 +294,13 @@ def _unadjusted_end(start: Date, tenor: Tenor) -> Date:
     return _add_months(start, tenor.months)
 
 
-def _schedule(start: Date, end: Date, months: int, cal: Calendar, bdc: str) -> List[Date]:
-    """Swap schedule; a period shorter than one coupon is a single period."""
+def swap_schedule(start: Date, end: Date, months: int, cal: Calendar, bdc: str) -> List[Date]:
+    """Swap leg schedule (backward from the unadjusted end, front stub).
+
+    A swap no longer than one coupon period (plus a few days of slack for
+    month lengths) is a single period. Swap pricers use this too, so par
+    swaps reprice the curve's own OIS/IRS quotes.
+    """
 
     if (end - start).days <= months * 31:
         return [start, cal.adjust(end, bdc)]
