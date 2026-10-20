@@ -90,23 +90,19 @@ def _shifted(F, K, shift) -> Tuple[np.ndarray, np.ndarray]:
 
 def z_over_x(z, rho) -> np.ndarray:
     """``z / x(z)`` of Hagan's formula, smooth at z = 0 (series for
-    |z| < 1e-6) and free of cancellation for large |z| of either sign."""
+    |z| < 1e-6) and free of cancellation for large |z| of either sign.
+    Elementwise over ``z`` and ``rho`` (broadcast)."""
 
     z = np.asarray(z, dtype=float)
-    rho = np.broadcast_to(np.asarray(rho, dtype=float), z.shape)
-    out = np.empty(z.shape)
+    rho = np.asarray(rho, dtype=float)
     small = np.abs(z) < 1e-6
-    zs, rs = z[small], rho[small]
-    out[small] = 1.0 - 0.5 * rs * zs + (2.0 - 3.0 * rs * rs) * zs * zs / 12.0
-    zl, rl = z[~small], rho[~small]
-    sq = np.sqrt(1.0 - 2.0 * rl * zl + zl * zl)
-    core = (zl * zl - 2.0 * rl * zl) / (sq + 1.0)  # sqrt(B) - 1 without cancellation
+    series = 1.0 - 0.5 * rho * z + (2.0 - 3.0 * rho * rho) * z * z / 12.0
+    zl = np.where(small, 1.0, z)  # placeholder on the series branch (no 0 / 0)
+    sq = np.sqrt(1.0 - 2.0 * rho * zl + zl * zl)
+    core = (zl * zl - 2.0 * rho * zl) / (sq + 1.0)  # sqrt(B) - 1 without cancellation
     with np.errstate(divide="ignore", invalid="ignore"):
-        x_pos = np.log1p((core + zl) / (1.0 - rl))
-        x_neg = -np.log1p((core - zl) / (1.0 + rl))
-    x = np.where(zl >= 0, x_pos, x_neg)
-    out[~small] = zl / x
-    return out
+        x = np.where(zl >= 0, np.log1p((core + zl) / (1.0 - rho)), -np.log1p((core - zl) / (1.0 + rho)))
+        return np.where(small, series, zl / x)
 
 
 def _raw_vols(F, K, T, alpha, beta, rho, nu, shift, vol_type: str) -> np.ndarray:
