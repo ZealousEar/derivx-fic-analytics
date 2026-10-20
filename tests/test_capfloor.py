@@ -594,8 +594,12 @@ def test_tab_renders_and_returns_the_position():
     assert not at.error
     pv = float(at.metric[0].value.replace(",", ""))
     assert pv == pytest.approx(positions[0].pv(example_market()), abs=0.01)
-    assert len(at.get("plotly_chart")) == 2 and len(at.get("download_button")) == 2
+    assert len(at.get("plotly_chart")) == 3 and len(at.get("download_button")) == 2  # strip, vega, ladder
     assert not at.warning
+    labels = [m.label for m in at.metric]
+    assert {"GAMMA (/BP²)", "THETA (1 BUS. DAY)", "VEGA (/1BP)", "PV01 (/BP)"} <= set(labels)
+    theta = float(next(m.value for m in at.metric if m.label == "THETA (1 BUS. DAY)").replace(",", ""))
+    assert theta < 0  # a long cap loses time value
 
 
 WIDGETS = {
@@ -609,6 +613,9 @@ WIDGETS = {
     "cap_atm_offset_bp": "number_input",
     "cap_strike_pct": "number_input",
     "cap_flat_vol_bachelier": "number_input",
+    "cap_strip_layout": "radio",
+    "cap_strip_method": "radio",
+    "cap_smile_expiry": "selectbox",
 }
 
 
@@ -635,6 +642,48 @@ def test_tab_handles_edge_inputs(changes):
     assert len(at.session_state["cap_test_positions"]) == 1
     beyond_curve = any("after the curve's last quote" in w.value for w in at.warning)
     assert beyond_curve == (changes.get("cap_forward_start") == "10Y")  # 10Yx30Y pays past the 30Y quote
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"cap_vol_mode": "Stripped from cap quotes"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_method": "Linear", "cap_tenor": "7Y"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike",
+         "cap_smile_expiry": "10Y (9.75Y)"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike", "cap_strike_mode": "Absolute %",
+         "cap_strike_pct": 4.25, "cap_kind": "Floor", "cap_forward_start": "2Y"},
+    ],
+)  # fmt: skip
+def test_tab_strips_caplet_vols_from_cap_quotes(changes):
+    at = _app()
+    for key, value in changes.items():
+        _set(at, key, value)
+    assert not at.error, [e.value for e in at.error]
+    charts = [c.proto.id for c in at.get("plotly_chart")]
+    assert any(i.endswith("cap_vol_strip_chart") for i in charts)
+    assert any(i.endswith("cap_smile_chart") for i in charts) == (changes.get("cap_strip_layout") == "By strike")
+    repricing = next(d.value for d in at.dataframe if "ERROR (BP UPFRONT)" in d.value.columns)
+    assert repricing["ERROR (BP UPFRONT)"].abs().max() < 1e-9
+    position = at.session_state["cap_test_positions"][0]
+    assert position.details["trade"].stripped_vol
+    strip = json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith("cap_vol_strip_chart")).proto.spec)
+    badge = next(a["text"] for a in strip["layout"]["annotations"] if a["text"].startswith("SOURCE:"))
+    assert "ILLUSTRATIVE" in badge
+
+
+def test_stripped_vols_need_the_normal_model_and_show_quote_vegas():
+    at = _app()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    five = vegas.loc[vegas["QUOTED CAP"] == "5Y", "VEGA (PER +1BP FLAT VOL)"].iloc[0]
+    assert five == pytest.approx(total, rel=0.01)  # the 5Y ATM cap is the 5Y quote: its vega sits on that quote
+    _set(at, "cap_model", "Black (%)")
+    assert at.error and "pick the Normal (bp) model" in at.error[0].value
+    assert at.session_state["cap_test_positions"] == []
 
 
 def test_tab_reports_black_with_a_negative_strike_as_an_error():
