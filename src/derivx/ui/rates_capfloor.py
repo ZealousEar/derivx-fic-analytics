@@ -1,5 +1,9 @@
-"""CAP / FLOOR tab: caps and floors on the swap curve's term rate, priced
-with the Bachelier (normal), Black or shifted Black model."""
+"""CAP / FLOOR tab: caps and floors on a term rate, priced with the
+Bachelier (normal), Black or shifted Black model.
+
+On a single-curve market the term rate projects on the swap curve. On a
+multi-curve market (EUR) the cap is on EURIBOR 3M or 6M: forwards from its
+projection curve, discounting on €STR, and key-rate risk bucketed per curve."""
 
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from plotly.subplots import make_subplots
 from derivx.rates.capfloor import CapFloor, cap_floor_parity, capfloor_position
 from derivx.rates.curves import Market
 from derivx.risk.sensitivities import Position, key_rate_pv01, parallel_pv01
+from derivx.ui import rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -163,7 +168,10 @@ def render(market: Market) -> List[Position]:
     )
     tenor = c3.selectbox("TENOR", TENORS, index=TENORS.index("5Y"), key="cap_tenor")
     fwd = c4.selectbox("FORWARD START", FORWARD_STARTS, key="cap_forward_start")
-    index_months = int(c5.radio("INDEX", ["3M", "6M"], horizontal=True, key="cap_index")[:-1])
+    indices = [k for k in market.projections if not market.projections.is_discount(k)]
+    index_choice = c5.radio("INDEX", indices or ["3M", "6M"], horizontal=True, key="cap_index")
+    projection = index_choice if indices else None
+    index_months = market.get_curve(projection).index.months if projection else int(index_choice[:-1])
 
     c1, c2, c3, c4 = st.columns(4)
     strike_mode = c1.radio("STRIKE", ["ATM ± bp", "Absolute %"], horizontal=True, key="cap_strike_mode")
@@ -194,10 +202,18 @@ def render(market: Market) -> List[Position]:
         else:
             st.caption("Vol by option expiry (years to fixing), linear in expiry and flat outside the table.")
             vol = _vol_table(model)
-        terms = dict(
-            forward_start=None if fwd == "Spot" else fwd, index_months=index_months, day_count=day_count,
-            calendar=calendar, fixing_lag=fixing_lag,
-        )
+        if projection:
+            index = market.get_curve(projection).index
+            terms = dict(
+                forward_start=None if fwd == "Spot" else fwd, index_months=index.months, day_count=index.day_count,
+                calendar=index.calendar, fixing_lag=index.fixing_lag, projection=projection,
+            )  # fmt: skip
+            calendar, day_count, fixing_lag = index.calendar, index.day_count, index.fixing_lag
+        else:
+            terms = dict(
+                forward_start=None if fwd == "Spot" else fwd, index_months=index_months, day_count=day_count,
+                calendar=calendar, fixing_lag=fixing_lag,
+            )
         atm = CapFloor(notional, kind, 0.0, tenor, 0.0, **terms).atm_strike(market)
         strike = strike_pct / 100 if strike_mode == "Absolute %" else atm + offset_bp * 1e-4
         cf = CapFloor(notional, kind, strike, tenor, vol, model, shift, **terms)
@@ -206,8 +222,16 @@ def render(market: Market) -> List[Position]:
         pv = float(table["pv"].sum())
         vega = float(table["vega"].sum())
         premium_bp = cf.premium_bp_running(market)
-        pv01 = parallel_pv01(position.pv, market)
-        ladder = key_rate_pv01(position.pv, market)
+        if market.is_multi_curve:
+            trade = ("cap", repr(position.details["trade"]))
+            curves = rates_risk.projection_chain(market, projection)
+            ladders = rates_risk.ladders(market, position.pv, trade, curves)
+            pv01 = rates_risk.rate_pv01(market, position.pv, trade)
+            ladder = [dict(r, pv01=float(v)) for key in curves for r, v in zip(*ladders[key])]
+        else:
+            ladders = None
+            pv01 = parallel_pv01(position.pv, market)
+            ladder = key_rate_pv01(position.pv, market)
         parity = cap_floor_parity(cf, market)
     except ValueError as err:
         st.error(f"Cannot price this {kind}: {err}")
@@ -221,9 +245,13 @@ def render(market: Market) -> List[Position]:
     m[3].metric("ATM STRIKE (%)", f"{atm * 100:.4f}")
     m[4].metric(f"VEGA (/{per})", f"{vega:,.2f}")
     m[5].metric("PV01 (/BP)", f"{pv01:,.2f}")
+    shift_text = (
+        "+1bp on every rate quote of the OIS and EURIBOR curves, rebuilt (basis spreads held)"
+        if ladders is not None else "+1bp on every curve quote with the curve rebuilt"
+    )  # fmt: skip
     st.caption(
         f"{cf.label}, {len(table)} {kind}lets. PV, vega and PV01 are P&L to the holder in "
-        f"currency for the notional; PV01 is +1bp on every curve quote with the curve rebuilt. Running premium is "
+        f"currency for the notional; PV01 is {shift_text}. Running premium is "
         f"PV over the strip annuity (sum of notional x accrual x DF). Cap - floor - payer swap = "
         f"{parity['residual']:.2e}."
     )
@@ -232,8 +260,10 @@ def render(market: Market) -> List[Position]:
         f"{day_count} accrual; each rate fixes {fixing_lag} business days before its period starts and pays at "
         "the period end. A spot-starting cap leaves out the first period (it fixes at trade); a forward start is "
         "spot plus the forward period, modified following, as on the swap tab. Option time is ACT/365F to the "
-        "fixing; one curve projects and discounts."
-    )
+        "fixing; "
+        + (f"forwards from the {projection} projection curve, discounting on the OIS curve." if projection
+           else "one curve projects and discounts.")
+    )  # fmt: skip
     if vol_mode == "Flat" and vol == 0.0:
         st.warning("Zero vol: every caplet is worth only its intrinsic value on the forward.")
     pillars = market.curve.pillar_dates
@@ -253,16 +283,32 @@ def render(market: Market) -> List[Position]:
         on_click="ignore", key="cap_caplets_csv",
     )
 
-    st.markdown("### / KEY-RATE PV01")
-    st.plotly_chart(_ladder_chart(ladder), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_ladder_chart")
-    ladder_view = pd.DataFrame({"QUOTE": [r["label"] for r in ladder], "PV01 (/BP)": [r["pv01"] for r in ladder]})
+    st.markdown("### / KEY-RATE PV01" + (" BY CURVE" if ladders is not None else ""))
+    if ladders is None:
+        st.plotly_chart(_ladder_chart(ladder), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_ladder_chart")
+        ladder_view = pd.DataFrame({"QUOTE": [r["label"] for r in ladder], "PV01 (/BP)": [r["pv01"] for r in ladder]})
+    else:
+        for key in ladders:
+            rows, values = ladders[key]
+            st.markdown(f"#### {rates_risk.curve_title(market, key)}")
+            chart_key = "cap_ladder_chart" if key == "curve" else f"cap_ladder_chart_{key.lower().replace(' ', '_')}"
+            st.plotly_chart(rates_risk.ladder_chart([r["label"] for r in rows], values, name=kind.upper()),
+                            width="stretch", config=PLOTLY_2D_CONFIG, key=chart_key)  # fmt: skip
+        ladder_view = pd.DataFrame(
+            {
+                "CURVE": [rates_risk.curve_title(market, key) for key in ladders for _ in ladders[key][0]],
+                "QUOTE": [r["label"] for r in ladder],
+                "PV01 (/BP)": [r["pv01"] for r in ladder],
+            }
+        )
     st.dataframe(ladder_view, width="stretch", hide_index=True, column_config=CAPLET_FORMATS)
     st.download_button(
         "DOWNLOAD KEY-RATE PV01 CSV", ladder_view.to_csv(index=False), file_name=f"{kind}_key_rate_pv01.csv",
         mime="text/csv", on_click="ignore", key="cap_ladder_csv",
     )
     st.caption(
-        f"P&L for +1bp on one curve quote at a time (central difference, curve rebuilt). Buckets sum to "
-        f"{sum(r['pv01'] for r in ladder):,.2f} against a parallel PV01 of {pv01:,.2f}."
+        "P&L for +1bp on one curve quote at a time (central difference, curve rebuilt"
+        + ("; an OIS bump rebuilds the EURIBOR curves on it, quotes held" if ladders is not None else "")
+        + f"). Buckets sum to {sum(r['pv01'] for r in ladder):,.2f} against a parallel PV01 of {pv01:,.2f}."
     )
     return [position]

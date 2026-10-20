@@ -1,11 +1,17 @@
 """Swap tab of the Rates page: price one vanilla swap, show its cash flows
-and key-rate risk, and size benchmark par swaps that hedge it."""
+and key-rate risk, and size benchmark par swaps that hedge it.
+
+On a multi-curve market (EUR with EURIBOR projection curves) the float leg
+can be EURIBOR 6M or 3M, projected on its own curve and discounted on €STR;
+key-rate risk is then bucketed per curve (discount and each projection) and
+the hedge uses OIS swaps, swaps against EURIBOR and 3s6s basis swaps."""
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -18,11 +24,14 @@ from derivx.rates.swaps import (
     CurveBumps,
     VanillaSwap,
     curve_bumps,
+    hedge_multi_curve,
+    hedge_set,
     hedge_with_benchmarks,
     key_rate_matrix,
     swap_position,
 )
 from derivx.risk.sensitivities import Position
+from derivx.ui import rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -80,13 +89,22 @@ def _conventions_note(swap: VanillaSwap, conv: CurveConventions, market: Market)
     fixed_dates, _ = swap.schedule_dates(market.asof)
     if swap.float_index == "OIS":
         index = "overnight rate compounded daily"
+    elif swap.projection:
+        index = f"{swap.projection} fixed {swap.fixing_lag} business days before each period"
     else:
         index = f"term rate fixed {swap.fixing_lag} business days before each period"
     lag = f", both legs paid {swap.payment_lag} business days after each period end" if swap.payment_lag else ""
+    if swap.projection:
+        curves = f"The {swap.projection} curve projects the float leg; the {conv.name} curve discounts both legs."
+    elif market.is_multi_curve and swap.float_index == "TERM":
+        curves = "The term leg projects on the OIS curve (single-curve approximation); it discounts both legs."
+    else:
+        curves = "One curve projects and discounts both legs."
+    name = swap.projection or conv.name
     return (
-        f"{conv.name} conventions: start {fixed_dates[0]}, maturity {fixed_dates[-1]}; fixed leg {swap.fixed_months}M "
+        f"{name} conventions: start {fixed_dates[0]}, maturity {fixed_dates[-1]}; fixed leg {swap.fixed_months}M "
         f"{swap.fixed_day_count}; float leg {index}, {swap.float_months}M {swap.float_day_count}{lag}; "
-        f"{swap.calendar} calendar, {swap.bdc}. One curve projects and discounts both legs."
+        f"{swap.calendar} calendar, {swap.bdc}. {curves}"
     )
 
 
@@ -183,13 +201,16 @@ def _swap_inputs(market: Market, conv: CurveConventions) -> Optional[Tuple[Vanil
         "NOTIONAL ($)", min_value=1e3, max_value=1e11, value=1e7, step=1e6, format="%.0f", key="swap_notional"
     )
     side = c2.radio("DIRECTION", ["Receive fixed", "Pay fixed"], horizontal=True, key="swap_side")
+    indices = [k for k in market.projections if not market.projections.is_discount(k)]
     kind = c3.radio(
         "CONVENTIONS",
-        ["OIS", "IRS"],
+        ["OIS", "IRS", *indices],
         horizontal=True,
         key="swap_kind",
         help="OIS: compounded overnight rate against fixed, on the curve's OIS legs. "
-        "IRS: term rate fixed in advance against fixed, on the curve's IRS legs.",
+        "IRS: term rate fixed in advance against fixed, on the curve's IRS legs, projected on the OIS curve "
+        "(single-curve). EURIBOR 6M/3M: fixed annual 30/360 against EURIBOR, projected on its own curve and "
+        "discounted on OIS (multi-curve).",
     )
 
     c1, c2, c3 = st.columns(3)
@@ -223,18 +244,18 @@ def _swap_inputs(market: Market, conv: CurveConventions) -> Optional[Tuple[Vanil
     if errors:
         return None
     try:
-        swap = VanillaSwap.from_conventions(
-            conv,
-            tenor,
-            0.0,
+        terms = dict(
             notional=float(notional),
             receive_fixed=side == "Receive fixed",
-            kind=kind,
             forward_start=forward_start,
             spread=spread_bp * 1e-4,
             maturity=maturity,
             trade_date=asof,
         )
+        if kind in indices:
+            swap = VanillaSwap.from_index(kind, tenor, 0.0, **terms)
+        else:
+            swap = VanillaSwap.from_conventions(conv, tenor, 0.0, kind=kind, **terms)
         par = swap.par_rate(market)
     except ValueError as exc:
         st.error(f"Cannot build this swap: {exc}")
@@ -268,6 +289,8 @@ def render(market: Market) -> List[Position]:
     if pillars and swap.periods(market.asof)[-1].pay > pillars[-1]:
         st.warning(f"The swap pays after the curve's last quote ({pillars[-1]}); forwards beyond it are held flat.")
 
+    if market.is_multi_curve:
+        return _render_multi_curve(swap, par, market, positions)
     bumps, no_risk = _bumps(market)
     pv01 = None if bumps is None else bumps.parallel_pv01(swap.pv)
     m1, m2, m3, m4 = st.columns(4)
@@ -339,6 +362,141 @@ def render(market: Market) -> List[Position]:
         "Least-squares notionals of the benchmark swaps that minimise the residual ladder (PV01 columns are ladder "
         "sums). Risk removed is the share of the squared ladder taken out; buckets between benchmarks cannot be "
         "hedged exactly."
+    )
+    if st.checkbox("ADD HEDGES TO THE PORTFOLIO", value=False, key="swap_add_hedges"):
+        positions += hedge["positions"]
+    return positions
+
+
+# --------------------------------------------------------------------------
+# Multi-curve
+# --------------------------------------------------------------------------
+
+
+def _slug(key: str) -> str:
+    return key.lower().replace(" ", "_")
+
+
+def _default_benchmarks(market: Market, swap: VanillaSwap, key: str) -> List[str]:
+    """OIS benchmarks always; on a projection curve only where the swap
+    projects (its index and the curve it rides on)."""
+
+    if key == "curve":
+        return list(BENCHMARK_TENORS)
+    chain, index = [], swap.projection
+    while index:
+        chain.append(index)
+        index = getattr(market.get_curve(index), "basis_index", None)
+    return list(BENCHMARK_TENORS) if key in chain else []
+
+
+def _render_multi_curve(swap: VanillaSwap, par: float, market: Market, positions: List[Position]) -> List[Position]:
+    """Metrics, per-curve ladders and the multi-curve hedge."""
+
+    curves = rates_risk.risk_keys(market)
+    try:
+        ladders = rates_risk.ladders(market, swap.pv, ("swap", swap), curves)
+        pv01 = rates_risk.rate_pv01(market, swap.pv, ("swap", swap))
+    except ValueError as exc:
+        st.error(f"Cannot rebuild the curves with bumped quotes, so risk is not available: {exc}")
+        return positions
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("PV ($)", _num(swap.pv(market), 0))
+    gap_bp = round((swap.fixed_rate - par) * 1e4, 2) + 0.0
+    m2.metric("PAR RATE (%)", f"{par * 100:.4f}", delta=f"{gap_bp:+.2f} bp fixed - par", delta_color="off")
+    m3.metric("ANNUITY ($ PER BP)", _num(swap.annuity(market)))
+    m4.metric("PV01 ($, +1BP)", _num(pv01))
+    st.caption(
+        "PV and every risk number are signed P&L to you. PV01 is the P&L for +1bp on every rate quote of every "
+        "curve (the OIS curve and each EURIBOR curve, rebuilt; tenor basis spreads held), central difference: a "
+        "receiver loses when rates rise. Annuity is the PV of 1bp a year on the remaining fixed leg, on OIS "
+        "discounting."
+    )
+
+    st.markdown("#### / CASH FLOWS")
+    table = _cashflow_table(swap, market)
+    st.dataframe(table, hide_index=True, width="stretch", column_config=CASHFLOW_FORMATS)
+    st.download_button("Download cash flows CSV", _csv(table), file_name="swap_cashflows.csv", key="swap_cf_csv")
+    st.caption("Amounts are signed to you (+ received, - paid); float rates include the spread. DF is the OIS curve.")
+
+    st.markdown("### / KEY-RATE PV01 BY CURVE")
+    ladder_slot = st.container()
+
+    st.markdown("### / HEDGE")
+    st.caption(
+        "Par instruments per curve, sized together to flatten every curve's ladder: OIS swaps on the discount "
+        "curve, swaps against EURIBOR on a curve built from swap quotes, 3s6s basis swaps on a curve built from "
+        "basis quotes."
+    )
+    benchmarks: Dict[str, List[str]] = {}
+    cols = st.columns(len(curves))
+    for col, key in zip(cols, curves):
+        # Projection benchmarks default to the swap's own index chain: the key follows the index so a new
+        # index starts from its defaults.
+        widget = "swap_hedge_tenors" if key == "curve" else f"swap_hedge_{_slug(key)}_{_slug(swap.projection or 'ois')}"
+        kind = "OIS SWAPS" if key == "curve" else (
+            "3S6S BASIS SWAPS" if getattr(market.get_curve(key), "basis_index", None) else f"SWAPS VS {key}"
+        )  # fmt: skip
+        picked = col.multiselect(f"{rates_risk.curve_title(market, key)}: {kind}", HEDGE_TENORS,
+                                 default=_default_benchmarks(market, swap, key), key=widget)  # fmt: skip
+        if picked:
+            benchmarks[key] = picked
+    hedge = None
+    if benchmarks:
+        frozen = tuple((k, tuple(v)) for k, v in benchmarks.items())
+        try:
+            bumps = {k: rates_risk.bumps(market, k) for k in curves}
+            units = rates_risk.cached("hedge_set", (rates_risk.market_key(market), frozen),
+                                      lambda: hedge_set(market, benchmarks, bumps=bumps))  # fmt: skip
+            hedge = hedge_multi_curve(swap_position(swap), market, hedges=units, ladders=ladders)
+        except ValueError as exc:
+            st.error(f"Cannot size the hedge: {exc}")
+
+    with ladder_slot:
+        shown = 0
+        for key in curves:
+            rows, values = ladders[key]
+            if key != "curve" and not rates_risk.loads_on(values):
+                continue
+            residual = [r["residual"] for r in hedge["ladders"][key]] if hedge else None
+            st.markdown(f"#### {rates_risk.curve_title(market, key)}")
+            chart_key = "swap_ladder_chart" if key == "curve" else f"swap_ladder_chart_{_slug(key)}"
+            st.plotly_chart(rates_risk.ladder_chart([r["label"] for r in rows], values, residual, name="SWAP"),
+                            width="stretch", config=PLOTLY_2D_CONFIG, key=chart_key)  # fmt: skip
+            shown += 1
+        skipped = [k for k in curves if k != "curve" and not rates_risk.loads_on(ladders[k][1])]
+        total = sum(float(np.sum(v)) for _, v in ladders.values())
+        st.caption(
+            "P&L for +1bp on one quote of one curve at a time (central difference). Bumping an OIS quote rebuilds "
+            "the EURIBOR curves on the moved OIS curve with their own quotes held, so the discount ladder carries "
+            f"the trade's whole response to OIS. Ladders sum to {_num(total)} across curves"
+            + (f"; no risk to {', '.join(skipped)}." if skipped else ".")
+        )
+
+    if hedge is None:
+        if not benchmarks:
+            st.info("Pick at least one benchmark tenor to size a hedge.")
+        return positions
+    rows = pd.DataFrame(
+        {
+            "CURVE": [rates_risk.curve_title(market, h["curve"]) for h in hedge["hedges"]],
+            "BENCHMARK": [h["benchmark"] for h in hedge["hedges"]],
+            "DIRECTION": [h["direction"] for h in hedge["hedges"]],
+            "NOTIONAL ($)": [abs(h["notional"]) for h in hedge["hedges"]],
+            "PAR (%)": [h["par"] * 100.0 for h in hedge["hedges"]],
+            "PV01 ($, +1BP)": [h["pv01"] for h in hedge["hedges"]],
+        }
+    )
+    h1, h2, h3 = st.columns(3)
+    h1.metric("SWAP LADDER SUM ($)", _num(sum(hedge["position_pv01"].values())))
+    h2.metric("HEDGED LADDER SUM ($)", _num(sum(hedge["hedged_pv01"].values())))
+    h3.metric("LADDER RISK REMOVED (%)", f"{hedge['risk_removed'] * 100:.2f}")
+    formats = {**HEDGE_FORMATS, "PAR (%)": st.column_config.NumberColumn(format="%.4f")}
+    st.dataframe(rows, hide_index=True, width="stretch", column_config=formats)
+    st.download_button("Download hedge CSV", _csv(rows), file_name="swap_hedge.csv", key="swap_hedge_csv")
+    st.caption(
+        "Least-squares notionals that minimise the stacked residual ladder of every curve (PV01 columns are ladder "
+        "sums over all curves). PAR is the par fixed rate of a swap or the par spread of a basis swap."
     )
     if st.checkbox("ADD HEDGES TO THE PORTFOLIO", value=False, key="swap_add_hedges"):
         positions += hedge["positions"]
