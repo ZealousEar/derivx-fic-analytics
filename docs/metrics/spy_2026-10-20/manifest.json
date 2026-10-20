@@ -1,0 +1,60 @@
+{
+  "manifest_version": 1,
+  "kind": "metrics",
+  "created_at_utc": "2026-10-20T21:53:06+00:00",
+  "code": {
+    "sha": "59ff7a2e5d72621d7c53d5ec8b059b7f38037f58",
+    "dirty": false,
+    "package": "derivx"
+  },
+  "packages": {
+    "python": "3.11.17",
+    "derivx": "0.1.0",
+    "numpy": "1.26.4",
+    "scipy": "1.17.1",
+    "pandas": "2.1.4",
+    "streamlit": "1.66.0",
+    "plotly": "7.1.0",
+    "yfinance": "0.2.66",
+    "pyarrow": "13.0.0"
+  },
+  "platform": {
+    "system": "Linux",
+    "machine": "x86_64",
+    "python": "3.11.17"
+  },
+  "inputs": {
+    "argv": [
+      "--outdir",
+      "docs/metrics/spy_2026-10-20"
+    ],
+    "min_volume": 10,
+    "min_mid": 0.1,
+    "max_spread": 0.4
+  },
+  "data": {
+    "source": "bundled sample: real SPY chain from Yahoo Finance (delayed quotes), one snapshot",
+    "ticker": "SPY",
+    "trade_dates": [
+      "2026-10-20"
+    ],
+    "fetched_at_utc": "2026-10-20T20:59:39+00:00",
+    "rows": 10040,
+    "expiries": 31,
+    "files": [
+      "data/examples/spy_2026-10-20.csv.gz"
+    ],
+    "data_sha256": "2fa7d599651ed6564caa6a3d4501dd228bffec7b1f30dfbbed660b30be3188b9"
+  },
+  "model": {
+    "rate_cc": 0.0,
+    "min_days": 2.0,
+    "max_days": null,
+    "sabr_beta": 1.0,
+    "cv_folds": 5,
+    "std_band_sd": 3.0,
+    "min_points": 8,
+    "expiries": "all"
+  },
+  "seed": null
+}
