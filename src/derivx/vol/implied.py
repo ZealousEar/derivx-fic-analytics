@@ -43,8 +43,9 @@ STATUS: Dict[str, str] = {
     "invalid_input": "non-finite input, F + shift <= 0, K + shift <= 0, T < 0 or df <= 0",
     "expired": "T == 0: an expired option has no time value to imply a vol from",
     "below_intrinsic": "price below the zero-vol (intrinsic) value: no vol reproduces it",
-    "no_time_value": "time value is zero to float precision: the vol is not identifiable",
-    "above_upper_bound": "price at or above the infinite-vol value (F df for a call, K df for a put)",
+    "no_time_value": "time value is zero to float precision (or subnormal): the vol is not identifiable",
+    "above_upper_bound": "price at or above the infinite-vol value (F df for a call, K df for a put), to float "
+    "precision",
     "no_convergence": "the solver did not converge",
 }
 
@@ -255,14 +256,23 @@ def _prepare(price, F, K, T, df, shift, is_call):
     return shape, call.ravel(), arrays
 
 
+def _price_tol(undisc: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Rounding tolerance of an OTM-equivalent price: the ITM -> OTM parity
+    subtraction loses up to ``eps * max(price, F, K)``."""
+
+    return 64 * _EPS * np.maximum(np.abs(undisc), scale)
+
+
 def _otm_target(undisc: np.ndarray, intrinsic_itm: np.ndarray, itm: np.ndarray, scale: np.ndarray):
-    """OTM-equivalent price and the status of each quote before solving."""
+    """OTM-equivalent price and the status of each quote before solving
+    (a subnormal OTM price carries too few digits to imply a vol from)."""
 
     otm = np.where(itm, undisc - intrinsic_itm, undisc)
-    tol = 64 * _EPS * np.maximum(np.abs(undisc), scale)
+    tol = _price_tol(undisc, scale)
     status = np.full(otm.shape, "ok", dtype=object)
     status[otm < -tol] = "below_intrinsic"
     status[(otm >= -tol) & (otm <= np.where(itm, tol, 0.0))] = "no_time_value"
+    status[(status == "ok") & (otm < np.finfo(float).tiny * np.maximum(scale, 1.0))] = "no_time_value"
     return otm, status
 
 
@@ -290,7 +300,10 @@ def implied_black_vol(price, F, K, T, is_call=True, df=1.0, shift=0.0) -> Implie
         intrinsic = np.abs(fl - kl)
         target, st = _otm_target(undisc, intrinsic, itm, np.maximum(fl, kl))
         upper = np.where(otm_call, fl, kl)
-        st[(st == "ok") & (target >= upper * (1.0 - 4 * _EPS))] = "above_upper_bound"
+        # Within rounding of the infinite-vol bound the price no longer pins the vol down (a 60% vol
+        # error at std 16 was reported as solved): the same tolerance as for zero time value.
+        near_bound = upper - target <= _price_tol(undisc, np.maximum(fl, kl))
+        st[(st == "ok") & near_bound] = "above_upper_bound"
         solve = st == "ok"
         if np.any(solve):
             j = np.flatnonzero(solve)
@@ -448,8 +461,10 @@ def hagan_normal_vol_approx(F, K, T, vol, shift=0.0):
     ``vol_n ~ vol sqrt(fk) (1 + l^2/24 + l^4/1920) / (1 + vol^2 T/24 + vol^4 T^2/5760)``
 
     with ``f = F + shift``, ``k = K + shift`` and ``l = ln(f/k)``. Smooth at
-    the money (no 0/0); accurate to a fraction of a bp for usual inputs. Use
-    :func:`lognormal_to_normal_vol` where exactness matters."""
+    the money (no 0/0). The error grows with ``vol^2 T``: within 0.1% of the
+    exact conversion up to ``vol^2 T`` of about 3 on ``|ln K/F| <= 1``, but
+    1% at ``vol^2 T = 10`` and 9% at 30. Use :func:`lognormal_to_normal_vol`
+    where exactness matters."""
 
     F, K, T, vol, shift = _as_float_arrays(F, K, T, vol, shift)
     f, k = F + shift, K + shift
