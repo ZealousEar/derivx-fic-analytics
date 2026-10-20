@@ -480,6 +480,64 @@ def test_a_cap_with_no_caplet_left_after_the_first_is_excluded(market):
 
 
 # --------------------------------------------------------------------------
+# Theta and gamma (RR-9)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model,vol,shift", MODELS)
+def test_decay_is_the_time_value_lost_to_the_next_business_day(market, model, vol, shift):
+    cf = CapFloor(1e7, "cap", 0.0365, "5Y", vol, model, shift, forward_start="3M")
+    table = cf.caplets(market)
+    days = 1  # Monday 2026-10-19 -> Tuesday
+    expected = 0.0
+    for row in table.itertuples():
+        scale = 1e7 * row.tau * row.df
+        later = max(row.expiry - days / 365.0, 0.0)
+        expected += scale * (model_price(model, row.forward, cf.strike, later, row.vol, shift)
+                             - model_price(model, row.forward, cf.strike, row.expiry, row.vol, shift))  # fmt: skip
+    assert cf.decay(market) == pytest.approx(expected, rel=1e-12)
+    assert cf.decay(market) < 0 and replace(cf, notional=-1e7).decay(market) == pytest.approx(-expected, rel=1e-12)
+    friday = Market(bootstrap(D("2026-10-23"), [CurveQuote(r["kind"], r["tenor"], r["rate"])
+                                                for r in sofr_example_rows()], "USD SOFR"))  # fmt: skip
+    assert cf.decay(friday) == pytest.approx(cf.decay(friday, days=3), rel=1e-15)  # Friday -> Monday
+    assert cf.decay(market, days=0) == 0.0
+    with pytest.raises(ValueError, match="0 or more"):
+        cf.decay(market, days=-1)
+
+
+def test_a_caplet_fixing_tomorrow_decays_to_its_intrinsic_value(market):
+    probe = CapFloor(1e7, "cap", 0.03, "6M", 0.01, start=dt.date(2026, 10, 22), exclude_first=False)
+    cf = replace(probe, strike=float(probe.caplets(market)["forward"].iloc[0]))  # first caplet at the money
+    table = cf.caplets(market)
+    first = table.iloc[0]
+    assert first["fix"] == dt.date(2026, 10, 20) and first["expiry"] == pytest.approx(1 / 365)
+    lost = -first["pv"]  # at the money: intrinsic value zero, so its whole value goes
+    assert lost < 0
+    rest = cf.decay(market) - lost
+    assert rest < 0 and abs(rest) < abs(lost)  # the second caplet, 3M longer, loses less in one day
+
+
+def test_full_theta_and_curve_gamma_of_caps_and_floors(market):
+    from derivx.risk.scenarios import carry_market, theta
+    from derivx.risk.sensitivities import rate_pv01_gamma
+
+    cap = CapFloor(1e7, "cap", 0.036, "5Y", 0.0095)
+    floor = replace(cap, kind="floor")
+    positions = [capfloor_position(cap, market.asof), capfloor_position(floor, market.asof)]
+    full = theta(positions, market)
+    rolled = carry_market(market, 1)
+    for value, position in zip(full, positions):
+        assert value == pytest.approx(position.pv(rolled) + position.cash(rolled, market.asof, rolled.asof)
+                                      - position.pv(market), rel=1e-12)  # fmt: skip
+    assert full[0] < 0 and full[1] < 0  # long options lose time value
+    (pv01_c, gamma_c), (pv01_f, gamma_f) = (rate_pv01_gamma(p.pv, market) for p in positions)
+    assert pv01_c > 0 > pv01_f and gamma_c > 0 and gamma_f > 0
+    swap_pv01, swap_gamma = rate_pv01_gamma(cap.swap_pv, market)  # cap - floor = payer swap on the strip
+    assert pv01_c - pv01_f == pytest.approx(swap_pv01, rel=1e-9)
+    assert gamma_c - gamma_f == pytest.approx(swap_gamma, abs=0.5)
+
+
+# --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
 

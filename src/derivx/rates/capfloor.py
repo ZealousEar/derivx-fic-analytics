@@ -20,8 +20,12 @@ QuantLib's ``Cap``/``Floor`` on an ``IborLeg`` with ``BlackCapFloorEngine``
 (``tests/test_capfloor.py``, ``tests/test_multicurve.py``).
 
 Vols are in each model's own units: normal (Bachelier) vol in rate units
-(1bp = 1e-4), lognormal vol as a decimal (0.20 = 20%). Vegas are P&L per
-+1bp of normal vol or per +1 vol point of lognormal vol.
+(1bp = 1e-4), lognormal vol as a decimal (0.20 = 20%): one flat vol, an
+``{expiry: vol}`` term structure, or caplet vols stripped from cap quotes
+(:mod:`derivx.rates.capvol`). Vegas are P&L per +1bp of normal vol or per
++1 vol point of lognormal vol; :meth:`CapFloor.decay` is the time decay to
+the next business day with forwards, discount factors and vols held (the
+full one-day theta, curves rolled, is :func:`derivx.risk.scenarios.theta`).
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ MODELS = ("bachelier", "black", "shifted_black")
 KINDS = ("cap", "floor")
 INDEX_MONTHS = (1, 3, 6, 12)
 VOL_UNIT = {"bachelier": 1e-4, "black": 0.01, "shifted_black": 0.01}  # 1bp normal, 1 vol point lognormal
-VolInput = Union[float, Mapping[float, float]]
+VolInput = Union[float, Mapping[float, float], object]  # or a stripped vol object with caplet_vols(expiry, strike)
 
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _EPS = np.finfo(float).eps
@@ -366,9 +370,10 @@ class _Strip:
 class CapFloor:
     """A cap or floor on a term rate.
 
-    ``strike`` is a decimal rate. ``vol`` is one number or a mapping
+    ``strike`` is a decimal rate. ``vol`` is one number, a mapping
     ``{expiry in years: vol}`` interpolated linearly in expiry and flat
-    outside, in the model's units. ``shift`` is the displacement of
+    outside, or stripped caplet vols (:class:`derivx.rates.capvol.CapletVolCurve`
+    or ``CapletVolSurface``, read at the cap's strike), in the model's units. ``shift`` is the displacement of
     ``shifted_black`` (ignored by the other models). ``notional`` < 0 is a
     sold cap.
 
@@ -481,7 +486,10 @@ class CapFloor:
             raise ValueError(
                 f"shifted Black needs strike + shift > 0 (strike {self.strike:.4%}, shift {self.shift:.4%})"
             )
-        self._vol_points()  # validates vol
+        if self.stripped_vol:
+            self._check_stripped_vol()
+        else:
+            self._vol_points()  # validates vol
 
     # -- conventions -------------------------------------------------------
 
@@ -534,6 +542,22 @@ class CapFloor:
             return market.index_rate(self.projection, period.start, period.end, self.day_count, period.fix)
         return market.projected_rate(period.start, period.end, self.day_count, period.fix)
 
+    @property
+    def stripped_vol(self) -> bool:
+        """True when ``vol`` is a stripped caplet vol object."""
+
+        return hasattr(self.vol, "caplet_vols")
+
+    def _check_stripped_vol(self) -> None:
+        """A stripped vol object belongs to one model and shift."""
+
+        own_shift = float(self.shift) if self.model == "shifted_black" else 0.0
+        if self.vol.model != self.model or float(self.vol.shift) != own_shift:
+            raise ValueError(
+                f"the caplet vols were stripped for the {self.vol.model} model (shift {self.vol.shift:.2%}); "
+                f"price the cap with that model and shift, not {self.model} (shift {own_shift:.2%})"
+            )
+
     def _vol_points(self) -> Tuple[np.ndarray, np.ndarray]:
         if isinstance(self.vol, Mapping):
             if not self.vol:
@@ -551,6 +575,8 @@ class CapFloor:
     def vol_at(self, expiry) -> np.ndarray:
         """Model vol at option expiries (years), before any market vol shift."""
 
+        if self.stripped_vol:
+            return np.asarray(self.vol.caplet_vols(np.asarray(expiry, dtype=float), self.strike), dtype=float)
         xs, ys = self._vol_points()
         return np.interp(np.asarray(expiry, dtype=float), xs, ys)
 
@@ -679,6 +705,23 @@ class CapFloor:
         strip = self._strip(market)
         _, vega = self._unit_values(strip, self._market_vols(strip, market))
         return float(np.dot(self._scale(strip), vega) * VOL_UNIT[self.model])
+
+    def decay(self, market: Market, days: Optional[int] = None) -> float:
+        """Time decay in currency: the PV with every live caplet's option time
+        shortened by ``days`` calendar days (default: to the next business
+        day of the cap's calendar), forwards, discount factors and vols held,
+        minus today's PV. A caplet fixing within the window drops to its
+        intrinsic value."""
+
+        if days is None:
+            days = (Calendar(self.calendar).add_business_days(market.asof, 1) - market.asof).days
+        if days < 0:
+            raise ValueError("decay days must be 0 or more")
+        strip = self._strip(market)
+        vols = self._market_vols(strip, market)
+        now, _ = self._unit_values(strip, vols)
+        later, _ = self._unit_values(replace(strip, expiry=np.maximum(strip.expiry - days / 365.0, 0.0)), vols)
+        return float(np.dot(self._scale(strip), later - now))
 
     def annuity(self, market: Market) -> float:
         """Sum of notional x accrual x discount factor over remaining periods
