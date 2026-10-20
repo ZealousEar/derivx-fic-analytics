@@ -394,3 +394,24 @@ def test_edited_spot_is_flagged_against_its_reference():
     assert not any("EDITED" in c.value for c in at.sidebar.caption)
     at.number_input(key="fx_spot_EURUSD").set_value(1.1300).run()
     assert any(c.value.startswith("EDITED. Reference: 1.12150 = ECB") for c in at.sidebar.caption)
+
+
+def test_widgets_shared_by_every_pair_keep_their_labels_and_options():
+    """A keyed widget whose label or options change with the pair is a new
+    widget to the browser, which then shows no selection (seen for the
+    OPTION radio): shared widgets stay identical across pairs."""
+
+    at = _fx()
+
+    def shared():
+        out = {}
+        for w in list(at.radio) + list(at.selectbox) + list(at.number_input) + list(at.slider):
+            if w.key and w.key.startswith("fx_") and not w.key.endswith(("_EURUSD", "_USDJPY")):
+                out[w.key] = (w.label, tuple(getattr(w, "options", ()) or ()), w.proto.help)
+        return out
+
+    before = shared()
+    at.selectbox(key="fx_pair").set_value("USDJPY").run()
+    after = shared()
+    assert before == after and "fx_type" in before
+    assert at.radio(key="fx_type").value == "CALL"

@@ -356,14 +356,12 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
         if ss[_k("expiry_date")] < trade:  # the trade date moved past it: an expiry cannot precede the trade
             ss[_k("expiry_date")] = trade
         expiry_date = sb.date_input("EXPIRY DATE", key=_k("expiry_date"), min_value=trade, persist_state=PERSIST)
+    # Labels and options of a keyed widget shared by every pair stay fixed: a pair-dependent label would make
+    # Streamlit treat it as a new widget and the browser would show no selection.
     kind = sb.radio(
-        "OPTION",
-        ("CALL", "PUT"),
-        horizontal=True,
-        key=_k("type"),
-        persist_state=PERSIST,
-        format_func=lambda k: f"{pair.base} {k} / {pair.quote} {'PUT' if k == 'CALL' else 'CALL'}",
+        "OPTION (ON THE BASE CURRENCY)", ("CALL", "PUT"), horizontal=True, key=_k("type"), persist_state=PERSIST
     )
+    sb.caption(f"{pair.base} {kind} / {pair.quote} {'PUT' if kind == 'CALL' else 'CALL'}")
     side = sb.radio("SIDE", ("BUY", "SELL"), horizontal=True, key=_k("side"), persist_state=PERSIST)
     mode = sb.radio("STRIKE BY", STRIKE_MODES, horizontal=True, key=_k("strike_mode"), persist_state=PERSIST)
     K = None
@@ -420,7 +418,7 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
         persist_state=PERSIST,
         format_func=lambda d: "MARKET (PAIR DEFAULT)" if d == "MARKET" else DELTA_TYPE_LABELS[d],
         help="MARKET: spot delta to 1Y and forward delta beyond; premium-adjusted when the pair's market premium "
-        f"currency is the base currency ({pair.label}: {'yes' if pair.premium_adjusted else 'no'}).",
+        "currency is the base currency (USDJPY, USDCHF, USDCAD and the EUR crosses).",
     )
     atm_type = sb.selectbox(
         "ATM", ATM_TYPES, key=_k("atm_type"), persist_state=PERSIST, format_func=lambda a: ATM_TYPE_LABELS[a]
