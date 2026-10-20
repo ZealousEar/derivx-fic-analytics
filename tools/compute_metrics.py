@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from derivx.calibration.production import calibrate_with_constraints
-from derivx.models.comparison import compare_models
+from derivx.models.comparison import compare_models, select_expiry
 from derivx.validation.backtest import walk_forward_test
 
 
@@ -38,7 +38,7 @@ def compute_svi_metrics(chains: Dict[pd.Timestamp, pd.DataFrame], outdir: Path) 
                     "expiry": slc.expiry,
                     "rmse": slc.rmse,
                     "n_points": slc.n_points,
-                    "rmse_spline": bench.get("rmse_spline"),
+                    "rmse_spline_cv": bench.get("rmse_spline_cv"),
                     "relative_improvement": bench.get("relative_improvement"),
                     "tau": slc.tau,
                 }
@@ -102,19 +102,18 @@ def compute_walkforward_metrics(chains: Dict[pd.Timestamp, pd.DataFrame], outdir
 
 
 def compute_model_comparison_metrics(chains: Dict[pd.Timestamp, pd.DataFrame], outdir: Path) -> pd.DataFrame:
-    """Compare SVI/SABR/local-vol on representative slices."""
+    """Compare SVI/SABR/spline on the expiry nearest 30 days of each day."""
     rows = []
     for trade_date, chain in chains.items():
-        expiries = sorted(pd.to_datetime(chain["expiry"]).dt.date.unique())
-        # Use first expiry for each day
-        if not expiries:
+        try:
+            expiry = select_expiry(chain, target_days=30.0).date()
+        except ValueError:
             continue
-        expiry = expiries[0]
         slice_df = chain[pd.to_datetime(chain["expiry"]).dt.date == expiry]
         if slice_df.empty or len(slice_df) < 10:
             continue
         try:
-            comp = compare_models(slice_df, models=["svi", "sabr", "local_vol"])
+            comp = compare_models(slice_df, models=["svi", "sabr", "spline"])
             comp["trade_date"] = trade_date
             comp["expiry"] = pd.Timestamp(expiry)
             rows.append(comp)
@@ -190,7 +189,9 @@ def generate_summary_report(svi_df: pd.DataFrame, wf_df: pd.DataFrame, comp_df: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--chain-dir", type=Path, default=Path("data/metrics/chains"), help="Directory with Parquet chains")
+    parser.add_argument(
+        "--chain-dir", type=Path, default=Path("data/metrics/chains"), help="Directory with Parquet chains"
+    )
     parser.add_argument("--outdir", type=Path, default=Path("data/metrics"), help="Output directory for metrics")
     args = parser.parse_args()
 

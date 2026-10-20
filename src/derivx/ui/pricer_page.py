@@ -42,14 +42,16 @@ def render(mode: str) -> None:
         st.session_state["force_camera"] = True
     # Monochrome with strategic red accents (Off-White inspired)
     accent_color = "#FF4444"  # Red accent for key elements
-    
+
     st.markdown(f"## / {mode.upper()} OPTIONS")
-    
+
     # Input parameters in sidebar - minimalist labels
     st.sidebar.markdown(f"### / {mode.upper()} PARAMS")
-    
+
     # Quick presets for dramatic visualization
-    preset = st.sidebar.radio("PRESET", ["DEFAULT", "HIGH VOL", "DEEP ITM", "FAR OTM"], horizontal=True, key="preset_choice")
+    preset = st.sidebar.radio(
+        "PRESET", ["DEFAULT", "HIGH VOL", "DEEP ITM", "FAR OTM"], horizontal=True, key="preset_choice"
+    )
     if preset != st.session_state.get("preset_last", "DEFAULT"):
         st.session_state["preset_last"] = preset
         st.session_state["force_camera"] = True
@@ -62,7 +64,7 @@ def render(mode: str) -> None:
         S_def, K_def, T_def, r_def, q_def, sigma_def = 150.0, 80.0, 1.0, 0.05, 0.0, 0.3
     else:  # FAR OTM
         S_def, K_def, T_def, r_def, q_def, sigma_def = 80.0, 120.0, 0.5, 0.05, 0.0, 0.4
-    
+
     S = st.sidebar.number_input("SPOT.S", value=S_def, key="spot")
     K = st.sidebar.number_input("STRIKE.K", value=K_def, key="strike")
     T = st.sidebar.number_input("MATURITY.T", value=T_def, min_value=0.0, step=0.1, key="maturity")
@@ -72,13 +74,13 @@ def render(mode: str) -> None:
     call = st.sidebar.selectbox("TYPE", ["CALL", "PUT"], key="opttype") == "CALL"
 
     price, delta, gamma, vega, theta, rho = bs_price_greeks(S, K, T, r, sigma, call=call, q=q)
-    
+
     # Hero metric - brutalist card
     st.markdown(f"""
-        <div style='background: #FFFFFF; color: #000000; padding: 3rem 2rem; 
+        <div style='background: #FFFFFF; color: #000000; padding: 3rem 2rem;
         border: 4px solid #000000; margin-bottom: 2rem; position: relative;'>
-            <div style='position: absolute; top: -15px; left: 20px; background: {accent_color}; 
-            color: #FFFFFF; padding: 5px 15px; font-weight: 700; font-size: 0.75rem; 
+            <div style='position: absolute; top: -15px; left: 20px; background: {accent_color};
+            color: #FFFFFF; padding: 5px 15px; font-weight: 700; font-size: 0.75rem;
             letter-spacing: 0.1em;'>
                 {'CALL' if call else 'PUT'} / PREMIUM
             </div>
@@ -95,7 +97,7 @@ def render(mode: str) -> None:
 
     # Greeks - minimalist metric cards
     st.markdown("### / GREEKS")
-    
+
     col1, col2, col3, col4, col5 = st.columns(5)
     greeks_data = [
         ("DELTA", "Δ", float(delta), col1),
@@ -104,7 +106,7 @@ def render(mode: str) -> None:
         ("THETA", "Θ", float(theta)/365.0, col4),
         ("RHO", "ρ", float(rho)*0.01, col5),
     ]
-    
+
     for name, symbol, value, col in greeks_data:
         with col:
             st.metric(f"{name}", f"{value:.4f}")
@@ -130,7 +132,7 @@ def render(mode: str) -> None:
     # 3D Surface Plot - with fixed axes and practical color gradient
     st.markdown("### / PRICE SURFACE")
     gridN = st.slider("RESOLUTION", 15, 50, 25, key="grid")
-    
+
     def _range(center: float, pct: float = 0.35, min_width: float = 20.0) -> list[float]:
         span = max(abs(center) * pct, min_width / 2.0)
         return [max(1e-6, center - span), center + span]
@@ -141,7 +143,7 @@ def render(mode: str) -> None:
     K_grid = np.linspace(K_range[0], K_range[1], gridN)
     Ss, Ks = np.meshgrid(S_grid, K_grid)
     P, *_ = bs_price_greeks(Ss, Ks, T, r, sigma, call=True, q=q)
-    
+
     price_min = float(np.nanmin(P))
     price_max = float(np.nanmax(P))
     if not np.isfinite(price_min):
@@ -235,18 +237,21 @@ def render(mode: str) -> None:
     # Volatility Smile - minimalist line chart
     model_name = "SVI" if mode == "EQUITY" else "SABR"
     st.markdown(f"### / {model_name} SMILE")
+    if T <= 0 or S <= 0:
+        st.warning("The smile needs MATURITY.T > 0 and SPOT.S > 0 (SVI and SABR are fitted in total variance).")
+        return
     Ks = np.linspace(max(1e-6, K - 40), K + 40, 20)
     ivs = np.full_like(Ks, sigma) + 0.01 * np.random.randn(len(Ks))
-    
+
     if mode == "EQUITY":
-        params = fit_svi_strike_slice(Ks, ivs, F=S)
-        iv_fit = np.array([svi_iv(k, params, F=S) for k in Ks])
+        params = fit_svi_strike_slice(Ks, ivs, F=S, T=T)
+        iv_fit = np.asarray(svi_iv(Ks, params, F=S, T=T))
     else:
-        params = calibrate_sabr_smile(Ks, ivs, T=max(T, 1e-4), F=S, beta=0.5)
-        iv_fit = np.array([hagan_sabr_iv(S, k, T, **params) for k in Ks])
-    
+        params = calibrate_sabr_smile(Ks, ivs, T=T, F=S, beta=0.5)
+        iv_fit = np.asarray(hagan_sabr_iv(S, Ks, T, **params))
+
     fig_smile = go.Figure()
-    
+
     # Market observations
     fig_smile.add_trace(go.Scatter(
         x=Ks, y=ivs,
@@ -254,7 +259,7 @@ def render(mode: str) -> None:
         name='MARKET',
         marker=dict(size=8, color='#FFFFFF', line=dict(width=2, color='#000000'))
     ))
-    
+
     # Model fit
     fig_smile.add_trace(go.Scatter(
         x=Ks, y=iv_fit,
@@ -262,7 +267,7 @@ def render(mode: str) -> None:
         name=f'{model_name}',
         line=dict(color=accent_color, width=3)
     ))
-    
+
     # ATM strike
     fig_smile.add_trace(go.Scatter(
         x=[K], y=[sigma],
@@ -270,7 +275,7 @@ def render(mode: str) -> None:
         name='ATM',
         marker=dict(size=12, color=accent_color, symbol='x', line=dict(width=3, color='#FFFFFF'))
     ))
-    
+
     smile_revision = f"{mode}_{S:.4f}_{K:.4f}_{T:.4f}_{sigma:.4f}_{int(call)}"
     fig_smile.update_layout(
         xaxis_title='STRIKE',
@@ -283,7 +288,7 @@ def render(mode: str) -> None:
         yaxis=dict(gridcolor='#333333', showgrid=True, zeroline=False),
         height=400,
         margin=dict(l=60, r=20, t=30, b=60),
-        legend=dict(bgcolor='#000000', bordercolor='#FFFFFF', borderwidth=1, 
+        legend=dict(bgcolor='#000000', bordercolor='#FFFFFF', borderwidth=1,
                    font=dict(family='IBM Plex Mono', color='#FFFFFF')),
         dragmode="zoom",
         uirevision=smile_revision,
@@ -296,7 +301,7 @@ def render(mode: str) -> None:
     st.plotly_chart(fig_smile, width="stretch", key="smile_2d", config=PLOTLY_2D_CONFIG)
     if GUARD_AVAILABLE:
         st.caption(ZOOM_HINT)
-    
+
     # Model parameters - always visible below smile
     st.markdown(f"**[ {model_name} CALIBRATED PARAMS ]**")
     param_cols = st.columns(len(params))

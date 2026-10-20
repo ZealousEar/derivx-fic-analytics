@@ -25,7 +25,12 @@ def _slice_chain(chain: pd.DataFrame, expiry: pd.Timestamp, band: Sequence[float
     return slice_df.loc[mask].sort_values("strike")
 
 
-def _prepare_prediction(prev_slice: pd.DataFrame, next_slice: pd.DataFrame, params: Dict[str, float]) -> pd.DataFrame:
+def _prepare_prediction(
+    prev_slice: pd.DataFrame, next_slice: pd.DataFrame, params: Dict[str, float], tau: float
+) -> pd.DataFrame:
+    """Prediction: yesterday's SVI smile (total-variance params for ``tau``)
+    read at the same k = ln(K/F) on the next day's forward."""
+
     merged = pd.merge(
         prev_slice[["strike", "implied_vol"]].rename(columns={"implied_vol": "prev_iv"}),
         next_slice[["strike", "implied_vol", "underlying_price"]],
@@ -36,7 +41,7 @@ def _prepare_prediction(prev_slice: pd.DataFrame, next_slice: pd.DataFrame, para
         return merged
     forward_next = float(merged["underlying_price"].iloc[0])
     strikes = merged["strike"].to_numpy()
-    merged["predicted_iv"] = [svi_iv(k, params, F=forward_next) for k in strikes]
+    merged["predicted_iv"] = svi_iv(strikes, params, F=forward_next, T=tau)
     return merged
 
 
@@ -79,7 +84,7 @@ def walk_forward_test(
             next_slice = _slice_chain(chain_next, cal_slice.expiry, moneyness_band)
             if prev_slice.empty or next_slice.empty:
                 continue
-            pred_frame = _prepare_prediction(prev_slice, next_slice, cal_slice.params)
+            pred_frame = _prepare_prediction(prev_slice, next_slice, cal_slice.params, cal_slice.tau)
             if pred_frame.empty:
                 continue
             err = measure_prediction_error(pred_frame)
