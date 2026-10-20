@@ -10,10 +10,10 @@ from derivx.vol.svi import svi_iv
 
 def _daily_chain(trade_date: dt.date, shift: float = 0.0, expiry: Optional[dt.date] = None) -> pd.DataFrame:
     expiry = expiry or (dt.date(2024, 2, 1))
-    strikes = np.linspace(90, 110, 5)
+    strikes = np.linspace(90, 110, 9)
     forward = 100.0 + shift
     params = {"a": 0.02, "b": 0.25, "rho": -0.1, "m": 0.0, "s": 0.35}
-    ivs = np.array([svi_iv(k, params, F=forward) for k in strikes]) + 0.0002 * shift
+    ivs = svi_iv(strikes, params, F=forward, T=1.0) + 0.0002 * shift  # params: total variance at T = 1
     df = pd.DataFrame(
         {
             "trade_date": pd.Timestamp(trade_date),
@@ -53,3 +53,19 @@ def test_measure_prediction_error_computes_hit_rate():
     metrics = measure_prediction_error(pred_frame)
     assert metrics["rmse"] >= 0
     assert 0 <= metrics["hit_rate"] <= 1 or np.isnan(metrics["hit_rate"])
+
+
+def test_prediction_reads_the_smile_on_the_moved_forward_not_the_spot():
+    """Review (VM-05): the SVI params are fitted in k = ln(K/F) on the parity
+    forward, but the walk-forward read them on the next day's spot."""
+
+    from derivx.validation.backtest import _prepare_prediction
+
+    params = {"a": 0.002, "b": 0.02, "rho": -0.5, "m": 0.0, "sigma": 0.1}
+    strikes = np.linspace(90, 115, 6)
+    prev = pd.DataFrame({"strike": strikes, "implied_vol": 0.2})
+    nxt = pd.DataFrame({"strike": strikes, "implied_vol": 0.21, "underlying_price": 101.0})
+    out = _prepare_prediction(prev, nxt, params, 0.25, forward=103.0, spot=100.0)
+    np.testing.assert_allclose(out["predicted_iv"], svi_iv(strikes, params, F=103.0 * 1.01, T=0.25))
+    legacy = _prepare_prediction(prev, nxt, params, 0.25)
+    np.testing.assert_allclose(legacy["predicted_iv"], svi_iv(strikes, params, F=101.0, T=0.25))

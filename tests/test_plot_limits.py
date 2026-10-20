@@ -11,6 +11,7 @@ from streamlit.testing.v1 import AppTest
 from derivx.calibration.production import calibrate_with_constraints
 from derivx.models.comparison import compare_models
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
+from derivx.vol.implied import black_price
 from derivx.vol.svi import svi_iv
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
@@ -59,19 +60,23 @@ def test_bound_scene_records_zoom_distance_and_pan_limits():
 def _chain(trade_date: dt.date) -> pd.DataFrame:
     strikes = np.linspace(80, 120, 9)
     params = {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "s": 0.4}
+    vols = svi_iv(strikes, params, F=100.0, T=1.0)  # params: total variance at T = 1
+    is_call = strikes >= 100.0
+    # bid/ask around the Black-76 price of each quoted vol (r = 0, F = 100), so mid vols equal the quotes
+    price = black_price(100.0, strikes, 30 / 365, vols, is_call)
     df = pd.DataFrame(
         {
             "trade_date": pd.Timestamp(trade_date),
             "expiry": pd.Timestamp(trade_date + dt.timedelta(days=30)),
             "strike": strikes,
-            "implied_vol": [svi_iv(k, params, F=100.0) for k in strikes],
+            "implied_vol": vols,
             "underlying_price": 100.0,
-            "bid": 1.0,
-            "ask": 1.2,
-            "mid": 1.1,
+            "bid": price * 0.99,
+            "ask": price * 1.01,
+            "mid": price,
             "volume": 50,
             "open_interest": 100,
-            "option_type": "call",
+            "option_type": np.where(is_call, "call", "put"),
         }
     )
     df["moneyness"] = df["strike"] / 100.0
@@ -101,14 +106,33 @@ def test_every_pricer_chart_is_zoom_bounded(mode):
     at.sidebar.radio[0].set_value(mode).run()
     assert not at.exception
     charts = _charts(at)
-    # Equity/FX: surface + smile; Rates: every chart across its five tabs.
-    assert len(charts) == 2 if mode != "[ RATES ]" else len(charts) >= 5
+    # Equity: scenario grid + risk surface + smile; FX: smile + tenor x delta surface + scenario grid;
+    # Rates: every chart across its five tabs.
+    assert len(charts) == 3 if mode != "[ RATES ]" else len(charts) >= 5
     for spec, config in charts:
         _assert_bounded(spec, config)
     if mode != "[ RATES ]":
-        smile = charts[1][0]["layout"]
+        named = {spec["layout"]["meta"]["chart"]: spec["layout"] for spec, _ in charts}
+        expected = {"[ EQUITY ]": {"scenario", "surface", "smile"}, "[ FX ]": {"fx_smile", "fx_surface", "fx_scenario"}}
+        assert set(named) == expected[mode]
+        smile = named["smile" if mode == "[ EQUITY ]" else "fx_smile"]
         assert smile["xaxis"]["minallowed"] >= 0.0  # no negative strikes
         assert smile["yaxis"]["minallowed"] >= 0.0
+
+
+def test_fx_smile_in_delta_space_is_zoom_bounded():
+    at = AppTest.from_file(str(APP), default_timeout=180)
+    at.run()
+    at.sidebar.radio[0].set_value("[ FX ]").run()
+    at.radio(key="fx_space").set_value("DELTA").run()
+    assert not at.exception
+    charts = _charts(at)
+    assert len(charts) == 3
+    for spec, config in charts:
+        _assert_bounded(spec, config)
+    smile = next(spec for spec, _ in charts if spec["layout"]["meta"]["chart"] == "fx_smile")
+    n = len(smile["layout"]["xaxis"]["ticktext"])
+    assert smile["layout"]["xaxis"]["minallowed"] == -0.5 and smile["layout"]["xaxis"]["maxallowed"] == n - 0.5
 
 
 def test_every_analytics_chart_is_zoom_bounded():
