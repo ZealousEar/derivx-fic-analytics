@@ -372,6 +372,15 @@ class HistoryStore:
         row = rows.sort_values("asof").iloc[-1]
         return row["asof"], float(row["value_decimal"]), str(row["source"])
 
+    def fixing_history(self, name: str, start: dt.date, end: dt.date) -> Dict[dt.date, float]:
+        """Overnight fixings ``name`` for rate dates in [start, end):
+        ``{date: decimal}`` (what part-fixed SOFR futures need)."""
+
+        rows = self.rows("FIXINGS")
+        rows = rows[(rows["item"] == name) & (rows["measure"] == "overnight_fixing")]
+        rows = rows[(rows["asof"] >= start) & (rows["asof"] < end)]
+        return {d: float(v) for d, v in zip(rows["asof"], rows["value_decimal"])}
+
     def fixings(self, day: dt.date) -> pd.DataFrame:
         """The latest of every overnight fixing on or before ``day``."""
 
