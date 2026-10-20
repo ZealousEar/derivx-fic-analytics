@@ -10,6 +10,7 @@ discounted on €STR."""
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import math
@@ -71,9 +72,13 @@ def _num(value: float, decimals: int = 2) -> str:
 
 
 def _read_upload(payload: bytes, name: str, vol_type: str, shift: float) -> Tuple[Optional[VolGrid], List[str]]:
+    """Parse an uploaded or pasted CSV (comma, semicolon or tab separated:
+    the delimiter is sniffed) into a vol grid and messages."""
+
     try:
-        raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig", dtype=str, keep_default_na=False, na_values=[""])
-    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
+        raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig", dtype=str, keep_default_na=False,
+                          na_values=[""], sep=None, engine="python")  # fmt: skip
+    except (csv.Error, pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
         return None, [f"{name}: could not read the file ({exc})"]
     units = "bp" if vol_type == "normal" else "percent"
     grid, issues = parse_vol_grid(raw, vol_type, units, shift, source=f"uploaded: {name}")
@@ -196,9 +201,19 @@ def _cube(
 # --------------------------------------------------------------------------
 
 
-def _smile_chart(cube: SwaptionVolCube, trade: Swaption, T: float, F: float, source: str, asof) -> go.Figure:
+def _smile_chart(
+    cube: SwaptionVolCube, trade: Swaption, T: float, F: float, trade_normal: float, source: str, asof
+) -> go.Figure:
+    """The cube's smile at the trade's expiry x tenor (normal bp against the
+    strike offset), the quotes when the point is quoted, and the trade at
+    the normal vol it is priced at (``trade_normal``, rate units: the cube's
+    vol, or a flat vol's normal equivalent). Raises ``ValueError`` when the
+    cube has no smile there."""
+
     L = parse_tenor(trade.tenor).years
     offsets = SMILE_OFFSETS_BP[F + SMILE_OFFSETS_BP * 1e-4 + cube.shift > 1e-4]
+    if offsets.size < 2:
+        raise ValueError(f"the forward {F:.3%} is too close to the SABR shift ({-cube.shift:.2%}) to draw a smile")
     model = np.asarray(cube.normal_vol(T, L, F, F + offsets * 1e-4), dtype=float) * 1e4
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=offsets, y=model, mode="lines", name="SABR (CUBE)", line=dict(color=SERIES[0], width=2)))
@@ -217,23 +232,27 @@ def _smile_chart(cube: SwaptionVolCube, trade: Swaption, T: float, F: float, sou
         )
         shown += list(point.market_normal * 1e4)
     trade_offset = (trade.strike - F) * 1e4
-    trade_vol = float(cube.normal_vol(T, L, F, trade.strike)) * 1e4
-    fig.add_trace(
-        go.Scatter(
-            x=[trade_offset],
-            y=[trade_vol],
-            mode="markers",
-            name="TRADE STRIKE",
-            marker=dict(color=ACCENT, size=12, symbol="diamond"),
+    xs = list(offsets)
+    if math.isfinite(trade_normal):
+        trade_vol = trade_normal * 1e4
+        fig.add_trace(
+            go.Scatter(
+                x=[trade_offset],
+                y=[trade_vol],
+                mode="markers",
+                name="TRADE STRIKE",
+                marker=dict(color=ACCENT, size=12, symbol="diamond"),
+            )
         )
-    )
+        xs.append(trade_offset)
+        shown.append(trade_vol)
     dark_layout(fig, height=420, xtitle="STRIKE - ATM FORWARD (BP)", ytitle="NORMAL VOL (BP)")
     fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0), margin=dict(b=100))  # off the curve
     rates_data.badge(fig, source, asof)
     return bound_axes(
         fig,
-        xaxis=axis_limits([*offsets, trade_offset], pad=0.03),
-        yaxis=axis_limits([*shown, trade_vol], pad=0.12, floor=0.0),
+        xaxis=axis_limits(xs, pad=0.03),
+        yaxis=axis_limits(shown, pad=0.12, floor=0.0),
     )
 
 
@@ -491,12 +510,18 @@ def render(market: Market) -> List[Position]:
         )
 
     st.markdown("### / SABR SMILE")
-    st.plotly_chart(
-        _smile_chart(cube, trade, T, F, grid.source, market.asof),
-        width="stretch",
-        config=PLOTLY_2D_CONFIG,
-        key="swn_smile_chart",
-    )
+    try:
+        smile = _smile_chart(cube, trade, T, F, g["normal_vol"], grid.source, market.asof)
+    except ValueError as err:
+        st.warning(f"No smile chart for {ui['expiry']}x{ui['tenor']}: {err}")
+    else:
+        st.plotly_chart(smile, width="stretch", config=PLOTLY_2D_CONFIG, key="swn_smile_chart")
+        if ui["flat"] is not None:
+            st.caption(
+                "The trade is priced at its flat vol (the diamond, as a normal vol); the line is the cube's smile."
+            )
+        if trade.strike + cube.shift <= 0:
+            st.caption(f"The strike is below the SABR shift ({-cube.shift:.2%}): the cube has no vol there.")
     quoted = ui["expiry"] in cube.expiries and ui["tenor"] in cube.tenors
     if quoted:
         point = cube.point(ui["expiry"], ui["tenor"])
@@ -613,14 +638,17 @@ def render(market: Market) -> List[Position]:
         st.caption("Flat vol: no vega by quote (the vol does not come from the cube).")
 
     with st.expander("IMPLIED VOL FROM A PREMIUM"):
-        premium = st.number_input(
+        shown_premium = float(round(abs(g["premium_bp"]), 3))
+        # Keyed on the trade and its premium: the input starts again from the premium shown above when either
+        # changes, instead of keeping an earlier trade's premium (implied vols for a stale premium).
+        tag = hashlib.sha1(f"{trade!r}|{shown_premium}".encode()).hexdigest()[:10]
+        premium = st.number_input(  # no upper bound: deep in-the-money long swaptions exceed 5,000bp
             "PREMIUM (BP OF NOTIONAL, POSITIVE)",
             min_value=0.0,
-            max_value=5000.0,
-            value=float(round(abs(g["premium_bp"]), 3)),
+            value=shown_premium,
             step=1.0,
             format="%.3f",
-            key="swn_implied_premium",
+            key=f"swn_implied_premium_{tag}",
         )
         pv = ui["sign"] * premium * ui["notional"] * 1e-4
         cols = st.columns(2)

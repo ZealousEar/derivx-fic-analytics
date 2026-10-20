@@ -654,7 +654,10 @@ def render(market: Market, positions: List[Position]) -> None:
 
     st.markdown("### / P&L EXPLAIN")
     if not positions:
-        st.info("No positions yet: price a swap, cap/floor or bond on the other Rates tabs to explain its P&L here.")
+        st.info(
+            "No positions yet: price a swap, swaption, cap/floor or bond on the other Rates tabs to explain its "
+            "P&L here."
+        )
         return
     floored = _floored_vols(positions, market, shock)
     if floored:

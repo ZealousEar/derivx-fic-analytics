@@ -686,6 +686,97 @@ def test_stripped_vols_need_the_normal_model_and_show_quote_vegas():
     assert at.session_state["cap_test_positions"] == []
 
 
+def test_a_forward_start_trade_strips_the_spot_start_cap_quotes():
+    """Cap vols are quoted on spot-start caps: picking a forward start for
+    the trade used to strip the quotes as forward-start caps too (the 1Y
+    quote's caplets fixing 2.25Y-2.75Y ahead), so the trade was priced on
+    wrong caplet vols."""
+
+    from derivx.rates.capvol import strip_caplet_vols
+    from derivx.rates.vol_examples import illustrative_cap_atm
+
+    at = _app()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    spot_curve = at.session_state["cap_test_positions"][0].details["trade"].vol
+    _set(at, "cap_forward_start", "2Y")
+    assert not at.error, [e.value for e in at.error]
+    position = at.session_state["cap_test_positions"][0]
+    trade = position.details["trade"]
+    assert position.details["forward_start"] == "2Y" and trade.vol == spot_curve
+    assert (trade.start - EXAMPLE_ASOF).days > 700
+    repricing = next(d.value for d in at.dataframe if "ERROR (BP UPFRONT)" in d.value.columns)
+    assert repricing["LAST CAPLET EXPIRY (Y)"].iloc[0] < 1.0  # the 1Y quote is a spot-start 1Y cap
+    quotes = illustrative_cap_atm("USD")
+    terms = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
+    expected = strip_caplet_vols(example_market(), list(quotes["maturity"]), quotes["vol_bp"].to_numpy() * 1e-4,
+                                 terms=terms).curve  # fmt: skip
+    assert trade.vol.nodes == expected.nodes
+    np.testing.assert_allclose(trade.vol.vols, expected.vols, rtol=1e-13)
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    by_quote = vegas.set_index("QUOTED CAP")["VEGA (PER +1BP FLAT VOL)"]
+    # The 2Y x 5Y cap's caplets fix by 7Y (its last one within days of the 7Y quote's): quotes from 12Y on
+    # cannot move it, and +1bp on every quote moves every caplet vol by about 1bp.
+    assert by_quote["7Y"] > 0.0 and by_quote["12Y":].abs().max() < 1e-6
+    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    assert by_quote.sum() == pytest.approx(total, rel=0.02)
+
+
+EDGE_APP = """
+import streamlit as st
+import derivx.ui.rates_capfloor as cap
+from derivx.rates.examples import example_market
+
+_base = cap.illustrative_cap_atm
+
+
+def _edge(currency):
+    table = _base(currency)
+    table.loc[table.index[-1], "vol_bp"] = {vol_bp!r}
+    return table
+
+
+cap.illustrative_cap_atm = _edge
+st.session_state["cap_test_positions"] = cap.render(example_market())
+"""
+
+
+def test_quote_vegas_at_the_stripping_limit_do_not_break_the_tab():
+    """Quotes the strip can just meet (a 30Y flat vol 0.4bp above the lowest
+    non-negative caplet vols allow): the -1bp bump of that quote cannot be
+    stripped, which used to raise a traceback below the metrics."""
+
+    from derivx.rates.capvol import strip_caplet_vols
+    from derivx.rates.vol_examples import illustrative_cap_atm
+
+    quotes = illustrative_cap_atm("USD")
+    mats, flat = list(quotes["maturity"]), quotes["vol_bp"].to_numpy() * 1e-4
+    terms = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
+
+    def strips(vol: float) -> bool:
+        try:
+            strip_caplet_vols(example_market(), mats, np.r_[flat[:-1], vol], terms=terms)
+        except ValueError:
+            return False
+        return True
+
+    lo, hi = 1e-4, flat[-1]
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if strips(mid) else (mid, hi)
+    at = AppTest.from_string(EDGE_APP.format(vol_bp=round((hi + 0.4e-4) * 1e4, 4)), default_timeout=120)
+    at.run()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    _set(at, "cap_tenor", "30Y")
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    assert not at.error, [e.value for e in at.error]
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    assert vegas.set_index("QUOTED CAP").loc["30Y", "DIFFERENCE"] == "up only"
+    assert any("One-sided at" in c.value and "30Y" in c.value for c in at.caption)
+
+
 def test_tab_reports_black_with_a_negative_strike_as_an_error():
     at = _app()
     _set(at, "cap_model", "Black (%)")
