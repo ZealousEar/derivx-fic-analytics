@@ -375,8 +375,11 @@ def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
 
 
 def _lowest_vol(vol: object) -> Optional[float]:
-    """Lowest of a flat vol or an {expiry: vol} term structure."""
+    """Lowest of a flat vol, an {expiry: vol} term structure or stripped
+    caplet vols."""
 
+    if hasattr(vol, "lowest"):
+        return float(vol.lowest)
     values = list(vol.values()) if isinstance(vol, Mapping) else [vol]
     try:
         return min(float(v) for v in values)
