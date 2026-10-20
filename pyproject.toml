@@ -37,6 +37,7 @@ dependencies = [
   "scipy",
   "pandas",
   "plotly",
+  "pyarrow",
   "streamlit>=1.59",
   "yfinance"
 ]

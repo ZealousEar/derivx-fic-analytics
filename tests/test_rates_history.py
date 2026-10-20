@@ -1,0 +1,222 @@
+"""History store: the committed sample and its manifest, priorities between
+snapshot, downloads and uploads, curve moves between dates, user history
+uploads, the live refresh and its background Treasury download."""
+
+from __future__ import annotations
+
+import datetime as dt
+import threading
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from derivx.data import rates_history as rh
+from derivx.data import rates_sources as rs
+from derivx.data.cache import DiskCache
+from derivx.rates.curves import bootstrap
+from derivx.rates.examples import EXAMPLE_ASOF, ust_curve
+from derivx.rates.market_quotes import treasury_quotes
+
+FIXTURES = Path(__file__).parent / "fixtures" / "rates"
+D = dt.date.fromisoformat
+
+
+@pytest.fixture(scope="module")
+def store():
+    return rh.bundled_store()
+
+
+def test_manifest_describes_every_committed_file():
+    manifest = rh.load_manifest()
+    files = {entry["file"]: entry for entry in manifest["files"]}
+    assert set(files) == {p.name for p in rh.SAMPLE_DIR.glob("*.csv")}
+    for name, entry in files.items():
+        path = rh.SAMPLE_DIR / name
+        assert rh.file_sha256(path) == entry["sha256"], f"{name} changed without rebuilding the manifest"
+        header = pd.read_csv(path, nrows=0).columns
+        assert header[0] == "date" and set(header[1:]) == set(entry["series"]), name
+        assert entry["unit"] == "percent" and entry["attribution"] and entry["urls"] and entry["fetched_at"]
+        assert entry["dataset"] in rh.DATASETS
+    total = sum((rh.SAMPLE_DIR / n).stat().st_size for n in files)
+    assert total < 250_000  # small enough to commit
+
+
+def test_bundled_store_coverage(store):
+    assert store.datasets() == ["EUR_AAA_ECB", "FIXINGS", "GBP_OIS_BOE", "USD_SWAP_ICE", "UST_PAR"]
+    ust = store.dates("UST_PAR")
+    snapshot = set(rs.parse_treasury_csv(rh.TREASURY_SNAPSHOT.read_text())["asof"])
+    assert snapshot <= set(ust) and ust[-1] == max(snapshot) == EXAMPLE_ASOF
+    assert ust[0] <= D("2008-01-31") and len(ust) > 400  # month ends back to 2008 plus every 2026 business day
+    assert store.coverage("GBP_OIS_BOE")[0] <= D("2009-01-31") and store.coverage("GBP_OIS_BOE")[1] >= D("2026-10-16")
+    assert store.curve("GBP_OIS_BOE", store.coverage("GBP_OIS_BOE")[1]).index[-1] == "25Y"
+    assert store.coverage("USD_SWAP_ICE")[1] <= rs.ICE_SWAP_LAST_DATE
+    fixings = store.fixings(EXAMPLE_ASOF).set_index("fixing")
+    assert set(fixings.index) == {"SOFR", "EFFR", "OBFR", "ESTR", "SONIA"}
+    assert fixings.loc["SOFR", "date"] <= EXAMPLE_ASOF and 0.0 < fixings.loc["SOFR", "rate"] < 0.1
+    assert store.fixing("SOFR", D("2020-01-01")) is None  # the bundled fixings start in the snapshot year
+
+
+def test_store_treasury_curve_is_the_examples_curve(store):
+    """The page's Treasury curve (from the store) equals the curve the tests
+    and golden fixtures use (read straight from the snapshot CSV)."""
+
+    quotes = treasury_quotes(store.curve("UST_PAR", EXAMPLE_ASOF).to_dict())
+    from_store = bootstrap(EXAMPLE_ASOF, quotes, "USD UST")
+    reference = ust_curve(EXAMPLE_ASOF)
+    assert [(q.kind, q.tenor) for q in from_store.quotes] == [(q.kind, q.tenor) for q in reference.quotes]
+    np.testing.assert_array_equal(from_store.dfs, reference.dfs)
+    assert store.origin("UST_PAR", EXAMPLE_ASOF) == "US Treasury, bundled snapshot"
+
+
+def test_higher_priority_rows_win(store):
+    day = EXAMPLE_ASOF
+    upload = rs.parse_treasury_csv(f'Date,"10 Yr"\n{day:%m/%d/%Y},6.00\n').assign(origin="upload: mine.csv")
+    merged = rh.build_store([store.frame, upload], "test")
+    assert merged.curve("UST_PAR", day)["10Y"] == 0.06
+    assert merged.curve("UST_PAR", day)["2Y"] == store.curve("UST_PAR", day)["2Y"]  # other tenors untouched
+    assert "upload: mine.csv" in merged.origin("UST_PAR", day)
+    assert rh.build_store([], "empty").datasets() == []
+
+
+def test_curve_moves(store):
+    move = store.curve_move("UST_PAR", D("2022-01-03"), D("2022-10-21"))
+    assert (move.start, move.end) == (D("2022-01-03"), D("2022-10-21"))
+    assert dict(zip(move.tenors, move.change_bp))["2Y"] == 371.0  # 0.78% -> 4.49%
+    assert move.series[0] == "FRED DGS1MO" and move.what == "par yields"
+    nearest = store.curve_move("UST_PAR", D("2022-01-01"), D("2022-10-22"))  # weekend and holiday ends
+    assert (nearest.start, nearest.end) == (D("2021-12-31"), D("2022-10-21"))
+    with pytest.raises(ValueError, match="within 4 days"):
+        store.curve_move("UST_PAR", D("2019-06-12"), D("2019-06-20"))  # mid-month: not in the sample
+    with pytest.raises(ValueError, match="must be after"):
+        store.curve_move("UST_PAR", D("2022-10-21"), D("2022-01-03"))
+    with pytest.raises(ValueError, match="no ICE"):
+        store.curve_move("USD_SWAP_ICE", D("2022-01-03"), D("2022-10-21"))
+    with pytest.raises(ValueError, match="unknown dataset"):
+        rh.dataset_info("JPY_TONA")
+
+
+def test_gbp_moves_are_derived_par_ois_rates(store):
+    move = store.curve_move("GBP_OIS_BOE", D("2022-09-21"), D("2022-09-28"))
+    assert move.what.startswith("par OIS rates derived") and move.tenors[0] == "1M" and move.tenors[-1] == "25Y"
+    a, b = store.ois_par("GBP_OIS_BOE", move.start), store.ois_par("GBP_OIS_BOE", move.end)
+    assert dict(zip(move.tenors, move.change_bp))["10Y"] == round((b["10Y"] - a["10Y"]) * 1e4, 2)
+    assert dict(zip(move.tenors, move.change_bp))["2Y"] > 50  # the gilt-crisis week repriced UK rates sharply
+    early = store.curve_move("GBP_OIS_BOE", D("2013-05-02"), D("2013-09-05"))
+    assert early.tenors[-1] == "5Y"  # the BoE OIS curve only reached five years before 2016
+
+
+def test_ois_par_reprices_the_boe_curve(store):
+    day = store.coverage("GBP_OIS_BOE")[1]
+    par = store.ois_par("GBP_OIS_BOE", day)
+    from derivx.rates.curves import CurveQuote
+    from derivx.rates.market_quotes import zero_rate_curve
+
+    curve = bootstrap(day, [CurveQuote("OIS", t, r) for t, r in par.items()], "GBP SONIA", "linear_zero")
+    zeros = store.curve("GBP_OIS_BOE", day, "zero_cc")
+    from derivx.rates.conventions import parse_tenor
+
+    boe = zero_rate_curve(day, [parse_tenor(t).years for t in zeros.index], list(zeros))
+    for inst in curve.instruments:
+        error_bp = abs(curve.zero_rate(inst.pillar) - boe.zero_rate(inst.pillar)) * 1e4
+        assert error_bp < (1e-6 if inst.tenor.years <= 10 else 0.5), (inst.tenor, error_bp)
+    with pytest.raises(ValueError, match="no OIS conventions"):
+        store.ois_par("UST_PAR", day)
+
+
+def test_parse_history_upload_long_and_wide():
+    long = pd.DataFrame({"date": ["2024-01-02", "2024-01-02", "2024-02-01", "2024-02-01"],
+                         "tenor": ["2Y", "10Y", "2Y", "10Y"], "rate": [4.2, 3.9, 4.4, 4.0]})  # fmt: skip
+    frame, issues, units = rh.parse_history_upload(long, "USD", name="mine.csv")
+    assert units == "percent" and any("percent" in i.message for i in issues)
+    assert set(frame["dataset"]) == {"USER_SWAP:USD"} and set(frame["origin"]) == {"upload: mine.csv"}
+    store = rh.build_store([frame])
+    move = store.curve_move("USER_SWAP:USD", D("2024-01-02"), D("2024-02-01"))
+    assert dict(zip(move.tenors, move.change_bp)) == {"2Y": 20.0, "10Y": 10.0}
+    wide = pd.DataFrame({"Date": ["2024-01-02", "2024-02-01"], "2Y": [0.042, 0.044], "10Y": [0.039, None]})
+    frame, _, units = rh.parse_history_upload(wide, "GBP", units="decimal")
+    assert units == "decimal" and len(frame) == 3 and set(frame["dataset"]) == {"USER_SWAP:GBP"}
+
+
+@pytest.mark.parametrize(
+    "table, message",
+    [
+        (pd.DataFrame({"when": ["2024-01-02"], "2Y": [4.0]}), "'date' column"),
+        (pd.DataFrame({"date": ["2024-01-02", "2024-02-01"], "2Q": [4.0, 4.1]}), "2Q"),
+        (pd.DataFrame({"date": ["2024-01-02", "2024-02-01"], "2Y": ["4.0", "n/a"]}), "not a number"),
+        (pd.DataFrame({"date": ["2024-01-02", "2024-02-01"], "2Y": [45.0, 46.0]}), "outside"),
+        (pd.DataFrame({"date": ["2024-01-02"], "2Y": [4.0]}), "two dates"),
+        (pd.DataFrame({"date": ["not a date", "2024-02-01"], "2Y": [4.0, 4.1]}), "dates"),
+    ],
+)
+def test_parse_history_upload_errors(table, message):
+    units = "percent" if message == "outside" else "auto"
+    frame, issues, _ = rh.parse_history_upload(table, "USD", units=units)
+    assert frame.empty and any(i.level == "error" and message in i.message for i in issues), issues
+
+
+def test_cached_downloads_join_the_store(tmp_path):
+    cache = DiskCache(tmp_path)
+    assert rh.cache_signature(cache) == () and rh.cached_frames(cache) == []
+    frame = rs.parse_fred_csv((FIXTURES / "fred_dswp.csv").read_text())
+    cache.store(
+        cache.key("FRED", {"ids": ["DSWP"]}), frame, b"x", {"source": "FRED", "fetched_at": "2026-10-20T00:00:00+00:00"}
+    )
+    signature = rh.cache_signature(cache)
+    assert len(signature) == 1 and signature[0][1] == "2026-10-20T00:00:00+00:00"
+    (tmp_path / "broken.json").write_text("{not json")
+    frames = rh.cached_frames(cache)
+    assert len(frames) == 1 and set(frames[0]["origin"]) == {"downloaded 2026-10-20T00:00:00+00:00"}
+    store = rh.build_store([rh.bundled_frame()] + frames)
+    assert D("2013-05-01") in store.dates("USD_SWAP_ICE")
+
+
+def test_refresh_live_turns_failures_into_notices(tmp_path):
+    frame = rs.parse_nyfed_json((FIXTURES / "nyfed_sofr_last3.json").read_text())
+    ok = rs.Fetched(frame, "NY Fed", "u", "2026-10-20T00:00:00+00:00", "0" * 64, notices=["fine print"])
+    seen = {}
+
+    def good(**kw):
+        seen.update(kw)
+        return ok
+
+    def bad(**kw):
+        raise rs.SourceBlocked("HTTP 403 from example.org")
+
+    result = rh.refresh_live(D("2026-10-20"), cache=DiskCache(tmp_path), requests={"good": good, "bad": bad})
+    assert result.ok == {"good": True, "bad": False}
+    assert any("bad: unavailable (HTTP 403" in n for n in result.notices) and "good: fine print" in result.notices
+    assert seen["max_age"] == 3600.0 and seen["timeout"] == 8.0 and seen["retries"] == 1
+    names = rh.live_requests(D("2026-10-20"))
+    assert {"US Treasury par curve (FRED H.15)", "UK OIS curve (BoE)", "SOFR (NY Fed)", "ESTR (ECB)"} <= set(names)
+
+
+def test_live_requests_run_offline_against_the_cache(tmp_path):
+    result = rh.refresh_live(D("2026-10-20"), cache=DiskCache(tmp_path))  # offline in tests, empty cache
+    assert result.ok and not any(result.ok.values())
+    assert all("offline: no cached" in n for n in result.notices)
+
+
+def test_treasury_downloads_in_the_background(tmp_path, monkeypatch):
+    cache = DiskCache(tmp_path)
+    monkeypatch.setenv("DERIVX_OFFLINE", "0")
+    release = threading.Event()
+    calls = []
+
+    def slow(year, cache=None):
+        calls.append(year)
+        release.wait(5)
+        frame = rs.parse_treasury_csv((FIXTURES / "treasury_2026.csv").read_text())
+        cache.store(cache.key("US Treasury", {"year": year}), frame, b"csv", {"source": "US Treasury"})
+
+    monkeypatch.setattr(rs, "treasury_par_curve", slow)
+    monkeypatch.setattr(rh, "_PENDING", {})
+    first = rh.treasury_in_background(2026, cache)
+    second = rh.treasury_in_background(2026, cache)
+    assert "background" in first and "background" in second and calls == [2026]  # started once
+    release.set()
+    rh._PENDING[(2026, str(cache.root))][0].result(timeout=5)
+    assert rh.treasury_in_background(2026, cache) is None  # cached and fresh
+    monkeypatch.setenv("DERIVX_OFFLINE", "1")
+    assert rh.treasury_in_background(2025, cache) is None  # offline: never starts
