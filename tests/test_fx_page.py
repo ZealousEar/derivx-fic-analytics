@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import html
 import json
 import math
 import re
@@ -415,3 +416,204 @@ def test_widgets_shared_by_every_pair_keep_their_labels_and_options():
     after = shared()
     assert before == after and "fx_type" in before
     assert at.radio(key="fx_type").value == "CALL"
+
+
+POINTS = "FWD PTS (PIPS)"
+
+
+def _badges(at: AppTest) -> str:
+    return " ".join(x.value for x in at.markdown if "dx-badge" in x.value)
+
+
+def test_missing_forward_points_are_never_replaced_by_a_made_up_rate():
+    """Review: with CARRY FROM FORWARD POINTS and no points for the expiry, a
+    FLAT vol priced the option on a foreign rate of 0% (the forward came
+    from nowhere, and the dates panel called it 'implied from the forward
+    points'). Nothing is priced without a forward."""
+
+    at = _fx()
+    at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
+    at.radio(key="fx_vol_src").set_value("FLAT").run()
+    base = at.session_state["fx_quotes_EURUSD"].copy()
+    base.loc[base["TENOR"] == "3M", "FWD PTS (PIPS)"] = np.nan
+    at.session_state["fx_quotes_EURUSD"] = base
+    at.run()
+    assert not at.exception
+    assert any(
+        "Cannot price this option: no forward for this expiry (3M: no forward points)" in e.value for e in at.error
+    )
+    assert not [m for m in at.markdown if "dx-hero-value" in m.value and "<style>" not in m.value]
+    assert "fx_scenario" not in _charts(at)
+    # an expiry between tenors with no points anywhere: the same
+    base[POINTS] = np.nan
+    at.session_state["fx_quotes_EURUSD"] = base
+    at.selectbox(key="fx_expiry").set_value("DATE").run()
+    assert not at.exception
+    assert any("no forward for this expiry" in e.value for e in at.error)
+
+
+def test_illustrative_carry_is_labelled_until_the_user_enters_it():
+    """Review: the default deposit rates (and the forward points computed
+    from them) are round numbers, but were shown as plain inputs with no
+    ILLUSTRATIVE label; the forward, its points and the premium depend on
+    them."""
+
+    at = _fx()
+    assert "ILLUSTRATIVE CARRY</span>USD rate 3.75%, EUR rate 2.00%: defaults, not market data" in _badges(at)
+    assert any(
+        c.value.startswith("ILLUSTRATIVE: the USD and EUR rates are round-number defaults") for c in at.sidebar.caption
+    )
+    dates = _frame(at, "DATE / CONVENTION").set_index("DATE / CONVENTION")["VALUE"]
+    assert "ILLUSTRATIVE defaults: USD rate 3.75%, EUR rate 2.00%" in dates["Rates"]
+    at.number_input(key="fx_rd_EURUSD").set_value(3.9).run()
+    assert "ILLUSTRATIVE CARRY</span>EUR rate 2.00%:" in _badges(at)
+    at.number_input(key="fx_rf_EURUSD").set_value(1.95).run()
+    assert "ILLUSTRATIVE CARRY" not in _badges(at)
+    assert not any(c.value.startswith("ILLUSTRATIVE") for c in at.sidebar.caption)
+    # forward points: the defaults were computed from the default rates
+    at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
+    assert "ILLUSTRATIVE CARRY</span>forward points (computed from the default rates):" in _badges(at)
+    base = at.session_state["fx_quotes_EURUSD"].copy()
+    base.loc[base["TENOR"] == "3M", POINTS] = 51.25
+    at.session_state["fx_quotes_EURUSD"] = base
+    at.run()
+    assert "ILLUSTRATIVE CARRY" not in _badges(at) and _cell(at, "FWD POINTS") == "+51.25 pips"
+    at.selectbox(key="fx_expiry").set_value("6M").run()  # 6M still has the default points
+    assert "forward points (computed from the default rates)" in _badges(at)
+    at.button(key="fx_points_from_rates").click().run()  # points from the user's rates: not illustrative
+    assert "ILLUSTRATIVE CARRY" not in _badges(at)
+
+
+def test_trade_and_expiry_dates_on_holidays_are_flagged():
+    """Review: an expiry DATE on a Saturday or on Christmas Day priced with
+    no word, and the trade-date warning sat inside a collapsed expander."""
+
+    at = _fx()
+    at.date_input(key="fx_trade_date").set_value(dt.date(2026, 10, 20)).run()
+    at.selectbox(key="fx_expiry").set_value("DATE").run()
+    at.date_input(key="fx_expiry_date").set_value(dt.date(2026, 11, 21)).run()  # a Saturday
+    assert not at.exception
+    msg = [w.value for w in at.warning if w.value.startswith("EXPIRY 2026-11-21 is not a business day")]
+    assert msg and "next one 2026-11-23" in msg[0]
+    at.date_input(key="fx_expiry_date").set_value(dt.date(2026, 12, 25)).run()  # TARGET and Fedwire holiday
+    assert any(w.value.startswith("EXPIRY 2026-12-25 is not a business day") for w in at.warning)
+    at.date_input(key="fx_expiry_date").set_value(dt.date(2026, 12, 23)).run()
+    assert not any("is not a business day" in w.value for w in at.warning)
+    at.date_input(key="fx_trade_date").set_value(dt.date(2026, 10, 24)).run()  # a Saturday
+    assert any(w.value.startswith("TRADE DATE 2026-10-24 is not a business day") for w in at.warning)
+    for block in at.expander:
+        assert not any("is not a business day" in w.value for w in block.warning)  # shown, not tucked away
+
+
+def test_priced_strike_outside_the_plotted_smile_is_mentioned():
+    at = _fx()
+    at.number_input(key="fx_strike_EURUSD").set_value(1.40).run()
+    assert not at.exception
+    assert "K (PRICED)" not in [t["name"] for t in _charts(at)["fx_smile"]["data"]]
+    assert any(c.value.startswith("K (PRICED) = 1.40000 is outside the plotted strikes") for c in at.caption)
+
+
+def test_surface_says_which_tenors_have_no_forward():
+    at = _fx()
+    at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
+    base = at.session_state["fx_quotes_EURUSD"].copy()
+    base.loc[base["TENOR"].isin(["9M", "2Y"]), POINTS] = np.nan
+    at.session_state["fx_quotes_EURUSD"] = base
+    at.run()
+    assert not at.exception
+    assert _charts(at)["fx_surface"]["data"][0]["y"] == ["ON", "1W", "2W", "3W", "1M", "2M", "3M", "6M", "1Y", "18M"]
+    assert any("Left out, no forward (forward points missing or unusable): 9M, 2Y." in c.value for c in at.caption)
+
+
+def _greek_cards(at: AppTest) -> dict:
+    block = next(m.value for m in at.markdown if "class='dx-greeks'" in m.value)
+    out = {}
+    for card in block.split("<div class='dx-greek'>")[1:]:
+        name = html.unescape(re.search(r"dx-greek-name'>([^<]+)<", card).group(1))
+        value = html.unescape(re.search(r"dx-greek-value'>([^<]+)<", card).group(1))
+        out[name] = (value, [html.unescape(s) for s in re.findall(r"dx-greek-sub'>([^<]+)<", card)])
+    return out
+
+
+@pytest.mark.parametrize("notional", [1.0, 1e8, 1e9, 1e12])
+def test_greek_card_values_fit_their_card_at_any_notional(notional):
+    """Review: at 1280px a EUR 100m notional's gamma showed as 'EUR 10,336,7'
+    (the card cut the value off) and tiny values as 'USD -1.597e-'. Card
+    values now fit CARD_VALUE_CHARS (the narrowest card of FX_CSS) and a
+    shortened value keeps its exact amount on the line below."""
+
+    from derivx.ui.fx_page import CARD_VALUE_CHARS
+
+    at = _fx()
+    at.number_input(key="fx_notional").set_value(notional).run()
+    assert not at.exception
+    cards = _greek_cards(at)
+    assert len(cards) == 8
+    for name, (value, subs) in cards.items():
+        assert len(value) <= CARD_VALUE_CHARS, (name, value)
+        if any(s.startswith("= ") for s in subs):  # shortened: the exact amount is given
+            exact = next(s for s in subs if s.startswith("= "))[2:]
+            short = float(re.sub(r"[kMBT]$", "", value.split(" ")[1]))
+            scale = {"k": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(value[-1], 1.0)
+            assert short * scale == pytest.approx(float(exact.split(" ")[1].replace(",", "")), rel=6e-4)
+    gamma, subs = cards["GAMMA Γ"]
+    if notional >= 1e9:  # EUR 103,367,032 at 1bn: shortened to EUR 103.4M, exact amount below
+        assert gamma[-1] in "MB" and subs[0].startswith("= EUR ") and subs[-1].endswith("per 1 EUR")
+    elif notional == 1e8:  # EUR 10,336,703 fits as it is
+        assert re.fullmatch(r"EUR [\d,]+", gamma) and not subs[0].startswith("= ")
+
+
+def test_forward_of_an_expiry_between_tenors_says_how_it_was_interpolated():
+    """Review: with CARRY FROM FORWARD POINTS an expiry DATE between tenors
+    (or after the last one) took its forward from interpolated (or flat
+    extrapolated) implied foreign rates without a word on screen."""
+
+    at = _fx()
+    at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
+    one, two = fx_dates("EURUSD", TODAY, tenor="1M"), fx_dates("EURUSD", TODAY, tenor="2M")
+    expiry = one.expiry + dt.timedelta(days=14)
+    at.selectbox(key="fx_expiry").set_value("DATE").run()
+    at.date_input(key="fx_expiry_date").set_value(expiry).run()
+    assert not at.exception
+    note = "forward from the implied EUR rates interpolated between 1M and 2M (linear in rate time)"
+    assert any(c.value == f"FORWARD: {note}." for c in at.caption)
+    rates = _frame(at, "DATE / CONVENTION").set_index("DATE / CONVENTION")["VALUE"]["Rates"]
+    assert note in rates
+    # the forward: implied EUR rates of the 1M and 2M points, linear in the rate time
+    frame = at.session_state["fx_quotes_EURUSD"].set_index("TENOR")[POINTS]
+
+    def implied(dates, pts):
+        return 0.0375 - math.log((EURUSD_SPOT + pts * 1e-4) / EURUSD_SPOT) / dates.tau_d
+
+    d = fx_dates("EURUSD", TODAY, expiry=expiry)
+    rf = np.interp(d.tau_d, [one.tau_d, two.tau_d], [implied(one, frame["1M"]), implied(two, frame["2M"])])
+    assert _cell(at, f"FORWARD ({d.delivery.isoformat()})") == f"{EURUSD_SPOT * math.exp((0.0375 - rf) * d.tau_d):.5f}"
+    # after the last tenor: flat
+    at.date_input(key="fx_expiry_date").set_value(
+        fx_dates("EURUSD", TODAY, tenor="2Y").expiry + dt.timedelta(days=60)
+    ).run()
+    assert any(
+        c.value == "FORWARD: forward from the 2Y implied EUR rate held flat (after the last tenor with forward points)."
+        for c in at.caption
+    )
+    # an expiry today delivers on the spot date: the forward is spot, no points needed and no note
+    base = at.session_state["fx_quotes_EURUSD"].copy()
+    base[POINTS] = np.nan
+    at.session_state["fx_quotes_EURUSD"] = base
+    at.date_input(key="fx_expiry_date").set_value(TODAY).run()
+    assert not at.exception and not at.error
+    assert _premium(at) == pytest.approx(NOTIONAL * (EURUSD_SPOT - 1.12), abs=0.01)
+    assert not any(c.value.startswith("FORWARD:") for c in at.caption)
+    # rates carry: no such note
+    at.date_input(key="fx_expiry_date").set_value(expiry).run()
+    at.radio(key="fx_carry").set_value("RATES").run()
+    assert not any(c.value.startswith("FORWARD:") for c in at.caption)
+
+
+def test_greeks_caption_states_what_each_rho_holds_fixed():
+    at = _fx()
+    text = next(c.value for c in at.caption if c.value.startswith("For the long position"))
+    assert "Each rho bumps one deposit rate with spot and the other rate fixed, so the forward moves;" in text
+    at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
+    text = next(c.value for c in at.caption if c.value.startswith("For the long position"))
+    assert "(the foreign rate is the one implied by the forward points)" in text

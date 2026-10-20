@@ -4,6 +4,7 @@ network fetch (monkeypatched: tests never use the network)."""
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import io
 import urllib.error
 from pathlib import Path
@@ -93,6 +94,25 @@ def test_fetch_failures_raise_fx_data_error_with_the_reason(monkeypatch, error, 
         raise error
 
     monkeypatch.setattr(market_data.urllib.request, "urlopen", failing)
+    with pytest.raises(FxDataError, match=message):
+        fetch_ecb_rates()
+
+
+class _CutOff(_Response):
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"KEY,FREQ", 4096)
+
+
+@pytest.mark.parametrize(
+    "response, message",
+    [(_CutOff(b""), "cut off \\(IncompleteRead\\)"), (_Response(b"\xff\xfe\x00K"), "not UTF-8")],
+)
+def test_truncated_or_binary_responses_raise_fx_data_error(monkeypatch, response, message):
+    """Review: a connection dropped mid-response (http.client.IncompleteRead)
+    or a non-text body escaped as a raw exception from the FETCH button's
+    callback (a traceback on the page) instead of the offline fallback."""
+
+    monkeypatch.setattr(market_data.urllib.request, "urlopen", lambda request, timeout: response)
     with pytest.raises(FxDataError, match=message):
         fetch_ecb_rates()
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -93,8 +93,16 @@ CARRY_MODES = ("RATES", "FORWARD POINTS")
 VOL_SOURCES = ("SMILE", "FLAT")
 SPACES = ("STRIKE", "DELTA")
 DEFAULT_TENOR = "3M"
+CARD_VALUE_CHARS = 14  # longest Greek-card value that fits the narrowest card of FX_CSS (desktop and phone)
 FX_CSS = """
 <style>
+/* Greek cards: at least 14rem wide at 1.3rem, so CARD_VALUE_CHARS monospace characters fit (a 100m notional's
+   gamma is EUR 10,336,703); longer values are shortened by _card_money, never cut off */
+.dx-greeks { grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
+.dx-greek-value { font-size: 1.3rem; }
+/* the sidebar captions carry the spot source and as-of date and the ILLUSTRATIVE labels: keep them readable */
+.stSidebar [data-testid="stCaptionContainer"],
+.stSidebar [data-testid="stCaptionContainer"] p { color: #BDBDBD !important; }
 @media (max-width: 640px) {
   .dx-greek-value { font-size: 1.05rem; }
   .dx-greeks { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
@@ -170,6 +178,23 @@ def _quotes_frame(pair: CurrencyPair, S: float, rd: float, rf: float, trade: dt.
     return pd.DataFrame(rows, columns=["TENOR", *QUOTE_COLUMNS, POINTS_COLUMN])
 
 
+def is_default_rate(ccy: str, value_pct: Optional[float]) -> bool:
+    """True when a rate input (percent) is still the ILLUSTRATIVE default of ``ccy``."""
+
+    return value_pct is not None and math.isclose(float(value_pct), 100 * ILLUSTRATIVE_RATES[ccy], abs_tol=1e-9)
+
+
+def _record_points(pair: CurrencyPair) -> None:
+    """Remember the forward points just written to the quotes table and
+    whether they came from the ILLUSTRATIVE default rates, so the page can
+    say when the carry is still illustrative."""
+
+    ss = st.session_state
+    illustrative = is_default_rate(pair.quote, ss[_k("rd", pair)]) and is_default_rate(pair.base, ss[_k("rf", pair)])
+    points = tuple(float(x) for x in ss[_k("quotes", pair)][POINTS_COLUMN])
+    ss[_k("points_ref", pair)] = (points, illustrative)
+
+
 def _init_pair(pair: CurrencyPair) -> None:
     ss = st.session_state
     ss.setdefault(_k("trade_date"), dt.date.today())
@@ -187,6 +212,7 @@ def _init_pair(pair: CurrencyPair) -> None:
         ss[_k("quotes", pair)] = _quotes_frame(
             pair, float(ss[_k("spot", pair)]), ss[_k("rd", pair)] / 100, ss[_k("rf", pair)] / 100, ss[_k("trade_date")]
         )
+        _record_points(pair)
 
 
 def _init_state() -> None:
@@ -259,6 +285,7 @@ def _reset_quotes(pair: CurrencyPair) -> None:
     ss[_k("quotes", pair)] = _quotes_frame(
         pair, float(ss[_k("spot", pair)]), ss[_k("rd", pair)] / 100, ss[_k("rf", pair)] / 100, ss[_k("trade_date")]
     )
+    _record_points(pair)
     ss[_k("editor_epoch", pair)] = ss.get(_k("editor_epoch", pair), 0) + 1
 
 
@@ -272,6 +299,7 @@ def _points_from_rates(pair: CurrencyPair) -> None:
             forward_points(S, S * math.exp((rd - rf) * d.tau_d), pair.pip), 2
         )
     ss[_k("quotes", pair)] = base
+    _record_points(pair)
     ss[_k("editor_epoch", pair)] = ss.get(_k("editor_epoch", pair), 0) + 1
 
 
@@ -423,6 +451,13 @@ def _sidebar() -> Tuple[Optional[FxInputs], List[str]]:
             max_value=50.0,
             step=0.05,
             format="%.4f",
+        )
+    defaults = [c for c, v in ((pair.quote, rd), (pair.base, rf)) if is_default_rate(c, v)]
+    if defaults:
+        sb.caption(
+            f"ILLUSTRATIVE: the {' and '.join(defaults)} rate{'s are' if len(defaults) > 1 else ' is a'} round-number "
+            f"default{'s' if len(defaults) > 1 else ''} (flat, not a fixing or a curve), not market data. Enter your "
+            "deposit rates" + (" or forward points." if carry == "RATES" else "; the forward comes from the points.")
         )
     sb.markdown("**/ VOL QUOTE CONVENTIONS**")
     delta_conv = sb.selectbox(
@@ -580,6 +615,34 @@ def _foreign_rate(inp: FxInputs, tau_d: float, points: Optional[float]) -> Tuple
     return implied_foreign_rate(inp.S, F, inp.rd, tau_d), None
 
 
+def illustrative_carry(inp: FxInputs) -> List[str]:
+    """The carry inputs of the selected expiry that are still ILLUSTRATIVE
+    defaults (empty when every one was entered): the domestic rate, the
+    foreign rate (RATES) or the forward points computed from the default
+    rates (FORWARD POINTS; for an expiry between tenors, any tenor's)."""
+
+    pair, ss = inp.pair, st.session_state
+    out = []
+    if is_default_rate(pair.quote, 100 * inp.rd):
+        out.append(f"{pair.quote} rate {100 * inp.rd:.2f}%")
+    if inp.carry == "RATES":
+        if is_default_rate(pair.base, 100 * inp.rf):
+            out.append(f"{pair.base} rate {100 * inp.rf:.2f}%")
+        return out
+    ref = ss.get(_k("points_ref", pair))
+    if ref is None or not ref[1]:
+        return out
+    frame = ss[_k("quotes", pair)]
+    unchanged = {}
+    for tenor, now, then in zip(frame["TENOR"], frame[POINTS_COLUMN], ref[0]):
+        now = np.nan if now is None else float(now)
+        unchanged[str(tenor)] = bool(np.isfinite(now) and math.isclose(now, then, abs_tol=1e-9))
+    tenor = inp.dates.tenor
+    if unchanged.get(tenor, False) if tenor is not None else any(unchanged.values()):
+        out.append("forward points (computed from the default rates)")
+    return out
+
+
 def _delta_type(inp: FxInputs, dates: FxDates) -> str:
     return market_delta_type(inp.pair, dates) if inp.delta_conv == "MARKET" else inp.delta_conv
 
@@ -619,36 +682,72 @@ def _quote_key(q: TenorQuote) -> Tuple:
 @dataclass(frozen=True)
 class Selected:
     """The selected expiry: its market, quote (as entered or interpolated),
-    smile (at the real spot) and how the quote was obtained."""
+    smile (at the real spot) and how the quote was obtained. ``market`` is
+    None when the expiry has no forward (forward points missing or
+    unusable): nothing can be priced then, and ``error`` says why."""
 
-    market: FxMarket
+    market: Optional[FxMarket]
     quote: Optional[TenorQuote]
     smile: Optional[FxSmile]
     delta_type: str
     note: str
     error: Optional[str]
+    carry_note: str = ""  # how the forward of an expiry between tenors came from the forward points
+
+
+def points_between_tenors(inp: FxInputs, rows: List[TenorRow]) -> Tuple[Optional[float], str]:
+    """Forward points (pips) of an expiry date that is not a tenor of the
+    quotes table, with CARRY FROM FORWARD POINTS, and how they were obtained:
+    the foreign rates implied by the tenors' points interpolated linearly in
+    the rate time, held flat before the first and after the last tenor with
+    points. ``(None, '')`` when no tenor has usable points; ``(0, '')`` when
+    delivery is on the spot date (an expiry today: the forward is spot)."""
+
+    d, base = inp.dates, inp.pair.base
+    if d.tau_d <= 0:  # delivery on the spot date: the forward is spot whatever the points
+        return 0.0, ""
+    implied = [(r.dates.tau_d, _foreign_rate(inp, r.dates.tau_d, r.points)[0], r.tenor) for r in rows]
+    implied = sorted((t, v, name) for t, v, name in implied if np.isfinite(v))
+    if not implied:
+        return None, ""
+    t, v, names = zip(*implied)
+    rf = float(np.interp(d.tau_d, t, v))
+    points = forward_points(inp.S, inp.S * math.exp((inp.rd - rf) * d.tau_d), inp.pair.pip)
+    if d.tau_d < t[0] or d.tau_d > t[-1]:
+        edge, side = (names[0], "before the first") if d.tau_d < t[0] else (names[-1], "after the last")
+        note = f"forward from the {edge} implied {base} rate held flat ({side} tenor with forward points)"
+    else:
+        j = min(int(np.searchsorted(t, d.tau_d)), len(t) - 1)
+        lo, hi = names[max(j - 1, 0)], names[j]
+        note = (
+            f"forward from the {hi} forward points"
+            if math.isclose(d.tau_d, t[j], abs_tol=1e-12)
+            else f"forward from the implied {base} rates interpolated between {lo} and {hi} (linear in rate time)"
+        )
+    return points, note
 
 
 def _selected(inp: FxInputs, rows: List[TenorRow]) -> Selected:
     d = inp.dates
-    dtype = _delta_type(inp, d)
-    valid = [r for r in rows if r.quote is not None]
     row = next((r for r in rows if r.tenor == d.tenor), None)
+    carry_note = ""
     if row is not None:
         points = row.points
-    elif inp.carry == "FORWARD POINTS":  # a date between tenors: implied rf linear in the rate time
-        taus = [(r.dates.tau_d, _foreign_rate(inp, r.dates.tau_d, r.points)[0]) for r in rows]
-        taus = [(t, v) for t, v in taus if np.isfinite(v)]
-        points = None
-        if taus:
-            t, v = zip(*sorted(taus))
-            rf = float(np.interp(d.tau_d, t, v))
-            points = forward_points(inp.S, inp.S * math.exp((inp.rd - rf) * d.tau_d), inp.pair.pip)
+    elif inp.carry == "FORWARD POINTS":  # a date between tenors
+        points, carry_note = points_between_tenors(inp, rows)
     else:
         points = None
+    sel = _selected_market(inp, rows, row, points)
+    return replace(sel, carry_note=carry_note) if carry_note and sel.market is not None else sel
+
+
+def _selected_market(inp: FxInputs, rows: List[TenorRow], row: Optional[TenorRow], points: Optional[float]) -> Selected:
+    d = inp.dates
+    dtype = _delta_type(inp, d)
+    valid = [r for r in rows if r.quote is not None]
     rf, rf_error = _foreign_rate(inp, d.tau_d, points)
-    if rf_error:
-        return Selected(FxMarket(inp.S, inp.rd, 0.0, d.tau_e, d.tau_d), None, None, dtype, "", f"{d.label}: {rf_error}")
+    if rf_error:  # no forward: never price on a made-up foreign rate
+        return Selected(None, None, None, dtype, "", f"{d.label}: {rf_error}")
     market = FxMarket(inp.S, inp.rd, rf, d.tau_e, d.tau_d)
     if row is not None and row.quote is not None:
         quote, note = row.quote, f"the {row.tenor} quotes"
@@ -685,6 +784,11 @@ class Priced:
 
 def _strike_and_vol(inp: FxInputs, sel: Selected) -> Tuple[float, float, str]:
     m, smile = sel.market, sel.smile
+    if m is None:
+        raise ValueError(
+            f"no forward for this expiry ({sel.error}): enter its forward points (vol quotes table) or take the "
+            "carry from the rates"
+        )
     expired = m.tau_e <= 0
     use_smile = inp.vol_src == "SMILE" and not expired
     if use_smile and smile is None:
@@ -740,6 +844,22 @@ def _money(x: float, ccy: str) -> str:
     if abs(x) < 1:
         return f"{ccy} {calc.fmt_sig(x)}"
     return f"{ccy} {x:,.0f}" if abs(x) >= 100 else f"{ccy} {x:,.2f}"
+
+
+def _card_money(x: float, ccy: str) -> Tuple[str, Optional[str]]:
+    """(headline, exact) for a Greek card: the exact amount when it fits the
+    card (:data:`CARD_VALUE_CHARS`), else 4 significant figures with a k / M /
+    B / T suffix and the exact amount for the line below (never cut off)."""
+
+    exact = _money(x, ccy)
+    if len(exact) <= CARD_VALUE_CHARS:
+        return exact, None
+    ax = abs(x)
+    for scale, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if ax >= scale:
+            short = f"{x / scale:.4g}{suffix}" if ax < 1e15 else f"{x:.2e}"
+            return f"{ccy} {short}", exact
+    return f"{ccy} {x:.2e}", exact
 
 
 def _cell(label: str, value: str) -> str:
@@ -813,38 +933,48 @@ def _greeks_panel(inp: FxInputs, p: Priced) -> None:
     pair, g, n = inp.pair, p.greeks, p.n_base
     f = calc.fmt_sig
     hedge = p.hedge_type
+    delta_amount = n * g.delta(hedge)
+    amounts = [  # (name, amount, its currency, unit line, per-unit line)
+        (
+            "GAMMA Γ",
+            n * g.gamma_1pct,
+            pair.base,
+            "spot-delta change per +1% spot",
+            f"{f(g.gamma_1pct)} per 1 {pair.base}",
+        ),
+        ("VEGA ν", n * g.vega_1vol, pair.quote, "P&L per +1 vol pt", f"{f(g.vega_1vol)} per 1 {pair.base}"),
+        ("THETA Θ", n * g.theta_1d, pair.quote, "P&L over 1 calendar day", "repriced, both times −1 day"),
+        (f"RHO {pair.quote}", n * g.rho_d_1bp, pair.quote, f"P&L per +1bp of the {pair.quote} rate", ""),
+        (f"RHO {pair.base}", n * g.rho_f_1bp, pair.quote, f"P&L per +1bp of the {pair.base} rate", ""),
+        ("VANNA", n * g.vanna_1vol, pair.base, "spot-delta change per +1 vol pt", ""),
+        ("VOLGA", n * g.volga_1vol, pair.quote, "vega change per +1 vol pt", ""),
+    ]
     cards = [
         (
             "DELTA Δ",
             f"{100 * g.delta(hedge):.3f}%",
             DELTA_TYPE_LABELS[hedge].lower(),
-            f"{_money(n * g.delta(hedge), pair.base)} {'long' if n * g.delta(hedge) >= 0 else 'short'}",
-        ),
-        (
-            "GAMMA Γ",
-            _money(n * g.gamma_1pct, pair.base),
-            "spot-delta change per +1% spot",
-            f"{f(g.gamma_1pct)} per 1 {pair.base}",
-        ),
-        ("VEGA ν", _money(n * g.vega_1vol, pair.quote), "P&L per +1 vol pt", f"{f(g.vega_1vol)} per 1 {pair.base}"),
-        ("THETA Θ", _money(n * g.theta_1d, pair.quote), "P&L over 1 calendar day", "repriced, both times −1 day"),
-        (f"RHO {pair.quote}", _money(n * g.rho_d_1bp, pair.quote), f"P&L per +1bp of the {pair.quote} rate", ""),
-        (f"RHO {pair.base}", _money(n * g.rho_f_1bp, pair.quote), f"P&L per +1bp of the {pair.base} rate", ""),
-        ("VANNA", _money(n * g.vanna_1vol, pair.base), "spot-delta change per +1 vol pt", ""),
-        ("VOLGA", _money(n * g.volga_1vol, pair.quote), "vega change per +1 vol pt", ""),
+            [f"{_money(delta_amount, pair.base)} {'long' if delta_amount >= 0 else 'short'}"],
+        )
     ]
+    for name, amount, ccy, unit, per_unit in amounts:
+        headline, exact = _card_money(amount, ccy)
+        cards.append((name, headline, unit, [s for s in (f"= {exact}" if exact else "", per_unit) if s]))
     html_cards = "".join(
         f"<div class='dx-greek'><div class='dx-greek-name'>{html.escape(a)}</div>"
         f"<div class='dx-greek-value'>{html.escape(b)}</div><div class='dx-greek-unit'>{html.escape(c)}</div>"
-        + (f"<div class='dx-greek-sub'>{html.escape(d)}</div>" if d else "")
+        + "".join(f"<div class='dx-greek-sub'>{html.escape(line)}</div>" for line in subs)
         + "</div>"
-        for a, b, c, d in cards
+        for a, b, c, subs in cards
     )
     st.markdown("### / GREEKS")
     st.caption(
         f"For the {'long' if n >= 0 else 'short'} position on {pair.base} {abs(n):,.0f}; each value is the P&L (or "
         f"change in delta) for the stated move. The delta shown is the hedge convention for a premium in "
-        f"{pair.base if inp.premium_in_base else pair.quote}; all four are below."
+        f"{pair.base if inp.premium_in_base else pair.quote}; all four are below. Each rho bumps one deposit rate "
+        "with spot and the other rate fixed, so the forward moves"
+        + (" (the foreign rate is the one implied by the forward points)" if inp.carry != "RATES" else "")
+        + "; theta keeps spot, rates and vol fixed."
     )
     st.markdown(f"<div class='dx-greeks'>{html_cards}</div>", unsafe_allow_html=True)
     table = pd.DataFrame(
@@ -862,6 +992,7 @@ def _greeks_panel(inp: FxInputs, p: Priced) -> None:
 
 def _dates_panel(inp: FxInputs, sel: Selected) -> None:
     d, pair = inp.dates, inp.pair
+    defaults = illustrative_carry(inp)
     with st.expander("DATES AND CONVENTIONS"):
         rows = [
             ("Trade date", d.trade.isoformat()),
@@ -873,12 +1004,33 @@ def _dates_panel(inp: FxInputs, sel: Selected) -> None:
             (
                 "Rates",
                 f"{pair.quote} {100 * sel.market.rd:.4f}%, {pair.base} {100 * sel.market.rf:.4f}% "
-                f"(continuous ACT/365F{'; implied from the forward points' if inp.carry != 'RATES' else ''})",
+                f"(continuous ACT/365F{'; implied from the forward points' if inp.carry != 'RATES' else ''}"
+                + (f"; {sel.carry_note}" if sel.carry_note else "")
+                + (f"; ILLUSTRATIVE defaults: {', '.join(defaults)}" if defaults else "")
+                + ")",
             ),
         ]
         st.dataframe(pd.DataFrame(rows, columns=["DATE / CONVENTION", "VALUE"]), hide_index=True, width="stretch")
-        if not pair.calendar.is_business_day(d.trade):
-            st.warning(f"{d.trade.isoformat()} is not a business day for {pair.label}; the dates are computed anyway.")
+
+
+def date_warnings(pair: CurrencyPair, dates: FxDates) -> List[str]:
+    """Warnings for a trade or expiry date that is not a business day of
+    both currencies (FX options trade and expire on such days; the dates
+    and the price are computed anyway, from the date as entered)."""
+
+    cal, out = pair.calendar, []
+    if not cal.is_business_day(dates.trade):
+        out.append(
+            f"TRADE DATE {dates.trade.isoformat()} is not a business day for {pair.label} ({cal.name}): spot and "
+            f"the tenor dates are computed from it anyway (next business day {cal.adjust(dates.trade, 'F')})."
+        )
+    if dates.tenor is None and dates.expiry > dates.trade and not cal.is_business_day(dates.expiry):
+        out.append(
+            f"EXPIRY {dates.expiry.isoformat()} is not a business day for {pair.label} ({cal.name}): an FX option "
+            f"expires on a business day of both currencies (next one {cal.adjust(dates.expiry, 'F')}). Priced as "
+            "entered."
+        )
+    return out
 
 
 def _quotes_editor(inp: FxInputs, rows: List[TenorRow]) -> None:
@@ -939,7 +1091,7 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     smile = sel.smile
     pair = inp.pair
     st.markdown(f"### / SMILE · {inp.dates.label}")
-    if sel.market.tau_e <= 0:
+    if inp.dates.tau_e <= 0:
         st.info(
             "EXPIRED (expiry = trade date): no time value is left, so there is no smile; the premium is the "
             "discounted intrinsic value of the forward."
@@ -960,6 +1112,7 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     )
     fig = go.Figure()
     fig.update_layout(meta={"chart": "fx_smile"})
+    off_chart = None  # the priced strike when it lies outside the plotted strikes
     if space == "STRIKE":
         K = smile_strikes(smile, n_sd=float(n_sd))
         vols = 100 * smile.vol(K)
@@ -1006,6 +1159,11 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
                 )
             )
             ys.append(100 * p.vol)
+        elif p is not None:
+            off_chart = (
+                f"K (PRICED) = {pair.fmt(p.K)} is outside the plotted strikes ({pair.fmt(K[0])} to "
+                f"{pair.fmt(K[-1])}): widen WIDTH (SD) to see it."
+            )
         x_title, x_lim = f"STRIKE ({pair.quote} per 1 {pair.base})", axis_limits(xs, floor=0.0)
     else:
         data = [row for row in smile_by_delta(smile, SMILE_DELTAS) if np.isfinite(row[2])]
@@ -1037,6 +1195,8 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     )
     bound_axes(fig, xaxis=x_lim, yaxis=axis_limits(ys, pad=0.15, floor=0.0))
     st.plotly_chart(fig, width="stretch", key=_k("smile_chart"), config=PLOTLY_2D_CONFIG)
+    if off_chart:
+        st.caption(off_chart)
     if GUARD_AVAILABLE:
         st.caption(ZOOM_HINT)
     ok, min_density, k_min = density_check(smile, smile_strikes(smile, n_sd=float(n_sd)))
@@ -1126,12 +1286,13 @@ def _smile_tables(inp: FxInputs, sel: Selected) -> None:
 def _surface(inp: FxInputs, rows: List[TenorRow]) -> None:
     st.markdown("### / VOL SURFACE · TENOR × DELTA")
     valid = [r for r in rows if r.quote is not None]
-    z, text, hover_k, tenors = [], [], [], []
+    z, text, hover_k, tenors, no_forward = [], [], [], [], []
     labels = [lab for lab, _, _ in SURFACE_DELTAS]
     with st.spinner("Building the smiles"):
         for r in valid:
             rf, err = _foreign_rate(inp, r.dates.tau_d, r.points)
             if err:
+                no_forward.append(r.tenor)
                 continue
             row = _unit_surface_row(
                 inp.rd,
@@ -1147,7 +1308,10 @@ def _surface(inp: FxInputs, rows: List[TenorRow]) -> None:
             text.append([f"{100 * v:.2f}" if np.isfinite(v) else "" for _, _, v in row])
             hover_k.append([inp.pair.fmt(k * inp.S) if np.isfinite(k) else "n/a" for _, k, _ in row])
     if not tenors:
-        st.info("No valid tenor quotes: fix the table above.")
+        st.info(
+            "No valid tenor quotes: fix the table above."
+            + (f" Tenors without a forward: {', '.join(no_forward)}." if no_forward else "")
+        )
         return
     fig = go.Figure(
         go.Heatmap(
@@ -1180,6 +1344,11 @@ def _surface(inp: FxInputs, rows: List[TenorRow]) -> None:
         f"Smile vols (%) at the smile's own delta strikes, per tenor, {MODEL_LABELS[inp.model]}; hover for the strike. "
         "Blank cells: no strike has that delta (a premium-adjusted call delta above its maximum) or the model has no "
         "vol there. Built from the quotes table (illustrative unless edited)."
+        + (
+            f" Left out, no forward (forward points missing or unusable): {', '.join(no_forward)}."
+            if no_forward
+            else ""
+        )
     )
 
 
@@ -1266,6 +1435,8 @@ def render() -> None:
             st.error(msg)
         st.info("Fix the inputs in the sidebar to price the option.")
         return
+    for msg in date_warnings(inp.pair, inp.dates):
+        st.warning(msg)
     rows = parse_quote_rows(inp.pair, inp.trade, st.session_state[_k("quotes", inp.pair)])
     sel = _selected(inp, rows)
     if inp.dates.tau_e <= 0:
@@ -1280,6 +1451,18 @@ def render() -> None:
         st.error(f"Cannot price this option: {exc}.")
     if priced is not None:
         _hero(inp, sel, priced)
+        if sel.carry_note:
+            st.caption(f"FORWARD: {sel.carry_note}.")
+        defaults = illustrative_carry(inp)
+        if defaults:
+            st.markdown(
+                f"<span class='dx-badge' style='color:{SERIES[3]}'>ILLUSTRATIVE CARRY</span>"
+                f"{html.escape(', '.join(defaults))}: defaults, not market data (the default rates are flat "
+                "round numbers, continuously compounded ACT/365F); the forward, its points and the premium depend on "
+                "them. Enter your deposit rates in the sidebar, or forward points in the vol quotes table (CARRY "
+                "FROM: FORWARD POINTS).",
+                unsafe_allow_html=True,
+            )
         _premium_panel(inp, sel, priced)
         _greeks_panel(inp, priced)
         _dates_panel(inp, sel)
