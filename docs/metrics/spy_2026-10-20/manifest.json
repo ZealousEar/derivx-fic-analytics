@@ -1,9 +1,9 @@
 {
   "manifest_version": 1,
   "kind": "metrics",
-  "created_at_utc": "2026-10-20T21:53:06+00:00",
+  "created_at_utc": "2026-10-20T23:07:46+00:00",
   "code": {
-    "sha": "59ff7a2e5d72621d7c53d5ec8b059b7f38037f58",
+    "sha": "03244b3f144ddf127054cc51a12dc9a9103320bf",
     "dirty": false,
     "package": "derivx"
   },
@@ -41,6 +41,10 @@
     "fetched_at_utc": "2026-10-20T20:59:39+00:00",
     "rows": 10040,
     "expiries": 31,
+    "slices": 31,
+    "row_sources": [
+      "yahoo"
+    ],
     "files": [
       "data/examples/spy_2026-10-20.csv.gz"
     ],
