@@ -3,6 +3,7 @@ repricing of every quoted cap, caplet smiles by strike and vega buckets."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -25,7 +26,7 @@ from derivx.rates.indices import HullWhite
 from derivx.rates.multicurve import bootstrap_projection
 from derivx.rates.vol_examples import CAP_STRIKES_PCT, illustrative_cap_atm, illustrative_cap_strikes
 
-D = __import__("datetime").date.fromisoformat
+D = dt.date.fromisoformat
 USD_TERMS = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
 EUR_TERMS = {"index_months": 6, "day_count": "ACT/360", "calendar": "TARGET", "fixing_lag": 2,
              "projection": "EURIBOR 6M"}  # fmt: skip
