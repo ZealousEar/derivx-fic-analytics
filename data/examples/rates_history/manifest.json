@@ -1,6 +1,6 @@
 {
  "description": "Committed rates history sample for offline use and tests (values as published, in the stated units). Rebuild with: python tools/build_rates_snapshot.py",
- "built_at": "2026-10-20T12:38:28+00:00",
+ "built_at": "2026-10-20T21:07:30+00:00",
  "files": [
   {
    "dataset": "UST_PAR",
@@ -20,17 +20,17 @@
     "DGS20": "20Y",
     "DGS30": "30Y"
    },
-   "sampling": "month ends 2008-2025 and episode windows (+/-4 days)",
+   "sampling": "month ends 2008-2014, every business day from 2015 to 2025 (complete curves) and episode windows (+/-4 days)",
    "urls": [
     "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS1MO%2CDGS3MO%2CDGS6MO%2CDGS1%2CDGS2%2CDGS3%2CDGS5%2CDGS7%2CDGS10%2CDGS20%2CDGS30&cosd=2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01%2C2008-01-01&coed=2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31%2C2025-12-31"
    ],
-   "fetched_at": "2026-10-20T11:33:15+00:00",
+   "fetched_at": "2026-10-20T21:07:33+00:00",
    "attribution": "Board of Governors of the Federal Reserve System (H.15) via FRED, Federal Reserve Bank of St. Louis",
    "file": "ust_par_fred.csv",
-   "rows": 270,
+   "rows": 2844,
    "first": "2008-01-31",
    "last": "2025-12-31",
-   "sha256": "593e94ff98ce873c00bedc1be55f7a62e5857f3521c02b517ef46fcf429413ca"
+   "sha256": "531d8a101241b8f0d687d72580b4a745e7502a23866b56cb41421d28482bd6de"
   },
   {
    "dataset": "USD_SWAP_ICE",

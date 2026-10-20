@@ -40,7 +40,7 @@ def test_manifest_describes_every_committed_file():
         assert entry["unit"] == "percent" and entry["attribution"] and entry["urls"] and entry["fetched_at"]
         assert entry["dataset"] in rh.DATASETS
     total = sum((rh.SAMPLE_DIR / n).stat().st_size for n in files)
-    assert total < 250_000  # small enough to commit
+    assert total < 400_000  # small enough to commit; the daily 2015-2025 Treasury curves are ~190 kB of it
 
 
 def test_bundled_store_coverage(store):
@@ -49,6 +49,8 @@ def test_bundled_store_coverage(store):
     snapshot = set(rs.parse_treasury_csv(rh.TREASURY_SNAPSHOT.read_text())["asof"])
     assert snapshot <= set(ust) and ust[-1] == max(snapshot) == EXAMPLE_ASOF
     assert ust[0] <= D("2008-01-31") and len(ust) > 400  # month ends back to 2008 plus every 2026 business day
+    daily = [d for d in ust if d >= D("2015-01-02")]
+    assert len(daily) > 2900 and max((b - a).days for a, b in zip(daily[:-1], daily[1:])) <= 4  # every business day
     assert store.coverage("GBP_OIS_BOE")[0] <= D("2009-01-31") and store.coverage("GBP_OIS_BOE")[1] >= D("2026-10-16")
     assert store.curve("GBP_OIS_BOE", store.coverage("GBP_OIS_BOE")[1]).index[-1] == "25Y"
     assert store.coverage("USD_SWAP_ICE")[1] <= rs.ICE_SWAP_LAST_DATE
@@ -88,7 +90,7 @@ def test_curve_moves(store):
     nearest = store.curve_move("UST_PAR", D("2022-01-01"), D("2022-10-22"))  # weekend and holiday ends
     assert (nearest.start, nearest.end) == (D("2021-12-31"), D("2022-10-21"))
     with pytest.raises(ValueError, match="within 4 days"):
-        store.curve_move("UST_PAR", D("2019-06-12"), D("2019-06-20"))  # mid-month: not in the sample
+        store.curve_move("UST_PAR", D("2011-06-15"), D("2011-06-22"))  # mid-month before the daily 2015+ sample
     with pytest.raises(ValueError, match="must be after"):
         store.curve_move("UST_PAR", D("2022-10-21"), D("2022-01-03"))
     with pytest.raises(ValueError, match="no ICE"):
