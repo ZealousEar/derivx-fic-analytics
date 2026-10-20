@@ -29,7 +29,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 import numpy as np
 from scipy.optimize import brentq
 
-from .conventions import Calendar, Date, Tenor, make_schedule, parse_tenor, year_fraction
+from .conventions import Calendar, Date, Tenor, _null_advance_months, make_schedule, parse_tenor, year_fraction
 
 INTERPOLATIONS = ("loglinear", "linear_zero", "monotone_convex")
 INSTRUMENT_KINDS = ("DEPO", "OIS", "IRS", "BILL", "BOND")
@@ -215,12 +215,20 @@ class Instrument:
             self.start = spot
             maturity = _unadjusted_end(spot, tenor)
             months = self.conv.bond_months
-            coupon_dates = make_schedule(spot, maturity, months, cal, "U", "U", backward=True)
             freq = 12 // months
+            # Regular coupon dates step back from maturity (month ends stay
+            # month ends), so a regular period accrues exactly 1/freq; only
+            # a settlement stub accrues a fraction of its reference period.
+            regular = [maturity]
+            while regular[-1] > spot:
+                regular.append(_null_advance_months(maturity, -months * len(regular), eom=True))
+            coupon_dates = [spot] + [d for d in reversed(regular) if d > spot]
             for s, e in zip(coupon_dates[:-1], coupon_dates[1:]):
-                # The settlement stub (if any) is a short first coupon period.
-                ref_start = _add_months(e, -months)
-                accrual = year_fraction(max(s, ref_start), e, self.conv.bond_day_count, ref_start, e, freq)
+                ref_start = regular[regular.index(e) + 1]
+                if s == ref_start:
+                    accrual = 1.0 / freq
+                else:
+                    accrual = year_fraction(s, e, self.conv.bond_day_count, ref_start, e, freq)
                 self._fixed.append((s, e, cal.adjust(e, "F"), accrual))
             self.end = maturity
             self.pillar = self._fixed[-1][2]
@@ -568,6 +576,25 @@ class Curve:
         return [f"{q.tenor} {q.kind}" for q in self.quotes]
 
 
+def _secant(f: Callable[[float], float], x0: float, max_iter: int = 30) -> Optional[float]:
+    """Secant iteration to machine precision; None if it does not settle."""
+
+    x1 = x0 * (1.0 + 1e-6)
+    f0, f1 = f(x0), f(x1)
+    for _ in range(max_iter):
+        if f1 == 0.0:
+            return x1
+        if f1 == f0 or not math.isfinite(f1):
+            return None
+        x2 = x1 - f1 * (x1 - x0) / (f1 - f0)
+        if not math.isfinite(x2) or x2 <= 0.0:
+            return None
+        if abs(x2 - x1) <= 4.0 * np.finfo(float).eps * abs(x2):
+            return x2
+        x0, f0, x1, f1 = x1, f1, x2, f(x2)
+    return None
+
+
 def bootstrap(
     asof: Date,
     quotes: Sequence[CurveQuote],
@@ -612,8 +639,20 @@ def bootstrap(
         for k, inst in enumerate(instruments, start=1):
             span = times[k] - times[k - 1]
             base = dfs[k - 1]
-            lo, hi = base * math.exp(-1.0 * span), base * math.exp(0.25 * span)
             f = lambda x, k=k, inst=inst: inst.npv(trial_curve(k, x, full))  # noqa: E731
+            # NPV is close to linear in the pillar DF, so a secant step from a
+            # good guess (the previous pass, or the last forward carried on)
+            # converges in a few evaluations; brentq is the safe fallback.
+            if passes > 0:
+                guess = dfs[k]
+            else:
+                fwd = (math.log(dfs[k - 2] / base) / (times[k - 1] - times[k - 2])) if k > 1 else 0.03
+                guess = base * math.exp(-fwd * span)
+            root = _secant(f, guess)
+            lo, hi = base * math.exp(-1.0 * span), base * math.exp(0.25 * span)
+            if root is not None and lo < root < hi:
+                dfs[k] = root
+                continue
             f_lo, f_hi = f(lo), f(hi)
             widen = 0
             while f_lo * f_hi > 0 and widen < 8:
