@@ -72,11 +72,11 @@ def test_tab_prices_on_the_illustrative_cube_and_says_so(app):
     assert position.kind == "swaption" and position.vol_model == "normal"
     pv = _metric(app, "PV ($)")
     assert pv == pytest.approx(position.pv(example_market()), abs=0.01)
-    assert _metric(app, "PREMIUM (BP OF NOTIONAL)") == pytest.approx(pv / 1e7 * 1e4, abs=1e-3)
+    assert _metric(app, "PREMIUM (BP)") == pytest.approx(pv / 1e7 * 1e4, abs=1e-3)
     trade = position.details["trade"]
     assert trade.expiry_date is not None and trade.strike == pytest.approx(trade.atm_strike(example_market()))
     for label in ("DELTA ($/BP FWD)", "PV01 ($/BP CURVE)", "GAMMA ($/BP²)", "VEGA ($/BP NORMAL)", "VEGA ($/VOL PT)",
-                  "THETA ($, 1 BUS. DAY)", "RMSE (BP)"):  # fmt: skip
+                  "THETA ($, 1 BUS. DAY)", "FWD SWAP RATE (%)"):  # fmt: skip
         assert label in [m.label for m in app.metric]
     assert _metric(app, "THETA ($, 1 BUS. DAY)") < 0 < _metric(app, "VEGA ($/BP NORMAL)")
     charts = _charts(app)
@@ -87,6 +87,8 @@ def test_tab_prices_on_the_illustrative_cube_and_says_so(app):
     smile = charts["swn_smile_chart"]
     assert {t["name"] for t in smile["data"]} == {"SABR (CUBE)", "QUOTES", "TRADE STRIKE"}
     assert smile["layout"]["yaxis"]["minallowed"] >= 0.0
+    params = next(d.value for d in app.dataframe if "RMSE (BP)" in d.value.columns)
+    assert params["STATUS"].iloc[0] == "fitted" and params["BETA"].iloc[0] == 0.0 and params["RMSE (BP)"].iloc[0] < 0.1
     residuals = next(d.value for d in app.dataframe if "RESIDUAL (BP)" in d.value.columns)
     assert len(residuals) == 9 and residuals["RESIDUAL (BP)"].abs().max() < 0.1
     assert _in_use(app).startswith("Vol quotes in use: ILLUSTRATIVE quotes (not market data): USD swaption")
@@ -139,7 +141,7 @@ def test_pasted_quotes_replace_the_illustrative_grid_until_reset(app):
     assert not app.error, [e.value for e in app.error]
     assert _in_use(app) == "Vol quotes in use: uploaded: pasted quotes."
     heat = _charts(app)["swn_atm_heatmap"]
-    assert heat["data"][0]["x"] == ["5Y", "10Y"] and heat["data"][0]["y"] == ["1Y", "2Y"]
+    assert heat["data"][0]["x"] == ["5Y", "10Y"] and heat["data"][0]["y"] == ["2Y", "1Y"]  # shortest on top
     badge = next(a["text"] for a in heat["layout"]["annotations"] if a["text"].startswith("SOURCE:"))
     assert "pasted quotes" in badge and "ILLUSTRATIVE" not in badge
     assert _metric(app, "VOL (BP)") == pytest.approx(100.0, abs=1e-6)  # 1Y x 5Y ATM quote

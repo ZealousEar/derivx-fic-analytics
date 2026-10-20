@@ -246,7 +246,13 @@ def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, obje
 def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms: Dict[str, object]) -> None:
     results, method, source = stripped["results"], stripped["method"], stripped["source"]
     st.markdown("### / STRIPPED CAPLET VOLS")
-    st.plotly_chart(_vol_strip_chart(results, method, source, market.asof), width="stretch", config=PLOTLY_2D_CONFIG,
+    shown = results
+    if stripped["strikes"] is not None:  # one strike at a time: eight overlaid step curves are unreadable
+        labels = {f"{r.curve.strike:.2%}": r for r in results}
+        nearest = int(np.argmin([abs(r.curve.strike - cf.strike) for r in results]))
+        pick = st.selectbox("CAPLET VOLS AT STRIKE", list(labels), index=nearest, key="cap_strip_strike")
+        shown = [labels[pick]]
+    st.plotly_chart(_vol_strip_chart(shown, method, source, market.asof), width="stretch", config=PLOTLY_2D_CONFIG,
                     key="cap_vol_strip_chart")  # fmt: skip
     rows = []
     for result in results:
@@ -458,16 +464,19 @@ def render(market: Market) -> List[Position]:
         return []
 
     per = "1BP" if model == "bachelier" else "VOL PT"
-    m = st.columns(4)
-    m[0].metric("PV", f"{pv:,.2f}")
-    m[1].metric("PREMIUM (BP RUNNING)", f"{premium_bp:,.2f}")
-    m[2].metric("PREMIUM (% UPFRONT)", f"{pv / notional * 100:.4f}")
-    m[3].metric("ATM STRIKE (%)", f"{atm * 100:.4f}")
-    m = st.columns(4)
-    m[0].metric(f"VEGA (/{per})", f"{vega:,.2f}")
-    m[1].metric("PV01 (/BP)", f"{pv01:,.2f}")
-    m[2].metric("GAMMA (/BP²)", f"{greeks['gamma']:,.4f}")
-    m[3].metric("THETA (1 BUS. DAY)", f"{greeks['theta']:,.2f}")
+    cells = [
+        ("PV", f"{pv:,.2f}"),
+        ("PREMIUM (BP RUNNING)", f"{premium_bp:,.2f}"),
+        ("PREMIUM (% UPFRONT)", f"{pv / notional * 100:.4f}"),
+        ("ATM STRIKE (%)", f"{atm * 100:.4f}"),
+        (f"VEGA (/{per})", f"{vega:,.2f}"),
+        ("PV01 (/BP)", f"{pv01:,.2f}"),
+        ("GAMMA (/BP²)", f"{greeks['gamma']:,.4f}"),
+        ("THETA (1 BUS. DAY)", f"{greeks['theta']:,.2f}"),
+    ]
+    for start in range(0, len(cells), 3):  # three to a row: wider rows wrap next to the sidebar
+        for col, (label, value) in zip(st.columns(3), cells[start : start + 3]):
+            col.metric(label, value)
     shift_text = (
         "+1bp on every rate quote of the OIS and EURIBOR curves, rebuilt (basis spreads held)"
         if ladders is not None else "+1bp on every curve quote with the curve rebuilt"
