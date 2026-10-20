@@ -101,7 +101,8 @@ def test_every_pricer_chart_is_zoom_bounded(mode):
     at.sidebar.radio[0].set_value(mode).run()
     assert not at.exception
     charts = _charts(at)
-    assert len(charts) == 2
+    # Equity/FX: surface + smile; Rates: every chart across its five tabs.
+    assert len(charts) == 2 if mode != "[ RATES ]" else len(charts) >= 5
     for spec, config in charts:
         _assert_bounded(spec, config)
     if mode != "[ RATES ]":

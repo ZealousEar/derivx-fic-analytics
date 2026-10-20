@@ -2,23 +2,19 @@ from __future__ import annotations
 
 import datetime as dt
 from io import BytesIO
-from pathlib import Path
 from typing import Dict, Iterable, List, Mapping
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 from scipy.interpolate import CubicSpline
 
 from derivx.calibration.production import CalibratedSlice, calibrate_with_constraints
 from derivx.core.bs import bs_price_greeks, put_call_parity_residual
 from derivx.data.market_data import apply_liquidity_filters, compute_moneyness, fetch_option_chain
 from derivx.models.comparison import compare_models
-from derivx.rates.black_ir import price_cap_floor
-from derivx.rates.term_structure import ZeroCurve, build_zero_curve
-from derivx.risk.metrics import scen_shift_curve
+from derivx.ui import rates_bonds, rates_capfloor, rates_curve, rates_scenarios, rates_swap
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene, mount_zoom_guard
 from derivx.ui.theme import PLOTLY_2D_CONFIG
 from derivx.validation.backtest import walk_forward_test
@@ -154,7 +150,6 @@ mode = st.sidebar.radio(
 )
 mode = mode.replace("[", "").replace("]", "").strip()  # Extract mode name
 
-DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "examples"
 DEFAULT_CAMERA = dict(eye=dict(x=1.6, y=1.6, z=1.2))
 # Zoom and pan are bounded by derivx.ui.plot_limits. Wheel zoom (pinch or
 # Ctrl/Cmd + wheel) and 3D pan need its in-page guard, so both are off without
@@ -1099,150 +1094,23 @@ if mode in ("EQUITY", "FX"):
 
 elif mode == "RATES":
     st.markdown("## / INTEREST RATES")
-    
-    accent_color = "#FF4444"
-    
-    # Sidebar inputs
-    st.sidebar.markdown("### / RATES PARAMS")
-    uploaded = st.sidebar.file_uploader("CSV.DATA", type=["csv"])
-    if uploaded is not None:
-        df_rates = pd.read_csv(uploaded)
+    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS"])
+    with tabs[0]:
+        market = rates_curve.render()
+    if market is None:
+        for tab in tabs[1:]:
+            with tab:
+                st.info("Fix the quotes on the CURVE tab to price instruments.")
     else:
-        df_rates = pd.read_csv(DATA_DIR / "rates_quotes.csv")
-    quotes = {row["tenor"]: float(row["rate"]) for _, row in df_rates.iterrows()}
-
-    curve = build_zero_curve(quotes)
-    
-    # Curve visualization - stark monochrome
-    st.markdown("### / ZERO CURVE")
-    fig_curve = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=("DISCOUNT FACTORS", "FORWARD RATES"),
-        specs=[[{"type": "scatter"}, {"type": "scatter"}]]
-    )
-    
-    # Discount factors
-    fig_curve.add_trace(go.Scatter(
-        x=curve.ts, y=curve.dfs,
-        mode='lines+markers',
-        name='DF',
-        line=dict(color='#FFFFFF', width=2),
-        marker=dict(size=6, color='#FFFFFF', line=dict(width=1, color='#000000')),
-    ), row=1, col=1)
-    
-    # Forward rates
-    fwd_rates = [curve.fwd_rate(max(0, t-0.5), t) for t in curve.ts if t > 0]
-    fig_curve.add_trace(go.Scatter(
-        x=curve.ts[curve.ts > 0], y=fwd_rates,
-        mode='lines+markers',
-        name='FWD',
-        line=dict(color=accent_color, width=2),
-        marker=dict(size=6, color=accent_color, line=dict(width=1, color='#FFFFFF')),
-    ), row=1, col=2)
-    
-    fig_curve.update_xaxes(title_text="TENOR", gridcolor='#333333', row=1, col=1)
-    fig_curve.update_xaxes(title_text="TENOR", gridcolor='#333333', row=1, col=2)
-    fig_curve.update_yaxes(title_text="DF", gridcolor='#333333', row=1, col=1)
-    fig_curve.update_yaxes(title_text="RATE", gridcolor='#333333', row=1, col=2)
-    
-    bound_axes(
-        fig_curve,
-        xaxis=axis_limits(curve.ts, floor=0.0),
-        xaxis2=axis_limits(curve.ts[curve.ts > 0], floor=0.0),
-        yaxis=axis_limits(curve.dfs, floor=0.0),
-        yaxis2=axis_limits(fwd_rates),
-    )
-    fig_curve.update_layout(
-        height=350,
-        paper_bgcolor='#000000',
-        plot_bgcolor='#000000',
-        font=dict(color='#FFFFFF', family='Helvetica'),
-        showlegend=False,
-        margin=dict(l=50, r=50, t=50, b=50),
-    )
-    st.plotly_chart(fig_curve, width="stretch", config=PLOTLY_2D_CONFIG)
-
-    # Cap/Floor pricing
-    st.markdown("### / CAP PRICING")
-    col1, col2 = st.columns(2)
-    with col1:
-        K = st.number_input("STRIKE.K", value=0.03, step=0.001, format="%.4f", key="cap_strike")
-    with col2:
-        flat_sigma = st.number_input("VOL.σ", value=0.2, step=0.01, format="%.4f", key="cap_vol")
-    
-    max_t = float(curve.ts.max())
-    tenors = np.linspace(0.5, max(0.5, max_t), num=6)
-    vol_curve = ZeroCurve(ts=curve.ts, dfs=np.full_like(curve.dfs, flat_sigma))
-    res = price_cap_floor(curve, K, tenors, vol_curve)
-    
-    # Display metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("PV", f"{res['PV']:.6f}")
-    with col2:
-        st.metric("DV01", f"{res['DV01']:.6f}")
-    with col3:
-        st.metric("PV01", f"{res['PV01']:.6f}")
-
-    # Buckets bar chart - minimalist
-    st.markdown("### / BUCKETS")
-    bucket_tenors = list(res['buckets'].keys())
-    bucket_values = list(res['buckets'].values())
-    
-    fig_buckets = go.Figure(go.Bar(
-        x=[f"{t:.1f}Y" for t in bucket_tenors],
-        y=bucket_values,
-        text=[f"{v:.5f}" for v in bucket_values],
-        textposition='outside',
-        marker=dict(color='#FFFFFF', line=dict(color='#000000', width=2)),
-    ))
-    fig_buckets.update_layout(
-        yaxis_title="VALUE",
-        xaxis_title="TENOR",
-        paper_bgcolor='#000000',
-        plot_bgcolor='#000000',
-        font=dict(color='#FFFFFF', family='IBM Plex Mono'),
-        height=300,
-        margin=dict(l=50, r=50, t=30, b=50),
-        xaxis=dict(gridcolor='#333333'),
-        yaxis=dict(gridcolor='#333333'),
-    )
-    bound_axes(
-        fig_buckets,
-        xaxis={"min": -0.5, "max": len(bucket_values) - 0.5, "min_span": 1.0},
-        yaxis=axis_limits([0.0, *bucket_values], pad=0.15, floor=min(0.0, *bucket_values)),
-    )
-    st.plotly_chart(fig_buckets, width="stretch", config=PLOTLY_2D_CONFIG)
-
-    # Scenario analysis
-    st.markdown("### / SCENARIOS")
-    col1, col2 = st.columns(2)
-    with col1:
-        par = st.slider("PARALLEL (BP)", -100, 100, 0, key="parallel")
-    with col2:
-        tw = st.slider("TWIST (BP)", -100, 100, 0, key="twist")
-    
-    # Compute scenario PV
-    shocked_curve = scen_shift_curve(curve, parallel_bp=par, twist_bp=tw)
-    res_shock = price_cap_floor(shocked_curve, K, tenors, vol_curve)
-    pnl = res_shock['PV'] - res['PV']
-    
-    # Scenario P&L - stark display
-    st.markdown(f"""
-        <div style='background: #FFFFFF; color: #000000; padding: 2rem; border: 3px solid #000000; margin: 1.5rem 0;'>
-            <div style='text-align: center; font-family: "IBM Plex Mono", monospace;'>
-                <div style='font-size: 0.85rem; letter-spacing: 0.1em; font-weight: 700; margin-bottom: 0.5rem;'>
-                    P&L / SCENARIO
-                </div>
-                <div style='font-size: 3rem; font-weight: 700; color: {"#FF4444" if pnl < 0 else "#000000"}; line-height: 1;'>
-                    {"" if pnl < 0 else "+"}{pnl:.6f}
-                </div>
-                <div style='margin-top: 1rem; font-size: 0.8rem; opacity: 0.7;'>
-                    BASE {res['PV']:.6f} → SHOCKED {res_shock['PV']:.6f}
-                </div>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
+        positions = []
+        with tabs[1]:
+            positions += rates_swap.render(market)
+        with tabs[2]:
+            positions += rates_capfloor.render(market)
+        with tabs[3]:
+            positions += rates_bonds.render(market)
+        with tabs[4]:
+            rates_scenarios.render(market, positions)
 elif mode == "ANALYTICS":
     st.markdown("## / VOL ANALYTICS LAB")
     tab_labels = [f"/ {label.upper()}" for label in ANALYTICS_TABS]
