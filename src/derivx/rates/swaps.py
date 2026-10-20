@@ -46,7 +46,6 @@ import pandas as pd
 from derivx.rates.conventions import BUSINESS_DAY_CONVENTIONS, Calendar, Date, add_months, parse_tenor, year_fraction
 from derivx.rates.curves import (
     CONVENTIONS,
-    GOVT_KEY,
     SPREAD_KINDS,
     CurveConventions,
     Market,
@@ -55,7 +54,7 @@ from derivx.rates.curves import (
 )
 from derivx.rates.indices import TermIndex, get_index
 from derivx.rates.multicurve import basis_leg_dates
-from derivx.risk.sensitivities import Position, PvFunction, bumped_market, solve_hedge
+from derivx.risk.sensitivities import Position, PvFunction, bumped_market, rate_curves, solve_hedge
 
 FLOAT_INDICES = ("OIS", "TERM")
 SWAP_KINDS = ("OIS", "IRS")
@@ -841,11 +840,7 @@ def risk_curves(market: Market) -> Tuple[str, ...]:
     does not price swaps; a projection that is the discount curve moves
     with it)."""
 
-    return tuple(
-        k
-        for k in market.curve_keys
-        if k != GOVT_KEY and (k == "curve" or not market.projections.is_discount(k)) and market.get_curve(k).quotes
-    )
+    return rate_curves(market)
 
 
 def benchmark_instruments(

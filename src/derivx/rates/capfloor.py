@@ -200,6 +200,50 @@ def bachelier_delta(F: float, K: float, T: float, sigma_n: float, is_call: bool 
     return w * _cdf(w * (F - K) / std)
 
 
+def shifted_black_gamma(F: float, K: float, T: float, sigma: float, shift: float) -> float:
+    """d2 price / d F2 (per unit of rate squared; same for calls and puts).
+    Zero at zero time value away from the strike."""
+
+    _check_inputs(F, K, T)
+    f, k = _shifted(F, K, shift)
+    _check_vol(sigma)
+    std = sigma * math.sqrt(max(T, 0.0))
+    if std == 0.0:
+        return 0.0
+    return _pdf(_black_d1(f, k, std)) / (f * std)
+
+
+def bachelier_gamma(F: float, K: float, T: float, sigma_n: float) -> float:
+    """d2 price / d F2 (per unit of rate squared; same for calls and puts)."""
+
+    _check_inputs(F, K, T)
+    _check_vol(sigma_n)
+    std = sigma_n * math.sqrt(max(T, 0.0))
+    if std == 0.0:
+        return 0.0
+    return _pdf((F - K) / std) / std
+
+
+def model_delta(
+    model: str, F: float, K: float, T: float, sigma: float, shift: float = 0.0, is_call: bool = True
+) -> float:
+    """d price / d F under one of :data:`MODELS` (undiscounted, per unit of
+    rate): ``N(d1)`` for a Black call, ``N(d)`` for a Bachelier call."""
+
+    if model == "bachelier":
+        return bachelier_delta(F, K, T, sigma, is_call)
+    return shifted_black_delta(F, K, T, sigma, _model_shift(model, shift), is_call)
+
+
+def model_gamma(model: str, F: float, K: float, T: float, sigma: float, shift: float = 0.0) -> float:
+    """d2 price / d F2 under one of :data:`MODELS` (undiscounted, per unit of
+    rate squared)."""
+
+    if model == "bachelier":
+        return bachelier_gamma(F, K, T, sigma)
+    return shifted_black_gamma(F, K, T, sigma, _model_shift(model, shift))
+
+
 def _solve_vol(excess: Callable[[float], float], hi: float, cap: float, what: str) -> float:
     """Root of an increasing ``excess(vol)`` with ``excess(0) < 0``."""
 

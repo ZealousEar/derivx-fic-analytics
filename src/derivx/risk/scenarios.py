@@ -640,6 +640,21 @@ def carry_market(market: Market, days: int) -> Market:
     return _moved(market, {}, horizon_date(market, days))
 
 
+def theta(positions: Sequence[Position], market: Market, days: int = 1) -> np.ndarray:
+    """One-day theta of each position: value on :func:`carry_market` (the
+    market rolled to ``days`` calendar days ahead, moved to the next business
+    day, quotes and vols unchanged) plus cash received, minus value today.
+    For an option it is time decay plus the carry and roll-down of its
+    forwards and discount factors (and, for vols keyed by time to expiry,
+    the roll down the vol curve)."""
+
+    positions = list(positions)
+    base = _pvs(positions, market)
+    rolled = carry_market(market, days)
+    pv, cash = _revalue(positions, market, rolled)
+    return pv + cash - base
+
+
 # --------------------------------------------------------------------------
 # Sensitivities
 # --------------------------------------------------------------------------
