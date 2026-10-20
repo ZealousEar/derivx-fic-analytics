@@ -1,18 +1,12 @@
-import datetime as dt
 import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from derivx.calibration.production import calibrate_with_constraints
-from derivx.models.comparison import compare_models
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
-from derivx.vol.implied import black_price
-from derivx.vol.svi import svi_iv
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
 
@@ -55,32 +49,6 @@ def test_bound_scene_records_zoom_distance_and_pan_limits():
     assert fig.layout.scene.aspectmode == "manual"
     assert scene["distance"] == pytest.approx([r0 / 2.0, r0 / 0.5])
     assert scene["zoom"] == [0.5, 2.0] and scene["pan"] == 0.3
-
-
-def _chain(trade_date: dt.date) -> pd.DataFrame:
-    strikes = np.linspace(80, 120, 9)
-    params = {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "s": 0.4}
-    vols = svi_iv(strikes, params, F=100.0, T=1.0)  # params: total variance at T = 1
-    is_call = strikes >= 100.0
-    # bid/ask around the Black-76 price of each quoted vol (r = 0, F = 100), so mid vols equal the quotes
-    price = black_price(100.0, strikes, 30 / 365, vols, is_call)
-    df = pd.DataFrame(
-        {
-            "trade_date": pd.Timestamp(trade_date),
-            "expiry": pd.Timestamp(trade_date + dt.timedelta(days=30)),
-            "strike": strikes,
-            "implied_vol": vols,
-            "underlying_price": 100.0,
-            "bid": price * 0.99,
-            "ask": price * 1.01,
-            "mid": price,
-            "volume": 50,
-            "open_interest": 100,
-            "option_type": np.where(is_call, "call", "put"),
-        }
-    )
-    df["moneyness"] = df["strike"] / 100.0
-    return df
 
 
 def _charts(at: AppTest) -> list:
@@ -136,34 +104,29 @@ def test_fx_smile_in_delta_space_is_zoom_bounded():
 
 
 def test_every_analytics_chart_is_zoom_bounded():
-    start = dt.date(2024, 1, 2)
-    chain = _chain(start)
-    # Five days: with exactly three the tab's window slider has min == max and
-    # Streamlit raises (a separate, pre-existing bug).
-    dates = [start + dt.timedelta(days=i) for i in range(5)]
-    days = {pd.Timestamp(d): _chain(d) for d in dates}
-    at = AppTest.from_file(str(APP), default_timeout=120)
-    at.session_state["market_chain"] = chain
-    at.session_state["calibration_results"] = calibrate_with_constraints(chain)
-    at.session_state["walkforward_chains"] = days
-    at.session_state["walkforward_metrics"] = pd.DataFrame(
-        {
-            "trade_date": list(days)[:2],
-            "next_date": list(days)[1:3],
-            "rmse": [0.01, 0.02],
-            "hit_rate": [0.5, 0.6],
-            "regime": "mid",
-        }
-    )
-    at.session_state["model_comp_metrics"] = compare_models(chain)
-    at.session_state["model_comp_slice"] = chain
+    """Calibration smile, walk-forward and model comparison: drawn from the
+    bundled sample and a short SYNTHETIC history (no network)."""
+
+    at = AppTest.from_file(str(APP), default_timeout=300)
     at.run()
     at.sidebar.radio[0].set_value("[ ANALYTICS ]").run()
+    at.button(key="lab_cal_run").click().run()
+    at.button(key="lab_mc_run").click().run()
+    at.radio(key="lab_wf_source").set_value("SYNTHETIC demo history").run()
+    at.slider(key="lab_wf_synth_days").set_value(4).run()
+    at.button(key="lab_wf_synth_go").click().run()
+    at.number_input(key="lab_wf_maxdays").set_value(30).run()
+    at.button(key="lab_wf_run").click().run()
     assert not at.exception
     charts = _charts(at)
     assert len(charts) == 3  # calibration smile, walk-forward, model comparison
     for spec, config in charts:
         _assert_bounded(spec, config)
+    named = {spec["layout"]["meta"]["chart"]: spec["layout"] for spec, _ in charts}
+    assert set(named) == {"lab_calibration", "lab_walkforward", "lab_model_comparison"}
+    for name in ("lab_calibration", "lab_model_comparison"):
+        assert named[name]["xaxis"]["minallowed"] >= 0.0 and named[name]["yaxis"]["minallowed"] >= 0.0
+    assert named["lab_walkforward"]["yaxis"]["minallowed"] >= 0.0
 
 
 def test_failed_guard_mount_falls_back_instead_of_raising(monkeypatch):

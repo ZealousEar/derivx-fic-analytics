@@ -1,4 +1,13 @@
-"""Validation utilities (walk-forward testing)."""
-from .backtest import measure_prediction_error, walk_forward_test
+"""Validation: walk-forward tests of smile forecasts and run manifests."""
 
-__all__ = ["walk_forward_test", "measure_prediction_error"]
+from .backtest import WalkForwardResult, WalkForwardSettings, run_walk_forward, walk_forward_test
+from .manifest import build_manifest, results_zip
+
+__all__ = [
+    "WalkForwardResult",
+    "WalkForwardSettings",
+    "build_manifest",
+    "results_zip",
+    "run_walk_forward",
+    "walk_forward_test",
+]

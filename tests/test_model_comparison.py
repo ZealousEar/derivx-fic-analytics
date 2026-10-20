@@ -140,3 +140,43 @@ def test_cv_refits_start_from_training_quotes_only(monkeypatch):
     _, slc = _slice(30)
     comp_mod.fit_models(slc, models=["svi"], rate=0.04, div_yield=0.012, folds=3)
     assert len(calls) == 4 and all("x0" not in c for c in calls)
+
+
+def test_every_expiry_is_scored_or_reported_with_a_reason():
+    from derivx.models.comparison import compare_models_by_expiry
+
+    chain = synth_chain(days=(0, 1, 30, 91), spot=580.0)
+    scores, skipped = compare_models_by_expiry(chain, ("svi", "sabr", "spline"), max_days=60)
+    assert sorted(scores["days"].unique()) == [30]
+    assert set(scores["model"]) == {"svi", "sabr", "spline"} and scores["rmse_cv_bp"].notna().all()
+    reasons = dict(zip(pd.to_datetime(skipped["expiry"]).dt.date.astype(str), skipped["reason"]))
+    assert len(reasons) == 3  # same-day, 1-day and beyond max_days: none dropped silently
+    assert any("> max_days=60" in r for r in reasons.values())
+    assert sum("< min_days" in r for r in reasons.values()) == 2
+    assert set(scores["forward_method"]) == {"parity"}
+
+
+def test_summaries_keep_every_slice_and_word_comparisons_by_sign():
+    """critic-1: no one-sided clipping of unfavourable slices, and 'better'
+    goes to the model with the lower error."""
+
+    from derivx.models.comparison import describe_pairwise, pairwise_wins, summarise_comparison
+
+    rows = []
+    for i, (svi, sabr) in enumerate([(60.0, 30.0), (5000.0, 20.0), (10.0, 40.0)]):
+        exp = pd.Timestamp("2026-11-01") + pd.Timedelta(days=7 * i)
+        rows += [
+            {"trade_date": pd.Timestamp("2026-10-20"), "expiry": exp, "model": "svi", "rmse_cv_bp": svi},
+            {"trade_date": pd.Timestamp("2026-10-20"), "expiry": exp, "model": "sabr", "rmse_cv_bp": sabr},
+        ]
+    scores = pd.DataFrame(rows)
+    summary = summarise_comparison(scores).set_index("model")
+    assert summary.loc["svi", "slices"] == 3 and summary.loc["svi", "max_rmse_cv_bp"] == 5000.0  # outlier kept
+    assert summary.loc["svi", "best_on"] == 1 and summary.loc["sabr", "best_on"] == 2
+    res = pairwise_wins(scores, "svi", "sabr")
+    assert res == {"slices": 3, "a_better": 1, "b_better": 2, "ties": 0, "median_diff": 30.0}
+    text = describe_pairwise("svi", "sabr", res)
+    assert text.startswith("SABR has the lower out-of-sample RMSE on 2 of 3 expiries")
+    assert "SABR better at the median" in text and "outperforms" not in text
+    flipped = describe_pairwise("sabr", "svi", pairwise_wins(scores, "sabr", "svi"))
+    assert "SABR has the lower" in flipped and "(median SABR - SVI = -30.0 vol bp; SABR better" in flipped

@@ -241,3 +241,144 @@ def select_expiry(chain: pd.DataFrame, target_days: float = 30.0, min_days: floa
         raise ValueError(f"no expiry at least {min_days:g} days after the trade date")
     i = int(np.argmin(np.where(valid, np.abs(days - target_days), np.inf)))
     return pd.Timestamp(expiries[i])
+
+
+def compare_models_by_expiry(
+    chain: pd.DataFrame,
+    models: Iterable[str] = ("svi", "sabr", "spline"),
+    *,
+    rate: float = 0.0,
+    min_days: float = 2.0,
+    max_days: Optional[float] = None,
+    sabr_beta: float = 1.0,
+    folds: int = 5,
+    std_band: Optional[float] = 3.0,
+    min_points: int = 8,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """:func:`fit_models` on every (trade_date, expiry) slice of ``chain``
+    with ``min_days <= days to expiry <= max_days``. Forwards come from
+    :func:`derivx.calibration.production.clean_chain` (put-call parity, or
+    interpolated from the other expiries' parity forwards when parity
+    fails), so they match the calibration tab. Returns ``(scores,
+    skipped)``: one row per (slice, model) with the table columns of
+    :func:`fit_models` plus ``trade_date``, ``expiry``, ``days``, ``tau``,
+    ``forward``, ``forward_method``; and one row per skipped slice with the
+    reason. No slice is dropped silently and no score is clipped."""
+
+    from derivx.calibration.production import clean_chain
+
+    models = _check_models(models)
+    cleaned, bad = clean_chain(chain, rate=rate, min_days=min_days)
+    skipped = [{"trade_date": s.trade_date, "expiry": s.expiry, "reason": s.reason} for s in bad]
+    frames = []
+    for td, exp, group, clean in cleaned:
+        base = {"trade_date": td, "expiry": exp}
+        if clean.days < min_days:
+            skipped.append({**base, "reason": f"{clean.days} day(s) to expiry < min_days={min_days:g}"})
+            continue
+        if max_days is not None and clean.days > max_days:
+            skipped.append({**base, "reason": f"{clean.days} days to expiry > max_days={max_days:g}"})
+            continue
+        try:
+            comp = fit_models(
+                group,
+                models,
+                sabr_beta=sabr_beta,
+                folds=folds,
+                trade_date=td,
+                rate=rate,
+                min_days=min_days,
+                std_band=std_band,
+                min_points=min_points,
+                hygiene={"forward": clean.forward, "forward_source": clean.forward_source},
+            )
+        except ValueError as exc:
+            skipped.append({**base, "reason": str(exc)})
+            continue
+        frames.append(
+            comp.table.assign(
+                trade_date=td,
+                expiry=exp,
+                days=clean.days,
+                tau=clean.tau,
+                forward=clean.forward,
+                forward_method=clean.forward_method,
+            )
+        )
+    scores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not scores.empty:
+        lead = ["trade_date", "expiry", "days", "tau", "forward", "forward_method"]
+        scores = scores[lead + [c for c in scores.columns if c not in lead]]
+    return scores, pd.DataFrame(skipped, columns=["trade_date", "expiry", "reason"])
+
+
+def summarise_comparison(scores: pd.DataFrame, metric: str = "rmse_cv_bp") -> pd.DataFrame:
+    """Per model: slices scored, failures, median / mean / max of ``metric``
+    and how often the model has the lowest ``metric`` among the models
+    scored on the same slice (ties count for each). Every scored slice is
+    included: nothing is clipped or filtered."""
+
+    if scores is None or scores.empty:
+        return pd.DataFrame()
+    key = ["trade_date", "expiry"]
+    ok = scores[np.isfinite(scores[metric])]
+    best = ok.groupby(key)[metric].transform("min")
+    ok = ok.assign(best=np.isclose(ok[metric], best, rtol=0.0, atol=1e-12))
+    rows = []
+    for model, g in scores.groupby("model", sort=False):
+        good = ok[ok["model"] == model]
+        rows.append(
+            {
+                "model": model,
+                "slices": int(len(g)),
+                "failed": int((~np.isfinite(g[metric])).sum()),
+                f"median_{metric}": float(good[metric].median()) if len(good) else np.nan,
+                f"mean_{metric}": float(good[metric].mean()) if len(good) else np.nan,
+                f"max_{metric}": float(good[metric].max()) if len(good) else np.nan,
+                "best_on": int(good["best"].sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def pairwise_wins(scores: pd.DataFrame, a: str, b: str, metric: str = "rmse_cv_bp") -> Dict[str, object]:
+    """On slices where both ``a`` and ``b`` were scored: how many times
+    ``a``'s ``metric`` is lower, higher or equal, and the median of
+    ``metric(a) - metric(b)`` (negative: ``a`` is better)."""
+
+    if scores is None or scores.empty:
+        return {"slices": 0, "a_better": 0, "b_better": 0, "ties": 0, "median_diff": float("nan")}
+    key = ["trade_date", "expiry"]
+    pa = scores[scores["model"] == a].set_index(key)[metric]
+    pb = scores[scores["model"] == b].set_index(key)[metric]
+    both = pd.concat([pa.rename("a"), pb.rename("b")], axis=1, join="inner").dropna()
+    diff = both["a"] - both["b"]
+    return {
+        "slices": int(len(both)),
+        "a_better": int((diff < 0).sum()),
+        "b_better": int((diff > 0).sum()),
+        "ties": int((diff == 0).sum()),
+        "median_diff": float(diff.median()) if len(diff) else float("nan"),
+    }
+
+
+MODEL_LABELS = {"svi": "SVI", "sabr": "SABR", "spline": "IV spline"}
+
+
+def describe_pairwise(a: str, b: str, res: Dict[str, object]) -> str:
+    """One sentence on :func:`pairwise_wins` ``res``, worded by its sign
+    (never 'A outperforms B' when A is worse)."""
+
+    la, lb = MODEL_LABELS.get(a, a), MODEL_LABELS.get(b, b)
+    n = int(res.get("slices", 0))
+    if not n:
+        return f"{la} vs {lb}: no expiry was scored by both."
+    wins_a, wins_b, d = int(res["a_better"]), int(res["b_better"]), float(res["median_diff"])
+    if wins_a > wins_b:
+        lead = f"{la} has the lower out-of-sample RMSE on {wins_a} of {n} expiries"
+    elif wins_b > wins_a:
+        lead = f"{lb} has the lower out-of-sample RMSE on {wins_b} of {n} expiries"
+    else:
+        lead = f"{la} and {lb} each have the lower out-of-sample RMSE on {wins_a} of {n} expiries"
+    who = la if d < 0 else lb if d > 0 else "neither"
+    return f"{lead} (median {la} - {lb} = {d:+.1f} vol bp; {who} better at the median)."
