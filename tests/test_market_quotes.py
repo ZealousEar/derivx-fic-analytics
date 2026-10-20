@@ -101,3 +101,39 @@ def test_treasury_quotes_and_fixings():
     assert fixing_quote(0.0388) == CurveQuote("DEPO", "ON", 0.0388)
     with pytest.raises(ValueError):
         fixing_quote(float("nan"))
+
+
+def test_store_par_rates_match_quantlib_on_proxy_and_short_curves(golden):
+    """The history store's derived par OIS rates beyond the BoE fixture: the
+    EUR proxy off the ECB AAA spot curve with negative rates (ESTR: spot T+2
+    TARGET, payment lag 1) and the pre-2016 BoE curve that stops at 5Y."""
+
+    from derivx.data.rates_history import bundled_store
+
+    store = bundled_store()
+    cases = golden("market_data")["store_cases"]
+    assert {(c["dataset"], c["asof"]) for c in cases} == {
+        ("EUR_AAA_ECB", "2020-03-31"),
+        ("EUR_AAA_ECB", "2021-12-31"),
+        ("GBP_OIS_BOE", "2013-05-31"),
+    }
+    for case in cases:
+        ours = store.ois_par(case["dataset"], dt.date.fromisoformat(case["asof"]))
+        assert list(ours) == list(case["par"]), case["asof"]
+        for tenor, rate in case["par"].items():
+            assert ours[tenor] == pytest.approx(rate, abs=1e-13), (case["dataset"], case["asof"], tenor)
+    assert min(golden("market_data")["store_cases"][0]["par"].values()) < 0  # really negative rates
+
+
+def test_store_par_rates_match_quantlib_live():
+    pytest.importorskip("QuantLib")
+    if str(ROOT / "tools") not in sys.path:
+        sys.path.insert(0, str(ROOT / "tools"))
+    from golden import market_data
+
+    from derivx.data.rates_history import bundled_store
+
+    store = bundled_store()
+    for case in market_data.store_cases():
+        ours = store.ois_par(case["dataset"], dt.date.fromisoformat(case["asof"]))
+        np.testing.assert_allclose([ours[t] for t in case["par"]], list(case["par"].values()), rtol=0, atol=1e-13)
