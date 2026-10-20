@@ -49,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -57,7 +58,7 @@ import pandas as pd
 
 from derivx.data.cache import DiskCache, sha256, utc_now
 from derivx.data.xlsx import excel_date, read_workbook
-from derivx.rates.conventions import parse_tenor
+from derivx.rates.conventions import get_calendar, parse_tenor
 
 LONG_COLUMNS = (
     "asof",
@@ -358,12 +359,14 @@ def _fetch(
     try:
         payloads = [http_get(url, timeout=timeout, retries=retries) for url in urls]
         frame = parse(payloads)
-    except (SourceError, ValueError, KeyError) as exc:
+    except Exception as exc:  # noqa: BLE001 - any failure, including a malformed payload, is a SourceError
+        failure = exc if isinstance(exc, SourceError) else _unexpected(source, exc)
         if entry is None:
-            if isinstance(exc, SourceError):
+            if failure is exc:
                 raise
-            raise SourceError(f"{source}: unexpected response ({exc})") from exc
-        return cached(True, [f"{source} fetch failed ({exc}); using the cache fetched {entry.meta['fetched_at']}"])
+            raise failure from exc
+        notice = f"{source} fetch failed ({failure}); using the cache fetched {entry.meta['fetched_at']}"
+        return cached(True, [notice])
     payload = b"".join(payloads)
     meta = {
         "source": source,
@@ -374,6 +377,15 @@ def _fetch(
     stored = cache.store(key, frame, payload, meta)
     notices = [] if stored is not None else [f"{source}: not cached ({cache.write_error})"]
     return Fetched(frame, source, meta["url"], str(meta["fetched_at"]), sha256(payload), notices=notices)
+
+
+def _unexpected(source: str, exc: Exception) -> SourceError:
+    """A payload the parser could not read (an HTML error page, a truncated
+    archive, broken XML ...) as a :class:`SourceError`; parser errors other
+    than ``ValueError`` name their type."""
+
+    detail = str(exc) if isinstance(exc, (ValueError, KeyError)) else f"{type(exc).__name__}: {exc}"
+    return SourceError(f"{source}: unexpected response ({detail})")
 
 
 def _iso(day: Optional[dt.date]) -> Optional[str]:
@@ -851,6 +863,22 @@ def _ecb_tenor(label: str) -> str:
 # --------------------------------------------------------------------------
 
 
+BOE_CALENDAR = "LONDON"
+
+
+def boe_curve_date(day: dt.date) -> dt.date:
+    """The London business day a BoE curve belongs to.
+
+    The month-end archive dates every curve by the calendar month end, also
+    when that is a weekend or a UK bank holiday (58 of the 213 month ends
+    from 2009-01 to 2026-09). The curve is then the last business day's (it
+    equals the daily archive's curve on that day exactly), so such dates
+    move back to the preceding London business day. Business days are
+    returned unchanged."""
+
+    return get_calendar(BOE_CALENDAR).adjust(day, "P")
+
+
 def _boe_tenor(years: float) -> str:
     months = round(years * 12)
     if abs(years * 12 - months) > 1e-4:
@@ -862,7 +890,9 @@ def parse_boe_ois_workbook(data: bytes) -> pd.DataFrame:
     """One BoE OIS workbook -> long format of the spot (zero) curve:
     percent, continuously compounded (BoE yield-curve FAQ), maturities in
     years from the curve date. The short-end sheet (1-60 months) and the
-    long sheet (0.5-25 years) overlap; the short-end value is kept."""
+    long sheet (0.5-25 years) overlap; the short-end value is kept. Curves
+    dated on a weekend or UK holiday (the month-end archive) are dated by
+    their business day (:func:`boe_curve_date`)."""
 
     book = read_workbook(data)
     spot_sheets = sorted((name for name in book.sheets if "spot" in name.lower()), key=lambda n: "short" not in n)
@@ -878,7 +908,7 @@ def parse_boe_ois_workbook(data: bytes) -> pd.DataFrame:
         for row in rows:
             if not row or not isinstance(row[0], float) or isinstance(row[0], bool):
                 continue
-            day = excel_date(row[0], book.date1904)
+            day = boe_curve_date(excel_date(row[0], book.date1904))
             for c, years in maturities.items():
                 value = row[c] if c < len(row) else None
                 if isinstance(value, float) and math.isfinite(value):
@@ -910,7 +940,14 @@ def parse_boe_ois_zip(data: bytes) -> pd.DataFrame:
     members = [m for m in archive.namelist() if m.lower().endswith(".xlsx") and "ois" in m.lower()]
     if not members:
         raise ValueError(f"no OIS workbook in the BoE archive ({archive.namelist()})")
-    frame = pd.concat([parse_boe_ois_workbook(archive.read(m)) for m in members], ignore_index=True)
+    frames = []
+    for member in members:
+        try:
+            data = archive.read(member)
+        except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+            raise ValueError(f"{member} in the BoE archive is corrupt or truncated ({exc})") from exc
+        frames.append(parse_boe_ois_workbook(data))
+    frame = pd.concat(frames, ignore_index=True)
     return (
         frame.drop_duplicates(["asof", "tenor"], keep="last")
         .sort_values(["asof", "tenor_years"])

@@ -122,3 +122,12 @@ def test_commands_register_themselves_and_run_as_a_module():
     assert done.returncode == 0 and "boe-ois" in done.stdout and "treasury" in done.stdout
     pyproject = (ROOT / "pyproject.toml").read_text()
     assert 'derivx = "derivx.cli:main"' in pyproject
+
+
+def test_units_option_is_validated(capsys):
+    parser = cli.build_parser()
+    args = parser.parse_args(["pull", "fred", "--ids", "X", "--units", "x=bp,y=percent"])
+    assert args.units == {"X": "bp", "Y": "percent"}
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["pull", "fred", "--ids", "X", "--units", "FOO"])  # used to fail with a dict() error message
+    assert exit_info.value.code == 2 and "use SERIES=UNIT" in capsys.readouterr().err

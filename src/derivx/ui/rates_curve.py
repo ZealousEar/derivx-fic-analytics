@@ -129,6 +129,13 @@ def _sidebar(data: rates_data.RatesData) -> Tuple[dt.date, str, str]:
     dates = data.store.dates("UST_PAR")[::-1]
     if not dates:
         raise ValueError("the history store has no US Treasury curve")
+    previous = st.session_state.get("rates_asof", st.session_state.get("_keep_rates_asof"))
+    if previous is not None and previous not in dates:
+        # e.g. a date only the live cache had, after switching back to the snapshot: say so, do not jump silently
+        st.session_state.pop("rates_asof", None)
+        data.notices.append(
+            ("warning", f"VALUATION DATE {previous} is not in the {data.mode} history; showing {dates[0]} instead.")
+        )
     rates_data.sticky("rates_asof", dates)
     asof = st.sidebar.selectbox(
         "VALUATION DATE",

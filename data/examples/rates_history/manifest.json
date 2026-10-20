@@ -103,7 +103,7 @@
     "BoE OIS spot 24Y": "24Y",
     "BoE OIS spot 25Y": "25Y"
    },
-   "sampling": "month ends since 2009, episode windows (+/-4 days), every day from 2026-08-19; maturities 1-11M, 1Y, 18M, 2Y-25Y (to 5Y only before 2016); rounded to 1e-4 percent (0.01bp)",
+   "sampling": "month ends since 2009 (dated by the last London business day), episode windows (+/-4 days), every day from 2026-08-19; maturities 1-11M, 1Y, 18M, 2Y-25Y (to 5Y only before 2016); rounded to 1e-4 percent (0.01bp)",
    "urls": [
     "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/oismonthedata.zip",
     "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/oisddata.zip",
@@ -113,9 +113,9 @@
    "attribution": "Source: Bank of England (yield curve archive)",
    "file": "gbp_ois_boe.csv",
    "rows": 306,
-   "first": "2009-01-31",
+   "first": "2009-01-30",
    "last": "2026-10-19",
-   "sha256": "dc2fc447ec4184a0cc5246e95e0a9fc41c078c752dad19ebf603070c69e1f160"
+   "sha256": "98400322f4a80344ea9d0f2dcc40e0121c77db92c1a80ede1ee53cc642d94adb"
   },
   {
    "dataset": "EUR_AAA_ECB",

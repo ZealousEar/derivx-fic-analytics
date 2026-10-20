@@ -16,6 +16,7 @@ import datetime as dt
 import io
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 from xml.etree import ElementTree as ET
@@ -28,6 +29,7 @@ _PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _REF = re.compile(r"^([A-Z]+)(\d+)$")
 _EPOCH_1900 = dt.date(1899, 12, 30)  # exact for serials >= 61 (1900-03-01 on); Excel counts a fake 1900-02-29
 _EPOCH_1904 = dt.date(1904, 1, 1)
+_BROKEN = (zipfile.BadZipFile, KeyError, ET.ParseError, zlib.error, EOFError)  # unreadable parts
 
 
 @dataclass(frozen=True)
@@ -128,7 +130,8 @@ def _read_sheet(data: bytes, strings: List[str]) -> List[List[Cell]]:
 def read_workbook(data: bytes, sheets: Optional[List[str]] = None) -> Workbook:
     """Parse an ``.xlsx`` payload; only the named ``sheets`` if given.
 
-    Raises ``ValueError`` if the bytes are not an xlsx workbook.
+    Raises ``ValueError`` if the bytes are not an xlsx workbook, or if a
+    sheet is truncated or corrupt.
     """
 
     try:
@@ -136,11 +139,17 @@ def read_workbook(data: bytes, sheets: Optional[List[str]] = None) -> Workbook:
         paths = _sheet_paths(archive)
         strings = _shared_strings(archive)
         props = ET.fromstring(archive.read("xl/workbook.xml")).find(f"{_MAIN}workbookPr")
-    except (zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
+    except _BROKEN as exc:
         raise ValueError(f"not an xlsx workbook ({exc})") from exc
     date1904 = props is not None and props.get("date1904", "0") in ("1", "true")
     wanted = list(paths) if sheets is None else sheets
     missing = [s for s in wanted if s not in paths]
     if missing:
         raise ValueError(f"workbook has no sheet(s) {missing}; sheets: {list(paths)}")
-    return Workbook({name: _read_sheet(archive.read(paths[name]), strings) for name in wanted}, date1904)
+    out = {}
+    for name in wanted:
+        try:
+            out[name] = _read_sheet(archive.read(paths[name]), strings)
+        except (*_BROKEN, IndexError) as exc:  # IndexError: a shared-string index past the table
+            raise ValueError(f"sheet {name!r} of the workbook is corrupt or truncated ({exc})") from exc
+    return Workbook(out, date1904)

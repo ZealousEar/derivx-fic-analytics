@@ -387,3 +387,75 @@ def test_cache_store_and_unwritable_directory(tmp_path):
     assert readonly.store(key, frame, b"payload", {"source": "NY Fed"}) is None
     assert "not writable" in readonly.write_error
     assert readonly.entries() == [] and readonly.load(key) is None
+
+
+# --------------------------------------------------------------------------
+# Review regressions
+# --------------------------------------------------------------------------
+
+
+def _boe_zip(edit) -> bytes:
+    """The recorded BoE archive with its OIS workbook's sheets passed
+    through ``edit(name, xml) -> xml``."""
+
+    outer = zipfile.ZipFile(io.BytesIO(fixture("boe_latest.zip")))
+    book = zipfile.ZipFile(io.BytesIO(outer.read("OIS daily data current month.xlsx")))
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as out:
+        for name in book.namelist():
+            data = book.read(name)
+            out.writestr(name, edit(name, data) if name.startswith("xl/worksheets/sheet") else data)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as out:
+        out.writestr("OIS daily data current month.xlsx", inner.getvalue())
+    return archive.getvalue()
+
+
+def test_boe_curves_dated_on_weekends_or_holidays_move_to_their_business_day():
+    """The month-end archive labels the last business day's curve with the
+    calendar month end (Saturday 2009-01-31 is Friday 2009-01-30's curve;
+    Sunday 2013-03-31 after Good Friday is Thursday 2013-03-28's)."""
+
+    assert rs.boe_curve_date(D("2009-01-31")) == D("2009-01-30")
+    assert rs.boe_curve_date(D("2013-03-31")) == D("2013-03-28")
+    assert rs.boe_curve_date(D("2026-08-31")) == D("2026-08-28")  # summer bank holiday Monday
+    assert rs.boe_curve_date(D("2026-10-19")) == D("2026-10-19")
+    # The 2026-10-05 curve relabelled as Saturday 2026-10-10 parses as Friday 2026-10-09.
+    saturday = _boe_zip(lambda name, xml: xml.replace(b'r="A8" s="5"><v>46300</v>', b'r="A8" s="5"><v>46305</v>'))
+    frame = rs.parse_boe_ois_zip(saturday)
+    assert sorted(set(frame["asof"])) == [D("2026-10-01"), D("2026-10-02"), D("2026-10-09")]
+    assert all(day.weekday() < 5 for day in frame["asof"])
+
+
+def test_corrupt_payloads_become_source_errors_or_stale_cache(serve, tmp_path):
+    """A truncated workbook (broken XML) or a corrupt archive member used to
+    escape as ParseError/zlib.error and crash the LIVE page."""
+
+    truncated = _boe_zip(lambda name, xml: xml[: len(xml) // 2])
+    with pytest.raises(ValueError, match="corrupt or truncated"):
+        rs.parse_boe_ois_zip(truncated)
+    member = zipfile.ZipFile(io.BytesIO(fixture("boe_latest.zip"))).getinfo("OIS daily data current month.xlsx")
+    broken = bytearray(fixture("boe_latest.zip"))
+    start = member.header_offset + 30 + len(member.filename.encode()) + len(member.extra) + 200
+    broken[start : start + 64] = bytes(64)  # damage the compressed bytes of the OIS workbook
+    with pytest.raises(ValueError, match="corrupt or truncated"):
+        rs.parse_boe_ois_zip(bytes(broken))
+    cache = DiskCache(tmp_path)
+    serve({"latest-yield-curve-data.zip": [truncated]})
+    with pytest.raises(rs.SourceError, match="BoE: unexpected response"):
+        rs.boe_ois_curve("latest", offline=False, cache=cache)
+    serve({"latest-yield-curve-data.zip": [fixture("boe_latest.zip"), truncated]})
+    good = rs.boe_ois_curve("latest", offline=False, cache=cache)
+    stale = rs.boe_ois_curve("latest", offline=False, cache=cache)
+    assert stale.from_cache and stale.stale and "corrupt or truncated" in stale.notices[0]
+    pd.testing.assert_frame_equal(stale.frame, good.frame)
+
+
+def test_any_parser_exception_is_a_source_error(serve, tmp_path, monkeypatch):
+    def explode(text):
+        raise TypeError("unexpected layout")
+
+    monkeypatch.setattr(rs, "parse_nyfed_json", explode)
+    serve({"newyorkfed": [b"{}"]})
+    with pytest.raises(rs.SourceError, match=r"NY Fed: unexpected response \(TypeError: unexpected layout\)"):
+        rs.nyfed_rate("sofr", last_n=3, offline=False, cache=DiskCache(tmp_path))
