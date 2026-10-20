@@ -1,0 +1,110 @@
+{
+  "data": {
+    "source": "bundled sample: real SPY chain from Yahoo Finance (delayed quotes), one snapshot",
+    "ticker": "SPY",
+    "trade_dates": [
+      "2026-10-20"
+    ],
+    "fetched_at_utc": "2026-10-20T20:59:39+00:00",
+    "rows": 10040,
+    "expiries": 31,
+    "files": [
+      "data/examples/spy_2026-10-20.csv.gz"
+    ],
+    "data_sha256": "2fa7d599651ed6564caa6a3d4501dd228bffec7b1f30dfbbed660b30be3188b9"
+  },
+  "filters": {
+    "min_volume": 10,
+    "min_mid": 0.1,
+    "max_spread": 0.4
+  },
+  "settings": {
+    "rate_cc": 0.0,
+    "min_days": 2.0,
+    "max_days": null,
+    "sabr_beta": 1.0,
+    "cv_folds": 5,
+    "std_band_sd": 3.0,
+    "min_points": 8,
+    "expiries": "all"
+  },
+  "snapshots": 1,
+  "model_comparison": {
+    "metric": "rmse_cv_bp: k-fold CV RMSE on interior strikes, vol bp",
+    "slices_scored": 29,
+    "slices_skipped": 2,
+    "per_model": [
+      {
+        "model": "svi",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 4.136972773806809,
+        "mean_rmse_cv_bp": 5.977030136341426,
+        "max_rmse_cv_bp": 31.990474108088666,
+        "best_on": 1
+      },
+      {
+        "model": "sabr",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 15.909007875016332,
+        "mean_rmse_cv_bp": 17.266425203088257,
+        "max_rmse_cv_bp": 41.15100056305984,
+        "best_on": 0
+      },
+      {
+        "model": "spline",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 1.3527181969297437,
+        "mean_rmse_cv_bp": 4.720038127574781,
+        "max_rmse_cv_bp": 76.98523844701556,
+        "best_on": 28
+      }
+    ],
+    "pairwise": {
+      "svi_vs_sabr": {
+        "slices": 29,
+        "a_better": 29,
+        "b_better": 0,
+        "ties": 0,
+        "median_diff": -11.342571199875799
+      },
+      "svi_vs_spline": {
+        "slices": 29,
+        "a_better": 1,
+        "b_better": 28,
+        "ties": 0,
+        "median_diff": 2.394525509480566
+      },
+      "sabr_vs_spline": {
+        "slices": 29,
+        "a_better": 1,
+        "b_better": 28,
+        "ties": 0,
+        "median_diff": 14.057042467563452
+      }
+    },
+    "statements": [
+      "SVI has the lower out-of-sample RMSE on 29 of 29 expiries (median SVI - SABR = -11.3 vol bp; SVI better at the median).",
+      "IV spline has the lower out-of-sample RMSE on 28 of 29 expiries (median SVI - IV spline = +2.4 vol bp; IV spline better at the median).",
+      "IV spline has the lower out-of-sample RMSE on 28 of 29 expiries (median SABR - IV spline = +14.1 vol bp; IV spline better at the median)."
+    ]
+  },
+  "calibration": {
+    "slices": 29,
+    "median_rmse_bp": 4.476968161069844,
+    "max_rmse_bp": 24.24124635710792,
+    "butterfly_ok": "29 of 29",
+    "lee_ok": "29 of 29",
+    "calendar_ok": "26 of 28 adjacent expiry pairs",
+    "calendar_failures": [
+      "2027-03-19",
+      "2027-12-17"
+    ]
+  },
+  "walk_forward": {
+    "status": "not run",
+    "reason": "1 snapshot(s): a walk-forward test needs daily snapshots one trading day apart. Yahoo has no history; collect one snapshot per trading day with tools/download_spy_chains.py."
+  }
+}
