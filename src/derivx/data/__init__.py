@@ -10,6 +10,7 @@ from importlib import import_module
 _LAZY = {
     "load_equity_chain_from_yf": "ingestion",
     "load_rates_quotes_from_csv": "ingestion",
+    "load_curve_quotes_from_csv": "ingestion",
     "fetch_option_chain": "market_data",
     "apply_liquidity_filters": "market_data",
     "compute_moneyness": "market_data",

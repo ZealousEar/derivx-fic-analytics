@@ -50,6 +50,7 @@ from derivx.rates.swaps import (
     swap_position,
 )
 from derivx.risk.scenarios import (
+    carry_market,
     historical,
     historical_sources,
     ibor_ois_basis,
@@ -404,7 +405,13 @@ def test_single_curve_set_prices_exactly_as_term(eur):
     assert cap.pv(single) == pytest.approx(replace(cap, projection=None).pv(Market(curve=ois)), rel=1e-14)
     bumped = single.rebuilt({"curve": 1.0})
     assert bumped.projection("EURIBOR 6M") is bumped.curve
+    assert single.replace(curve=bumped.curve).projection("EURIBOR 6M") is bumped.curve  # never a stale alias
     assert parallel_pv01(proj.pv, single) == pytest.approx(parallel_pv01(term.pv, Market(curve=ois)), rel=1e-12)
+    # The projection is no curve of its own: risk is bucketed on the discount curve only, and bumping the alias
+    # is refused (it used to be silently ignored, a zero ladder).
+    assert risk_curves(single) == ("curve",) and set(multi_curve_ladders([proj.pv], single)) == {"curve"}
+    with pytest.raises(ValueError, match="discount curve itself"):
+        parallel_pv01(proj.pv, single, "EURIBOR 6M")
     # Multi-curve differs: EURIBOR projects above the OIS curve.
     assert proj.par_rate(eur) > proj.par_rate(single) + 10e-4
 
@@ -542,6 +549,11 @@ def test_clean_quotes_reads_futures_prices_fra_labels_and_basis_spreads():
         [{"instrument": "BASIS", "tenor": "5Y", "rate": 8.0}], units="bp", kinds=PROJECTION_KINDS
     )
     assert quotes[0].rate == pytest.approx(0.0008)
+    # 8 typed into a percent table meaning 8bp is an 800bp basis: refused, not built into a curve.
+    quotes, issues, _ = clean_quotes(rows[:4] + [{"instrument": "BASIS", "tenor": "5Y", "rate": 8.0}],
+                                     kinds=PROJECTION_KINDS, asof=EXAMPLE_ASOF)  # fmt: skip
+    assert [q.kind for q in quotes] == ["DEPO", "FUT", "FRA", "IRS"]
+    assert any("800.0bp basis spread" in i.message and "8bp is 0.08" in i.message for i in issues)
 
 
 def test_illustrative_quotes_follow_the_discount_curve_and_assumed_basis(eur):
@@ -605,6 +617,13 @@ def test_a_3m_trade_carries_6m_and_basis_risk_and_hedges_flatten_every_curve(eur
     bumps = {k: curve_bumps(eur, k, parallel=False) for k in risk_curves(eur)}
     hedge = hedge_multi_curve(position, eur, benchmarks, bumps=bumps)
     assert hedge["risk_removed"] > 0.99
+    # A hedge's PV01 is its P&L for +1bp on every rate quote (as the trade's); a 3s6s basis swap has next to
+    # none and carries the basis-spread risk instead, so the two are reported apart.
+    rate_pv01 = sum(r["position"] for rows in hedge["ladders"].values() for r in rows if r["kind"] != "BASIS")
+    assert sum(h["pv01"] for h in hedge["hedges"]) == pytest.approx(-rate_pv01, rel=0.01)
+    for h in hedge["hedges"]:
+        if h["benchmark"].endswith("3s6s") and h["notional"]:
+            assert abs(h["basis_pv01"]) > 1000.0 and abs(h["pv01"]) < 0.05 * abs(h["basis_pv01"]), h
     assert {r["curve"] for r in hedge["hedges"] if r["notional"]} >= {"EURIBOR 6M", "EURIBOR 3M"}
     total = sum(abs(r["position"]) for rows in hedge["ladders"].values() for r in rows)
     for key, rows in hedge["ladders"].items():
@@ -695,6 +714,66 @@ def test_carry_rolls_projection_curves_and_uses_their_fixings(eur):
     assert "EURIBOR 6M" in rolled.projection_fixings and rolled.projection("EURIBOR 6M").asof == rolled.asof
 
 
+def test_rolling_past_a_futures_fixing_drops_the_contract(eur):
+    """Carry over a futures fixing: a 3M curve dated after the DEC26
+    contract fixed has no DEC26 quote (its rate is a fixing now), reprices
+    the rest, and a 3M swap's carry scenario runs (it used to raise
+    'has already fixed')."""
+
+    c3 = eur.projection("EURIBOR 3M")
+    dec = next(i for i in c3.instruments if i.kind == "FUT" and i.quote.tenor == "DEC26")
+    later = carry_market(eur, (dec.index.fixing_date(dec.start) - eur.asof).days + 5)
+    rolled = later.projection("EURIBOR 3M")
+    assert "DEC26" not in [q.tenor for q in rolled.quotes] and len(rolled.quotes) == len(c3.quotes) - 1
+    assert max(abs(r["error_bp"]) for r in rolled.repricing()) < 1e-8
+    swap3 = swap_position(VanillaSwap.from_index("EURIBOR 3M", "5Y", 0.027, notional=NOTIONAL, trade_date=eur.asof))
+    fut = future_position(RateFuture("FUT", "DEC26", 97.3, contracts=10, convexity=HullWhite()))
+    for days in (60, 90, 200):
+        for row in run_scenario([swap3, fut], eur, parallel(5.0, horizon_days=days)):
+            assert math.isfinite(row["pnl"]) and abs(row["residual"]) < 1e-3 * max(1.0, abs(row["pnl"])), row
+    # The settled future is worth its final settlement: 100 - the fixing, no convexity left.
+    fixed = RateFuture("FUT", "DEC26", 97.3, contracts=10, convexity=HullWhite())
+    assert fixed.convexity_adjustment(later) == 0.0
+    fixing = eur.projection("EURIBOR 3M").forward(dec.start, dec.end)  # today's forward, realised on the roll
+    assert fixed.price(later) == pytest.approx(100.0 * (1.0 - fixing), abs=1e-10)
+
+
+def test_rolling_a_sofr_curve_with_futures_realises_its_overnight_forwards(data):
+    """SR1/SR3 quotes on a later date: contracts whose month or quarter
+    has ended are dropped, those under way take today's curve's overnight
+    forwards as fixings for the days in between, and every quote left
+    reprices (rolling used to raise for any horizon)."""
+
+    sofr = data["sofr"]
+    asof = D(sofr["asof"])
+    fixings = {D(d): r for d, r in sofr["fixings"]}
+    hw = HullWhite(*data["hw"])
+    curve = bootstrap(asof, [CurveQuote(*q) for q in sofr["quotes"]], "USD SOFR", convexity=hw, fixings=fixings)
+    market = Market(curve=curve)
+    for days in (10, 45, 90):
+        rolled = carry_market(market, days).curve
+        kept = {(q.kind, q.tenor) for q in rolled.quotes}
+        for inst in curve.instruments:
+            if inst.kind in ("SR1", "SR3"):
+                assert ((inst.kind, inst.quote.tenor) in kept) == (inst.end > rolled.asof), (days, inst.quote.tenor)
+        assert max(abs(r["error_bp"]) for r in rolled.repricing()) < 1e-8, days
+        realised = {d: r for d, r in rolled.overnight_fixings.items() if d not in fixings}
+        assert realised and all(asof <= d < rolled.asof for d in realised)
+        nxt = curve.conventions.cal.add_business_days
+        for day, rate in realised.items():
+            assert rate == pytest.approx(curve.forward_rate(day, nxt(day, 1), "ACT/360"), rel=1e-14)
+        swap = swap_position(VanillaSwap.from_conventions("USD SOFR", "5Y", 0.035, kind="OIS", trade_date=asof))
+        sr3 = future_position(RateFuture("SR3", "SEP26", 96.0, contracts=5, convexity=hw))
+        for row in run_scenario([swap, sr3], market.replace(index_fixings={"SOFR": fixings}),
+                                parallel(0.0, horizon_days=days)):  # fmt: skip
+            assert math.isfinite(row["carry"]), row
+    # An SR3 whose quarter has ended prices off fixings alone, with no convexity.
+    ended = carry_market(market.replace(index_fixings={"SOFR": fixings}), 70)
+    sep = RateFuture("SR3", "SEP26", 96.0, convexity=hw)
+    assert sep.period(ended.asof)[1] < ended.asof and sep.convexity_adjustment(ended) == 0.0
+    assert 90.0 < sep.price(ended) < 100.0
+
+
 def test_historical_replays_move_projections_with_the_swap_curve_and_say_so(eur):
     shock = historical("2022 hiking cycle")
     table = historical_sources(shock)
@@ -713,3 +792,71 @@ def test_bumped_market_matches_rebuilt_and_keeps_single_curve_behaviour():
     bumped = bumped_market(usd, "curve", {3: 1.0})
     assert bumped.fixings is usd.curve and bumped.govt is usd.govt
     assert np.array_equal(bumped.dfs if hasattr(bumped, "dfs") else bumped.curve.dfs, usd.curve.rebuilt({3: 1.0}).dfs)
+
+
+def test_monotone_convex_rebuilds_solve_by_chord_to_the_same_curves():
+    """Monotone convex is non-local, so a rebuild used to re-run every pass
+    of the bootstrap: per-curve ladders of a EURIBOR 3M swap took over a
+    minute and a half. Rebuilds now solve all pillars at once by the chord
+    method from the curve they replace, to the curves the passes give."""
+
+    import time
+
+    asof = EXAMPLE_ASOF
+    quotes = [CurveQuote(r["kind"], r["tenor"], r["rate"] - 0.012) for r in sofr_example_rows()]
+    ois = bootstrap(asof, quotes, "EUR ESTR", "monotone_convex")
+    q6 = illustrative_quotes(bootstrap(asof, quotes, "EUR ESTR"), "EURIBOR 6M")
+    c6 = bootstrap_projection(asof, q6, "EURIBOR 6M", ois, "monotone_convex")
+    bumped = ois.rebuilt({4: 1.0})
+    passes = bootstrap(asof, ois.bumped_quotes({4: 1.0}), "EUR ESTR", "monotone_convex")
+    assert np.allclose(bumped.dfs, passes.dfs, rtol=0, atol=2e-15)
+    moved = c6.rebuilt({7: -1.0}, discount=bumped)
+    ref = bootstrap_projection(asof, c6.bumped_quotes({7: -1.0}), "EURIBOR 6M", bumped, "monotone_convex")
+    assert np.allclose(moved.dfs, ref.dfs, rtol=0, atol=2e-15)
+    assert max(abs(r["error_bp"]) for r in moved.repricing()) < 1e-8
+    q3 = illustrative_quotes(bootstrap(asof, quotes, "EUR ESTR"), "EURIBOR 3M", HullWhite(), basis_curve=c6)
+    c3 = bootstrap_projection(asof, q3, "EURIBOR 3M", ois, "monotone_convex", basis=c6, convexity=HullWhite())
+    market = Market(curve=ois, projections={"EURIBOR 6M": c6, "EURIBOR 3M": c3})
+    swap = VanillaSwap.from_index("EURIBOR 3M", "5Y", 0.025, notional=NOTIONAL, trade_date=asof)
+    start = time.perf_counter()
+    ladders = multi_curve_ladders([swap.pv], market)
+    assert time.perf_counter() - start < 45.0  # about 4s here; the passes took over 90s
+    total = sum(m[:, 0].sum() for _, m in ladders.values())
+    everything = {k: 1.0 for k in market.curve_keys}
+    parallel_all = (swap.pv(market.rebuilt(everything)) - swap.pv(market.rebuilt({k: -1.0 for k in everything}))) / 2
+    assert total == pytest.approx(parallel_all, rel=1e-3)
+
+
+def test_csv_quotes_are_never_averaged_across_instruments(tmp_path):
+    """G15's evidence: the CSV loader averaged a 2Y OIS at 4.0% and a 2Y IRS
+    at 5.0% into one 4.5% quote. A repeated tenor now raises; quotes for a
+    curve set carry a curve column and load per curve."""
+
+    from pathlib import Path
+
+    from derivx.data import load_curve_quotes_from_csv, load_rates_quotes_from_csv
+
+    example = Path(__file__).resolve().parents[1] / "data" / "examples" / "rates_quotes.csv"
+    assert len(load_rates_quotes_from_csv(str(example))) == 5
+    mixed = tmp_path / "mixed.csv"
+    mixed.write_text("instrument,tenor,rate\nOIS,1Y,0.039\nOIS,2Y,0.040\nIRS,2Y,0.050\n")
+    with pytest.raises(ValueError, match="2Y"):
+        load_rates_quotes_from_csv(str(mixed))
+    ois_rows = "\n".join(f"EUR ESTR,{r['kind']},{r['tenor']},{r['rate'] - 0.012:.6f}" for r in sofr_example_rows())
+    six_rows = "\n".join(
+        f"EURIBOR 6M,{kind},{tenor},{rate}" for kind, tenor, rate in (("DEPO", "6M", 0.0210), ("FRA", "6X12", 0.0215),
+                                                                      ("IRS", "2Y", 0.0225), ("IRS", "5Y", 0.0240))
+    )  # fmt: skip
+    curve_set = tmp_path / "set.csv"
+    curve_set.write_text("curve,instrument,tenor,rate\n" + ois_rows + "\n" + six_rows + "\n")
+    quotes = load_curve_quotes_from_csv(str(curve_set))
+    assert set(quotes) == {"EUR ESTR", "EURIBOR 6M"} and [q.kind for q in quotes["EURIBOR 6M"]] == [
+        "DEPO", "FRA", "IRS", "IRS"
+    ]  # fmt: skip
+    ois = bootstrap(EXAMPLE_ASOF, quotes["EUR ESTR"], "EUR ESTR")
+    market = build_curve_set(ois, [ProjectionSpec("EURIBOR 6M", tuple(quotes["EURIBOR 6M"]))])
+    assert par_swap_rate(market, "5Y", index="EURIBOR 6M") == pytest.approx(0.0240, abs=1e-12)
+    bad = tmp_path / "bad.csv"
+    bad.write_text("curve,instrument,tenor,rate\nEURIBOR 6M,OIS,2Y,0.02\nEURIBOR 6M,BASIS,5Y,0.0008\n")
+    with pytest.raises(ValueError, match="EURIBOR 6M: row 1"):
+        load_curve_quotes_from_csv(str(bad))

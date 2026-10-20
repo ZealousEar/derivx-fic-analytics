@@ -32,6 +32,7 @@ fixing date is before ``market.asof`` from ``market.fixing_curve``
 Every value is in currency for the swap's notional and signed to the holder:
 a receiver swap gains when rates fall, so its PV01 is negative.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -43,7 +44,15 @@ import numpy as np
 import pandas as pd
 
 from derivx.rates.conventions import BUSINESS_DAY_CONVENTIONS, Calendar, Date, add_months, parse_tenor, year_fraction
-from derivx.rates.curves import CONVENTIONS, GOVT_KEY, CurveConventions, Market, get_conventions, swap_schedule
+from derivx.rates.curves import (
+    CONVENTIONS,
+    GOVT_KEY,
+    SPREAD_KINDS,
+    CurveConventions,
+    Market,
+    get_conventions,
+    swap_schedule,
+)
 from derivx.rates.indices import TermIndex, get_index
 from derivx.rates.multicurve import basis_leg_dates
 from derivx.risk.sensitivities import Position, PvFunction, bumped_market, solve_hedge
@@ -828,10 +837,15 @@ def hedge_with_benchmarks(
 
 def risk_curves(market: Market) -> Tuple[str, ...]:
     """Curves a swap book's key-rate risk is bucketed on: the discount curve
-    and every projection curve with quotes (the Treasury curve does not
-    price swaps)."""
+    and every projection curve with quotes of its own (the Treasury curve
+    does not price swaps; a projection that is the discount curve moves
+    with it)."""
 
-    return tuple(k for k in market.curve_keys if k != GOVT_KEY and market.get_curve(k).quotes)
+    return tuple(
+        k
+        for k in market.curve_keys
+        if k != GOVT_KEY and (k == "curve" or not market.projections.is_discount(k)) and market.get_curve(k).quotes
+    )
 
 
 def benchmark_instruments(
@@ -943,13 +957,15 @@ def hedge_multi_curve(
     ``benchmarks`` maps curve keys to tenors (see
     :func:`benchmark_instruments`); or pass ``hedges`` from
     :func:`hedge_set`, and the position's ``ladders`` ({curve: (rows,
-    values)} as from :func:`multi_curve_ladders`), to reuse them. Returns ``hedges`` (rows
-    ``curve``, ``benchmark``, ``notional`` signed: positive receives fixed or
-    the spread leg, ``direction``, ``par`` rate or spread, ``pv01``),
-    ``positions``, ``ladders`` ({curve: rows ``label``, ``position``,
-    ``hedge``, ``residual``}), the ladder sums ``position_pv01`` and
-    ``hedged_pv01`` per curve, and ``risk_removed`` (share of the squared
-    stacked ladder removed).
+    values)} as from :func:`multi_curve_ladders`), to reuse them. Returns
+    ``hedges`` (rows ``curve``, ``benchmark``, ``notional`` signed: positive
+    receives fixed or the spread leg, ``direction``, ``par`` rate or
+    spread, ``pv01`` the sized hedge's P&L for +1bp on every rate quote,
+    ``basis_pv01`` for +1bp on every tenor basis spread), ``positions``,
+    ``ladders`` ({curve: rows ``label``, ``kind``, ``position``, ``hedge``,
+    ``residual``}), the ladder sums ``position_pv01`` and ``hedged_pv01``
+    per curve, and ``risk_removed`` (share of the squared stacked ladder
+    removed).
     """
 
     if hedges is None:
@@ -971,6 +987,8 @@ def hedge_multi_curve(
     hedge_ladder = matrix @ multiples
     residual = target + hedge_ladder
     base = float(target @ target)
+    kinds = [_quote_kind(market, key, r) for key, rows_k in zip(curves, hedges.rows) for r in rows_k]
+    spread = np.array([k in SPREAD_KINDS for k in kinds], dtype=bool)
     rows, positions = [], []
     for (key, label, unit), x, column in zip(hedges.units, multiples, matrix.T):
         details = unit.details
@@ -983,7 +1001,8 @@ def hedge_multi_curve(
                 "direction": ("Receive fixed" if swap else "Receive spread leg") if x > 0
                 else ("Pay fixed" if swap else "Pay spread leg") if x < 0 else "-",
                 "par": float(details["fixed_rate"] if swap else details["spread"]),
-                "pv01": float(x * column.sum()),
+                "pv01": float(x * column[~spread].sum()),
+                "basis_pv01": float(x * column[spread].sum()),
             }
         )  # fmt: skip
         if x != 0:
@@ -994,9 +1013,10 @@ def hedge_multi_curve(
         n = len(rows_k)
         t, h = target[start : start + n], hedge_ladder[start : start + n]
         out_ladders[key] = [
-            {**{k: r[k] for k in ("label", "tenor", "years")}, "position": a, "hedge": b, "residual": a + b}
-            for r, a, b in zip(rows_k, t, h)
-        ]
+            {**{k: r[k] for k in ("label", "tenor", "years")}, "kind": kind, "position": a, "hedge": b,
+             "residual": a + b}
+            for r, a, b, kind in zip(rows_k, t, h, kinds[start : start + n])
+        ]  # fmt: skip
         position_pv01[key], hedged_pv01[key] = float(t.sum()), float((t + h).sum())
         start += n
     return {
@@ -1007,6 +1027,12 @@ def hedge_multi_curve(
         "hedged_pv01": hedged_pv01,
         "risk_removed": 1.0 - float(residual @ residual) / base if base > 0 else 1.0,
     }
+
+
+def _quote_kind(market: Market, key: str, row: Mapping[str, object]) -> str:
+    """Instrument kind of a ladder row (``DEPO``, ``IRS``, ``BASIS`` ...)."""
+
+    return market.get_curve(key).instruments[int(row["index"])].kind
 
 
 def _scaled(unit: Position, multiple: float, receive: bool) -> Position:

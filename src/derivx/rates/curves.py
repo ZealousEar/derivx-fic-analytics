@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from scipy.linalg import lu_factor, lu_solve
 from scipy.optimize import brentq
 
 from .conventions import Calendar, Date, Tenor, _null_advance_months, make_schedule, parse_tenor, year_fraction
@@ -413,6 +414,7 @@ class _Interpolator:
         self.fd = np.diff(self.y) / self.dt  # discrete forward on each interval
         if method == "monotone_convex":
             self.f_nodes = self._monotone_convex_nodes()
+            self._mc_cases()
         if method == "linear_zero":
             z = np.empty_like(self.t)
             z[1:] = self.y[1:] / self.t[1:]
@@ -442,6 +444,50 @@ class _Interpolator:
             slope = (self.z[-1] - self.z[-2]) / (self.t[-1] - self.t[-2])
             return float(self.z[-1] + self.t[-1] * slope)
         return float(self.fd[-1])
+
+    def _mc_cases(self) -> None:
+        """Per interval: the forward corrections g0, g1 at its ends and which
+        of the Hagan-West shapes it takes (see :meth:`_g_integral`), so a
+        lookup evaluates one shape per point instead of all four."""
+
+        g0, g1 = self.f_nodes[:-1] - self.fd, self.f_nodes[1:] - self.fd
+        with np.errstate(divide="ignore", invalid="ignore"):
+            c1 = ((g0 < 0) & (-0.5 * g0 <= g1) & (g1 <= -2.0 * g0)) | ((g0 > 0) & (-0.5 * g0 >= g1) & (g1 >= -2.0 * g0))
+            c2 = ((g0 < 0) & (g1 > -2.0 * g0)) | ((g0 > 0) & (g1 < -2.0 * g0))
+            c3 = ((g0 > 0) & (g1 < 0) & (g1 > -0.5 * g0)) | ((g0 < 0) & (g1 > 0) & (g1 < -0.5 * g0))
+            flat = (np.abs(g0) < 1e-15) & (np.abs(g1) < 1e-15)
+        self.g0, self.g1 = g0, g1
+        self.case = np.select([flat, c1, c2, c3], [0, 1, 2, 3], default=4)
+
+    @staticmethod
+    def _g_integral_case(case: int, g0: np.ndarray, g1: np.ndarray, x: np.ndarray) -> np.ndarray:
+        """:meth:`_g_integral` for points that all take shape ``case`` (the
+        same formulas, so the same numbers). Call it under ``np.errstate``
+        ignoring divide, invalid and over, as :meth:`neg_log_df` does."""
+
+        if case == 0:
+            out = np.zeros_like(x)
+        elif case == 1:
+            out = g0 * (x - 2 * x**2 + x**3) + g1 * (-(x**2) + x**3)
+        elif case == 2:
+            eta2 = (g1 + 2.0 * g0) / (g1 - g0)
+            out = np.where(x <= eta2, g0 * x, g0 * x + (g1 - g0) * (x - eta2) ** 3 / (3.0 * (1.0 - eta2) ** 2))
+        elif case == 3:
+            eta3 = 3.0 * g1 / (g1 - g0)
+            out = np.where(
+                x < eta3,
+                g1 * x + (g0 - g1) * eta3 / 3.0 * (1.0 - (1.0 - x / eta3) ** 3),
+                g1 * x + (g0 - g1) * eta3 / 3.0,
+            )
+        else:
+            eta4 = g1 / (g1 + g0)
+            a = -g0 * g1 / (g0 + g1)
+            out = np.where(
+                x <= eta4,
+                a * x + (g0 - a) * eta4 / 3.0 * (1.0 - (1.0 - x / eta4) ** 3),
+                a * x + (g0 - a) * eta4 / 3.0 + (g1 - a) * (x - eta4) ** 3 / (3.0 * (1.0 - eta4) ** 2),
+            )
+        return out if np.isfinite(out).all() else np.nan_to_num(out, nan=0.0)
 
     @staticmethod
     def _g_integral(g0: np.ndarray, g1: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -493,11 +539,19 @@ class _Interpolator:
             elif self.method == "linear_zero":
                 out[inside] = np.interp(ti, tt, self.z) * ti
             else:
-                i = np.searchsorted(tt, ti, side="right")  # tt[i-1] <= t < tt[i]
-                t0, h, fd = tt[i - 1], self.dt[i - 1], self.fd[i - 1]
-                g0, g1 = self.f_nodes[i - 1] - fd, self.f_nodes[i] - fd
+                k = np.searchsorted(tt, ti, side="right") - 1  # tt[k] <= t < tt[k + 1]
+                t0, h, fd = tt[k], self.dt[k], self.fd[k]
                 x = (ti - t0) / h
-                out[inside] = y[i - 1] + fd * (ti - t0) + h * self._g_integral(g0, g1, x)
+                cases = self.case[k]
+                with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                    if cases.min() == cases.max():
+                        g = self._g_integral_case(int(cases[0]), self.g0[k], self.g1[k], x)
+                    else:
+                        g = np.empty_like(x)
+                        for case in np.unique(cases):
+                            on = cases == case
+                            g[on] = self._g_integral_case(int(case), self.g0[k[on]], self.g1[k[on]], x[on])
+                out[inside] = y[k] + fd * (ti - t0) + h * g
         return out
 
 
@@ -652,23 +706,77 @@ class Curve:
 
         ``bumps_bp`` is one number (parallel), a ``{quote index: bp}`` map, or
         a sequence aligned with ``quotes``. ``asof`` re-dates the curve with
-        unchanged quotes (used for carry and roll-down).
+        unchanged quotes (used for carry and roll-down): futures are dated
+        contracts, so a later date drops those whose reference period has
+        ended, and a contract then part-way through its period takes the
+        overnight fixings from this curve's date to the new one from this
+        curve's own forwards (realised, as carry assumes). See
+        :meth:`rolled_inputs`.
         """
 
         if not self.quotes or self.conventions is None:
             raise ValueError("curve has no quotes to rebuild from")
         quotes = self.bumped_quotes(bumps_bp)
         same_date = asof is None or asof == self.asof
+        fixings: Mapping[Date, float] = self.overnight_fixings
+        if not same_date:
+            quotes, fixings = self.rolled_inputs(quotes, asof)
         return bootstrap(
             asof or self.asof,
             quotes,
             self.conventions,
             self.interpolation,
             convexity=self.convexity,
-            fixings=self.overnight_fixings,
+            fixings=fixings,
             _known=self.unchanged_pillars(quotes) if same_date else (),
             _guess=self.dfs[1:] if same_date else (),
+            _jacobian=self.solver_jacobian() if same_date else None,
         )
+
+    def solver_jacobian(self) -> Optional[np.ndarray]:
+        """The chord matrix of this curve's rebuilds (monotone convex only:
+        a local interpolation solves pillar by pillar), computed once."""
+
+        if self.interpolation != "monotone_convex" or not self.instruments:
+            return None
+        cached = getattr(self, "_solver_jacobian", None)
+        if cached is None:
+            cached = residual_jacobian(self.asof, self.instruments, self.ts, self.dfs, self.interpolation)
+            self._solver_jacobian = cached
+        return cached
+
+    def rolled_inputs(self, quotes: Sequence[CurveQuote], asof: Date) -> Tuple[List[CurveQuote], Dict[Date, float]]:
+        """``quotes`` (aligned with :attr:`quotes`) and the overnight fixings
+        for a rebuild on the later date ``asof``. SOFR futures whose
+        reference period has ended by ``asof`` are dropped (settled). For a
+        contract whose period has begun, the business days from this curve's
+        date up to ``asof`` that have no published fixing take this curve's
+        overnight forward (ACT/360 simple rate to the next business day).
+        ``ValueError`` if no quote is left."""
+
+        fixings: Dict[Date, float] = dict(self.overnight_fixings)
+        if asof <= self.asof or not any(inst.kind in OIS_FUTURES for inst in self.instruments):
+            return list(quotes), fixings
+        kept: List[CurveQuote] = []
+        started = []
+        for quote, inst in zip(quotes, self.instruments):
+            if inst.kind in OIS_FUTURES:
+                if inst.end <= asof:
+                    continue
+                if inst.start < asof:
+                    started.append(inst)
+            kept.append(quote)
+        if not kept:
+            raise ValueError(f"every quote of the {self.conventions.name} curve has settled by {asof}")
+        if started:
+            cal, day_count = self.conventions.cal, self.conventions.ois_day_count
+            day = cal.adjust(max(min(cal.adjust(inst.start, "P") for inst in started), self.asof), "F")
+            while day < asof:
+                following = cal.add_business_days(day, 1)
+                if day not in fixings:
+                    fixings[day] = self.forward_rate(day, following, day_count)
+                day = following
+        return kept, fixings
 
     def unchanged_pillars(self, quotes: Sequence[CurveQuote]) -> np.ndarray:
         """Discount factors of the leading pillars whose quotes are the
@@ -739,6 +847,7 @@ def solve_pillars(
     max_passes: int = 50,
     known: Sequence[float] = (),
     guess: Sequence[float] = (),
+    jacobian: Optional[np.ndarray] = None,
 ) -> Tuple[List[object], np.ndarray, np.ndarray]:
     """Sort instruments by pillar and solve the discount factor at each one
     so that ``instrument.npv(curve)`` is zero (curve time ACT/365F).
@@ -750,8 +859,13 @@ def solve_pillars(
     instruments (a local interpolation solves pillars in order, so a rebuild
     that changes only later quotes reuses them exactly); ``guess`` are
     starting discount factors for every pillar (a rebuild starts from the
-    curve it replaces). Returns (sorted instruments, times with 0 first,
-    discount factors with 1 first).
+    curve it replaces). With monotone convex (non-local) interpolation, a
+    rebuild that also passes the replaced curve's ``jacobian`` (see
+    :func:`residual_jacobian`) solves every pillar at once by the chord
+    method from ``guess``: a 1bp bump converges in a few iterations, about
+    ten times faster than repeated passes, to the same tolerance; it falls
+    back to the passes if it does not converge. Returns (sorted instruments,
+    times with 0 first, discount factors with 1 first).
     """
 
     if interpolation not in INTERPOLATIONS:
@@ -768,6 +882,12 @@ def solve_pillars(
     times = np.array([0.0] + [(d - asof).days / 365.0 for d in pillars])
     dfs = np.exp(-0.03 * times)  # starting guess, refined below
     local = interpolation != "monotone_convex"
+    n = len(instruments)
+    if not local and jacobian is not None and len(guess) == n and np.shape(jacobian) == (n, n):
+        solved = _chord(_residuals(asof, instruments, times, interpolation), np.log(np.asarray(guess, float)), jacobian,
+                        tol)  # fmt: skip
+        if solved is not None:
+            return instruments, times, np.concatenate([[1.0], np.exp(solved)])
     first = 1
     if local and len(known):
         if len(known) >= len(instruments):
@@ -821,6 +941,105 @@ def solve_pillars(
     return instruments, times, dfs
 
 
+class _RecordingCurve(Curve):
+    """Trial curve that notes every time it is asked for (the instruments of
+    a bootstrap always ask for the same times, whatever the curve)."""
+
+    def df_times(self, times) -> np.ndarray:
+        t = np.asarray(times, dtype=float)
+        self._seen.append(t.ravel())
+        return super().df_times(t)
+
+    def _df_scalar(self, x: DateOrTime) -> float:
+        self._seen.append(np.array([self.time(x)]))
+        return super()._df_scalar(x)
+
+
+class _GridCurve(Curve):
+    """Trial curve that interpolates once on a grid of times and looks the
+    instruments' times up in it (the same numbers: interpolation is
+    elementwise); any other time is interpolated as usual."""
+
+    def _set_grid(self, grid: np.ndarray) -> None:
+        self._grid, self._values = grid, self._interp.neg_log_df(grid)
+
+    def _lookup(self, t: np.ndarray) -> Optional[np.ndarray]:
+        k = np.minimum(np.searchsorted(self._grid, t), len(self._grid) - 1)
+        return self._values[k] if np.array_equal(self._grid[k], t) else None
+
+    def df_times(self, times) -> np.ndarray:
+        t = np.atleast_1d(np.asarray(times, dtype=float))
+        found = self._lookup(t)
+        return np.exp(-found) if found is not None else super().df_times(t)
+
+    def _df_scalar(self, x: DateOrTime) -> float:
+        found = self._lookup(np.array([self.time(x)]))
+        return math.exp(-float(found[0])) if found is not None else super()._df_scalar(x)
+
+
+def _residuals(
+    asof: Date, instruments: Sequence[object], times: np.ndarray, interpolation: str
+) -> Callable[[np.ndarray], np.ndarray]:
+    """NPV of every instrument on the curve with log discount factors ``x``
+    at ``times[1:]``. The first call notes the times the instruments use;
+    later calls interpolate them all at once."""
+
+    grid: List[np.ndarray] = []
+
+    def resid(x: np.ndarray) -> np.ndarray:
+        dfs = np.concatenate([[1.0], np.exp(x)])
+        if not grid:
+            curve = _RecordingCurve._trial(asof, times, dfs, interpolation)
+            curve._seen = []
+            out = np.array([inst.npv(curve) for inst in instruments], dtype=float)
+            grid.append(np.unique(np.concatenate(curve._seen)) if curve._seen else np.array([0.0]))
+            return out
+        curve = _GridCurve._trial(asof, times, dfs, interpolation)
+        curve._set_grid(grid[0])
+        return np.array([inst.npv(curve) for inst in instruments], dtype=float)
+
+    return resid
+
+
+def residual_jacobian(
+    asof: Date, instruments: Sequence[object], times: np.ndarray, dfs: np.ndarray, interpolation: str, h: float = 1e-7
+) -> np.ndarray:
+    """d npv_i / d ln DF_j of a bootstrapped curve's instruments at its
+    pillars (forward differences of ``h`` in log DF): the chord matrix of
+    its rebuilds."""
+
+    resid = _residuals(asof, instruments, times, interpolation)
+    x0 = np.log(np.asarray(dfs[1:], dtype=float))
+    r0 = resid(x0)
+    out = np.empty((len(x0), len(x0)))
+    for j in range(len(x0)):
+        x = x0.copy()
+        x[j] += h
+        out[:, j] = (resid(x) - r0) / h
+    return out
+
+
+def _chord(
+    resid: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, jacobian: np.ndarray, tol: float, max_iter: int = 40
+) -> Optional[np.ndarray]:
+    """Root of ``resid`` by the chord method (fixed Jacobian) from ``x0``;
+    None if it does not settle below ``tol``."""
+
+    try:
+        factor = lu_factor(np.asarray(jacobian, dtype=float), check_finite=True)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    x = x0.copy()
+    for _ in range(max_iter):
+        step = lu_solve(factor, resid(x))
+        if not np.all(np.isfinite(step)):
+            return None
+        x -= step
+        if float(np.max(np.abs(step))) < tol:
+            return x
+    return None
+
+
 def bootstrap(
     asof: Date,
     quotes: Sequence[CurveQuote],
@@ -832,6 +1051,7 @@ def bootstrap(
     fixings: Optional[Mapping[Date, float]] = None,
     _known: Sequence[float] = (),
     _guess: Sequence[float] = (),
+    _jacobian: Optional[np.ndarray] = None,
 ) -> Curve:
     """Bootstrap a curve on which every quote reprices.
 
@@ -848,7 +1068,7 @@ def bootstrap(
     if not quotes:
         raise ValueError("need at least one quote")
     built = [Instrument(q, asof, conv, convexity, fixings) for q in quotes]
-    instruments, times, dfs = solve_pillars(asof, built, interpolation, tol, max_passes, _known, _guess)
+    instruments, times, dfs = solve_pillars(asof, built, interpolation, tol, max_passes, _known, _guess, _jacobian)
     pillars = [inst.pillar for inst in instruments]
     return Curve(
         asof, times, dfs, interpolation, pillars, [i.quote for i in instruments], conv, instruments, convexity, fixings
@@ -933,6 +1153,15 @@ class ProjectionSet(collections.abc.Mapping):
         name = str(key).strip().upper()
         return self._built.get(name, self._sources[name])
 
+    def rebased(self, discount: Curve) -> "ProjectionSet":
+        """This set with every projection that is the discount curve
+        pointing at ``discount`` (``self`` if they already do)."""
+
+        if all(self._built.get(k) is discount for k in self._same if k in self._sources):
+            return self
+        sources = {k: (discount if k in self._same else self.source(k)) for k in self._sources}
+        return ProjectionSet(sources, self._depends, same_as_discount=self._same)
+
     def depends_on(self, key: str) -> Tuple[str, ...]:
         return self._depends[str(key).strip().upper()]
 
@@ -1001,6 +1230,8 @@ class Market:
     def __post_init__(self) -> None:
         if not isinstance(self.projections, ProjectionSet):
             self.projections = ProjectionSet(self.projections, discount=self.curve)
+        else:  # a single-curve projection follows a replaced discount curve
+            self.projections = self.projections.rebased(self.curve)
         if not isinstance(self.projection_fixings, ProjectionSet):
             fixings = dict(self.projection_fixings)
             self.projection_fixings = ProjectionSet(fixings, depends={k: () for k in fixings})
@@ -1131,6 +1362,12 @@ class Market:
         unknown = [k for k in bumps if k not in keys]
         if unknown:
             raise ValueError(f"no {unknown} curve to bump; the market's curves are {list(keys)}")
+        aliases = [k for k in bumps if k not in (DISCOUNT_KEY, GOVT_KEY) and self.projections.is_discount(k)]
+        if aliases:
+            raise ValueError(
+                f"the {', '.join(aliases)} projection is the discount curve itself (single-curve): bump "
+                f"{DISCOUNT_KEY!r} instead"
+            )
         at = asof or self.asof
         rolled = at != self.asof
         if rolled and (self.fixings is not None or len(self.projection_fixings)):
