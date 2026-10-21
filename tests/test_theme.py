@@ -182,6 +182,13 @@ def _pruned(value):
     return value
 
 
+def _as_json(fig):
+    """The figure as plain JSON: Plotly 5 keeps numpy arrays in
+    ``to_plotly_json()``, which ``==`` cannot compare."""
+
+    return json.loads(fig.to_json())
+
+
 def _figures():
     import numpy as np
     import plotly.graph_objects as go
@@ -216,7 +223,7 @@ def test_dark_layout_matches_the_update_calls_it_replaces():
     import copy
 
     for (figure, kwargs), (twin, _) in zip(_figures(), _figures()):
-        expected = _pruned(_reference_dark_layout(copy.deepcopy(twin), **kwargs).to_plotly_json())
-        assert _pruned(theme.dark_layout(figure, **kwargs).to_plotly_json()) == expected, kwargs
+        expected = _pruned(_as_json(_reference_dark_layout(copy.deepcopy(twin), **kwargs)))
+        assert _pruned(_as_json(theme.dark_layout(figure, **kwargs))) == expected, kwargs
     again = theme.dark_layout(theme.dark_layout(next(_figures())[0], ytitle="Y"), xtitle="X")
     assert again.layout.yaxis.title.text is None and again.layout.xaxis.title.text == "X"  # None clears a title
