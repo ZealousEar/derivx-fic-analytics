@@ -1,5 +1,7 @@
 """CURVE tab: build the curve set from editable quotes and show the
-Treasury curve, all from the market data the sidebar DATA SOURCE picks.
+Treasury curve, all from the market data the sidebar DATA SOURCE picks,
+and the sidebar REPORTING CURRENCY (:mod:`derivx.ui.rates_fx`) the other
+tabs total books in.
 
 The swap (OIS) curve discounts every trade. For EUR the tab also builds
 EURIBOR 6M and 3M projection curves, each from its own quote table and
@@ -33,7 +35,7 @@ from derivx.rates.multicurve import (
     illustrative_quotes,
 )
 from derivx.rates.quotes import clean_quotes
-from derivx.ui import rates_data, rates_exports
+from derivx.ui import rates_data, rates_exports, rates_fx
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -653,6 +655,7 @@ def render() -> Optional[Market]:
     proj_badges = {key: (f"{key} | {proj_sources[key]}", asof) for key in projections}
     rates_data.set_badges(curve=(curve_badge, asof), govt=(t_badge, asof), **proj_badges)
     full = market.replace(govt=treasury)
+    rates_fx.sidebar(full)  # REPORTING CURRENCY: the FX spots BOOK, SCENARIOS and RESEARCH convert their totals at
     st.markdown("### / EXPORT")
     tables = dict(market_tables(full))
     tables["swap_repricing"] = repricing

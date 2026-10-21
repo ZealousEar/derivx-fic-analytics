@@ -257,3 +257,30 @@ def test_estr_compounded_cap_on_the_eur_curve_set(eur):
     assert (caplets["OPTION TIME (Y)"] < caplets["EXPIRY (Y)"]).all()  # Lyashenko-Mercurio: vol decays in-period
     eur.radio(key="cap_index").set_value("EURIBOR 6M").run()
     assert not eur.exception
+
+
+def test_reporting_currency_sidebar_converts_every_tab_and_survives_a_mode_switch():
+    """The sidebar REPORTING CURRENCY (A1) drives the converted totals of
+    the SCENARIOS explain on EUR swaps and caps with a dollar bond, states
+    the ECB rate it used, and keeps its value across EQUITY and back."""
+
+    at = AppTest.from_file(str(APP), default_timeout=900)
+    at.run()
+    at.sidebar.radio[0].set_value("[ RATES ]").run()
+    at.selectbox(key="rates_conv").set_value("EUR ESTR").run()
+    at.sidebar.radio(key="rates_risk_scope").set_value("TAB TRADES").run()
+    assert not at.exception, [e.value for e in at.exception]
+    report = at.sidebar.selectbox(key="rates_report_ccy")
+    assert report.value == "USD" and list(report.options) == ["USD", "EUR", "GBP"]
+    caption = next(c.value for c in at.sidebar.caption if c.value.startswith("EURUSD"))
+    assert "ECB euro reference rates" in caption and str(at.session_state["rates_asof"]) in caption
+    report.set_value("EUR").run()
+    assert not at.exception and not at.error, [e.value for e in at.error]
+    explain = next(d.value for d in at.dataframe if "TOTAL P&L" in d.value.columns)
+    assert "ALL IN EUR" in set(explain["POSITION"]) and "ALL IN USD" not in set(explain["POSITION"])
+    assert any(m.label == "TOTAL P&L (IN €)" for m in at.metric)
+    at.sidebar.radio[0].set_value("[ EQUITY ]").run()
+    at.sidebar.radio[0].set_value("[ RATES ]").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.sidebar.selectbox(key="rates_report_ccy").value == "EUR"
+    assert any(m.label == "TOTAL P&L (IN €)" for m in at.metric)
