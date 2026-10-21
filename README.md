@@ -392,7 +392,7 @@ minutes here on 4 cores; run single files while iterating.
 | Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,445 passed, 0 skipped, 0 failed |
 | `pytest --nbmake notebooks` (Python 3.11.17, numpy 2.4.6, pandas 2.3.3, SciPy 1.17.1) | 3 passed |
 | `ruff check .` and `ruff format --check .` (ruff 0.17.1, the CI pin) | clean (208 files formatted) |
-| `mypy` (2.4.0, the CI pin, on the local versions above) | **1 error**: `src/derivx/cli.py:855`, `Need type annotation for "failed"` [var-annotated], so CI's typecheck job would fail on this revision as it stands |
+| `mypy` (2.4.0, the CI pin, on the local versions above) | clean (no issues in 103 source files) |
 
 - **QuantLib golden fixtures.** `tools/gen_golden.py` with the modules in `tools/golden/` writes the 15 files
   `tests/golden/<area>.json` from QuantLib 1.44 (calendars, curves, multi-curve, swaps, caps/floors including
@@ -418,7 +418,7 @@ CI (`.github/workflows/ci.yaml`) runs on pushes and pull requests to `main` or `
 on this revision, which has not been pushed or opened as a pull request. Its jobs: **lint** (ruff 0.17.1 check and
 format over the whole repository); **typecheck** (mypy 2.4.0 over `src/derivx`, installed from
 `requirements-lock.txt`; a lenient start: the 11 error codes still off and an `attr-defined` baseline of 18 rates,
-CLI and rates-UI modules are listed in `[tool.mypy]`; as the table shows, it would fail on this revision); **test**
+CLI and rates-UI modules are listed in `[tool.mypy]`); **test**
 on Python 3.10, 3.11, 3.12 and 3.13 with the newest versions the ranges allow and the dev extra (live QuantLib
 checks), deprecation and runtime warnings as errors; **oldest**: Python 3.10 with every direct dependency at its
 lower bound, same flags; **notebooks** with nbmake; and **docker**: builds the test stage (the UI tests, the swap,
@@ -570,8 +570,7 @@ Models
 
 Platform
 - pandas 3 and numpy 2.5 are not supported yet (capped). mypy runs in CI with a lenient config (11 error codes
-  off, an `attr-defined` baseline of 18 modules), and on this revision it reports one error
-  (`src/derivx/cli.py:855`, a missing annotation), so the typecheck job would fail until that is fixed.
+  off, an `attr-defined` baseline of 18 modules).
 - The GitHub workflows have not run on this revision (see [CI](#tests-and-validation)).
 - Inputs survive mode switches, but the selected tab inside a page is not kept.
 - Yahoo rate-limits shared IPs; lab pulls back off and say so. Yahoo's terms of use govern its data.
