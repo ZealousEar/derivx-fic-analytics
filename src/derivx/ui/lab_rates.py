@@ -11,9 +11,12 @@ model-comparison tools pointed at dated rates curves and rates-vol smiles.
 * Rates Vol History tab: a dated swaption / cap normal-vol history, the
   SABR smile walk-forward against persistence, the smile-model comparison
   and the daily SABR parameter history with jumps
-  (:mod:`derivx.validation.vol_history`). No free source publishes dated
-  rates-vol quotes, so the history is the user's upload or a SYNTHETIC
-  demo, labelled as such.
+  (:mod:`derivx.validation.vol_history`), and implied ATM normal vol
+  against the realised normal vol of the underlying forward rate, from the
+  history's own forwards or a curve history of the store
+  (:mod:`derivx.validation.realised_implied`). No free source publishes
+  dated rates-vol quotes, so the history is the user's upload or a
+  SYNTHETIC demo, labelled as such.
 
 Units: rates decimals in the data, bp in scores; vols in bp of normal vol;
 dates are observation dates of the history (horizons in observations).
@@ -39,6 +42,7 @@ from derivx.ui.lab_vol import stability_results
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.state import PERSIST
 from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.validation import realised_implied as ri
 from derivx.validation.curve_forecast import PREDICTORS as CURVE_PREDICTORS
 from derivx.validation.curve_forecast import CurveForecastSettings, run_curve_walk_forward
 from derivx.validation.manifest import build_manifest
@@ -62,6 +66,7 @@ K_VH = "lab_vh_history"
 K_VH_WF = "lab_vh_wf"
 K_VH_MC = "lab_vh_mc"
 K_VH_STAB = "lab_vh_stab"
+K_VH_RVI = "lab_vh_rvi"
 LABELS = {
     **MODEL_LABELS,
     "ns": "Nelson-Siegel",
@@ -751,3 +756,263 @@ def render_vol_tab() -> None:
     if stored:
         stale_notice(stored, data_key, str(z), "SABR parameter history", stale("SABR PARAMETERS", stored))
         stability_results(stored, "lab_vh_stab", chart_name="lab_volhist_params")
+    _realised_vs_implied(hist, data_key, prov)
+
+
+# -- realised against implied -----------------------------------------------------------
+
+
+def _rvi_sources(hist: VolHistory, store: rh.HistoryStore) -> List[str]:
+    """Underlyings on offer: the vol history's own forwards (when it has
+    any), then every curve history of the store (uploads and the daily
+    Treasury curve first)."""
+
+    curves = [k for k in store.datasets() if rh.dataset_info(k).kind != "fixings"]
+    curves.sort(key=lambda k: (not k.startswith("USER_SWAP:"), k != "UST_PAR", k))
+    own = [ri.HISTORY_FORWARDS] if any(hist.forwards.get(d) for d in hist.dates) else []
+    return own + curves
+
+
+def _rvi_label(key: str) -> str:
+    if key == ri.HISTORY_FORWARDS:
+        return "Forwards in the vol history"
+    info = rh.dataset_info(key)
+    return f"{info.title} (PROXY: government yields)" if info.kind == "govt" else info.title
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def _vh_rvi(
+    hist: VolHistory,
+    levels: Optional[pd.DataFrame],
+    basis: Optional[ri.CurveBasis],
+    what: str,
+    cfg: ri.RealisedSettings,
+) -> ri.RealisedImpliedResult:
+    if levels is None:
+        underlying, skipped = ri.history_forwards(hist)
+        notes: Dict[str, str] = {}
+    else:
+        underlying, notes, skipped = ri.curve_forwards(levels, basis, hist.points)
+    return ri.realised_vs_implied(hist, underlying, cfg, what=what, notes=notes, skipped=skipped)
+
+
+def _rvi_chart(daily: pd.DataFrame, point: str) -> go.Figure:
+    d = daily[daily["point"] == point].sort_values("date")
+    fig = go.Figure()
+    fig.update_layout(meta={"chart": "lab_volhist_rvi"})
+    traces = (
+        ("implied_bp", "implied ATM normal vol", dict(color=ACCENT, width=2)),
+        ("trailing_bp", "realised, trailing window", dict(color=SERIES[2], width=2)),
+        ("forward_bp", "realised, next window", dict(color=SERIES[3], width=2, dash="dash")),
+    )
+    values = []
+    for col, name, line in traces:
+        y = d[col].to_numpy(float)
+        if np.isfinite(y).any():
+            values.append(y[np.isfinite(y)])
+            fig.add_trace(go.Scatter(x=d["date"], y=y, mode="lines+markers", name=name, line=line, marker=dict(size=4)))
+    dark_layout(fig, height=360, xtitle="VOL QUOTE DATE", ytitle="NORMAL VOL (BP / YEAR)")
+    fig.update_layout(legend=legend(), margin=dict(l=60, r=20, t=30, b=60))
+    dates = pd.to_datetime(d["date"])
+    pad = max((dates.max() - dates.min()) * 0.03, pd.Timedelta(days=1))
+    bound_axes(
+        fig,
+        xaxis={"min": (dates.min() - pad).isoformat(), "max": (dates.max() + pad).isoformat()},
+        yaxis=axis_limits(np.concatenate(values) if values else [0.0, 1.0], pad=0.1, floor=0.0),
+    )
+    return fig
+
+
+def _rvi_underlying(source: str, hist: VolHistory, store: rh.HistoryStore, window: int):
+    """(levels or None, basis or None, what, proxy, default calendar,
+    rates provenance) of the chosen underlying; the curve history is cut
+    to the vol dates plus two windows either side."""
+
+    if source == ri.HISTORY_FORWARDS:
+        what = "the ATM forwards in the vol history (constant expiry)"
+        return None, None, what, False, "WEEKENDS", {"underlying": "vol history forwards", "source": hist.source}
+    u = ri.store_underlying(store, source)
+    pad = dt.timedelta(days=int(window * 7 / 5 * 2) + 30)
+    idx = pd.Index(u.levels.index)
+    levels = u.levels[(idx >= hist.dates[0] - pad) & (idx <= hist.dates[-1] + pad)]
+    info = rh.dataset_info(source)
+    if len(levels) < 2:
+        raise ValueError(
+            f"the store's {info.title} history covers {u.levels.index[0]} .. {u.levels.index[-1]}, not the vol "
+            f"dates {hist.dates[0]} .. {hist.dates[-1]}"
+        )
+    origins = sorted({store.origin(source, d) for d in (levels.index[0], levels.index[-1])}) if len(levels) else []
+    prov = {
+        "dataset": source,
+        "title": info.title,
+        "source": info.source,
+        "measure": u.measure,
+        "tenors": [str(c) for c in levels.columns],
+        "first": str(levels.index[0]) if len(levels) else None,
+        "last": str(levels.index[-1]) if len(levels) else None,
+        "curves": len(levels),
+        "store_sha256": store.fingerprint,
+        "origins": origins,
+        "proxy": u.proxy,
+        "basis": u.basis.description,
+    }
+    return levels, u.basis, u.what, u.proxy, u.calendar, prov
+
+
+def _format_rvi(summary: pd.DataFrame) -> pd.DataFrame:
+    out = summary.copy()
+    for col in out.columns:
+        if col.endswith("_bp") or col in ("ratio_mean", "skill", "dm_t", "implied_above_share"):
+            out[col] = out[col].astype(float).round(2 if col.endswith("_bp") else 3)
+    return out
+
+
+def _realised_vs_implied(hist: VolHistory, data_key: str, prov: Dict[str, Any]) -> None:
+    st.markdown("#### / REALISED VS IMPLIED: ATM NORMAL VOL")
+    st.caption(
+        "Each point's ATM normal vol against the realised normal vol of its underlying forward rate: the forwards "
+        "in the vol history, or the forward swap rate expiry-into-tenor read off a curve history of the store "
+        "(your uploaded swap curve, the Treasury par curve as a proxy, BoE OIS, ECB AAA). Realised = sqrt(252 x "
+        "sum of squared changes / business days), zero mean, bp a year, over the window ending on each vol date "
+        "(trailing) and the one after it (next)."
+    )
+    store = _active_store()
+    sources = _rvi_sources(hist, store)
+    if not sources:
+        st.warning("No underlying rate history: the vol history has no forwards and the store holds no curve.")
+        return
+    c1, c2 = st.columns([3, 2])
+    source = c1.selectbox("Realised vol of", sources, format_func=_rvi_label, key="lab_vh_rvi_src")
+    window = int(
+        c2.selectbox(
+            "Window (business days)",
+            list(ri.WINDOWS),
+            index=list(ri.WINDOWS).index(21),
+            format_func=lambda w: f"{w} ({w / 21:.1f} months)" if w < 252 else f"{w} (1 year)",
+            key="lab_vh_rvi_w",
+            persist_state=PERSIST,
+        )
+    )
+    try:
+        levels, basis, what, proxy, default_cal, rates_prov = _rvi_underlying(source, hist, store, window)
+    except ValueError as exc:
+        st.warning(f"{_rvi_label(source)} cannot be the underlying of this vol history: {exc}")
+        return
+    d1, d2 = st.columns(2)
+    calendar = d1.selectbox(
+        "Business-day calendar",
+        list(ri.CALENDARS),
+        index=list(ri.CALENDARS).index(default_cal),
+        key=f"lab_vh_rvi_cal_{source}",
+        help="Calendar the window and each step's business days are counted on (WEEKENDS: every weekday).",
+    )
+    gap = int(
+        d2.number_input(
+            "Max days per step",
+            1,
+            40,
+            ri.MAX_GAP_DAYS,
+            key="lab_vh_rvi_gap",
+            persist_state=PERSIST,
+            help="Calendar days one observation step may span; a longer step (a monthly stretch) is left out.",
+        )
+    )
+    cfg = ri.RealisedSettings(window=window, calendar=calendar, max_gap_days=gap)
+    settings_key = fingerprint(cfg.as_dict())
+    rvi_key = fingerprint(data_key, source, store.fingerprint if levels is not None else "")
+    if st.button("Compare realised and implied vol", key="lab_vh_rvi_run", width="stretch"):
+        with st.spinner(f"Realised vol of {len(hist.points)} point(s) over {window}-business-day windows..."):
+            computed = _vh_rvi(hist, levels, basis, what, cfg)
+        st.session_state[K_VH_RVI] = {
+            "data_key": rvi_key,
+            "settings_key": settings_key,
+            "provenance": prov,
+            "rates": rates_prov,
+            "source": source,
+            "proxy": proxy,
+            "result": computed,
+            "manifest": build_manifest(
+                "realised_vs_implied",
+                inputs={"underlying": source, **cfg.as_dict()},
+                data={"vol_history": prov, "rates": rates_prov},
+                model={
+                    "realised": "1e4 x sqrt(days_per_year x sum dF^2 / sum business days), zero mean",
+                    "forward_swap_rate": basis.description if basis is not None else "as given in the vol history",
+                    "implied": "ATM (0bp offset) normal vol quote",
+                },
+            ),
+        }
+    stored = st.session_state.get(K_VH_RVI)
+    if not stored:
+        return
+    stale_notice(
+        stored,
+        rvi_key,
+        settings_key,
+        "realised-vs-implied",
+        lambda: banner(
+            "STALE REALISED VS IMPLIED: COMPUTED ON",
+            [stored["provenance"]["source"], f"realised: {stored['result'].underlying}"],
+            "stale",
+        ),
+    )
+    result: ri.RealisedImpliedResult = stored["result"]
+    cfg_used = result.settings
+    parts = [
+        f"implied: ATM normal vols, {stored['provenance']['source']}",
+        f"realised: {result.underlying}",
+        f"{cfg_used.window}-business-day windows on the {cfg_used.calendar} calendar, steps up to "
+        f"{cfg_used.max_gap_days} days, {cfg_used.min_coverage:.0%} covered",
+    ]
+    rates = stored["rates"]
+    if rates.get("dataset"):
+        parts.append(f"rates {rates['first']} .. {rates['last']} ({'; '.join(rates['origins'])})")
+    if stored["provenance"]["synthetic"]:
+        parts.insert(0, "SYNTHETIC implied vols: not market data")
+    banner("REALISED VS IMPLIED", parts, synthetic=bool(stored["provenance"]["synthetic"]))
+    if stored["proxy"]:
+        st.warning(
+            "PROXY underlying: government yields stand in for swap rates. Their realised vol leaves out the "
+            "swap-spread vol, so a swaption's implied vol is not expected to match it. Upload a swap-curve history "
+            "(Rates Curves tab) or vol-history forwards for the like-for-like comparison."
+        )
+    if result.empty:
+        st.warning("No realised vol could be measured at the vol dates (reasons below).")
+    else:
+        st.dataframe(_format_rvi(result.summary), hide_index=True, width="stretch")
+        st.caption(
+            "bp of normal vol a year. spread = implied - trailing realised (the window ending on the quote date); "
+            "premium = implied - forward realised (the next window; positive: a delta-hedged option seller "
+            "earned it); ratio = implied / trailing. Breakeven daily move = implied / sqrt(252), in bp a "
+            "business day. skill = 1 - RMSE(implied) / RMSE(trailing) as forecasts of the forward realised vol, "
+            "and dm_t is the Diebold-Mariano statistic of that comparison with overlapping windows (negative "
+            "favours implied). Consecutive dates share most of a window, so short histories say little. Only "
+            "dates whose windows are covered are scored."
+        )
+        points = list(result.summary["point"])
+        point = st.selectbox("Point", points, key="lab_vh_rvi_point")
+        if point is not None:
+            last = result.daily[(result.daily["point"] == point) & np.isfinite(result.daily["trailing_bp"])]
+            if len(last):
+                row = last.iloc[-1]
+                st.caption(f"{point} on {row['date']}, the latest vol date with a covered trailing window:")
+                stats(
+                    [
+                        ("IMPLIED, BP/YR", f"{row['implied_bp']:.1f}"),
+                        ("REALISED, BP/YR", f"{row['trailing_bp']:.1f}"),
+                        ("SPREAD, BP/YR", f"{row['spread_bp']:+.1f}"),
+                        ("BREAKEVEN, BP/DAY", f"{row['breakeven_daily_bp']:.2f}"),
+                    ]
+                )
+            st.plotly_chart(
+                _rvi_chart(result.daily, point), width="stretch", config=PLOTLY_2D_CONFIG, key="lab_vh_rvi_chart"
+            )
+    if not result.skipped.empty:
+        with st.expander(f"{len(result.skipped)} point(s) not compared, with the reason"):
+            st.dataframe(result.skipped, hide_index=True, width="stretch")
+    downloads(
+        "realised_vs_implied",
+        stored["manifest"],
+        {"summary": result.summary, "daily": result.daily, "skipped": result.skipped},
+        key="lab_vh_rvi_dl",
+    )

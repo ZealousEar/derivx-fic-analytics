@@ -1,7 +1,8 @@
 """ANALYTICS lab research tabs in AppTest, offline (VM-18, AL-20): smile
 risk on a calibrated expiry, the SSVI surface with Dupire local vol, the
 daily parameter history, and the lab's tools on rates curves and rates-vol
-smiles. Every new chart is zoom-bounded and every result has a manifest."""
+smiles, including implied against realised vol. Every new chart is
+zoom-bounded and every result has a manifest."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from derivx.ui import lab_rates, lab_vol
+from derivx.validation import realised_implied as ri
 from derivx.validation.vol_history import synthetic_vol_history
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
@@ -177,3 +179,48 @@ def test_rates_vol_history_tab_on_synthetic_and_uploaded_grids():
     bad = pd.DataFrame({"expiry": ["1Y"], "tenor": ["10Y"], "offset_bp": [0], "vol": [80]}).to_csv(index=False)
     at.file_uploader(key="lab_vh_file").set_value(("bad.csv", bad.encode(), "text/csv")).run()
     assert any("needs a 'date' column" in e.value for e in at.error)
+
+
+def test_rates_vol_history_compares_implied_with_realised_vol():
+    """AL-20: implied ATM normal vols against the realised normal vol of the
+    underlying, from the vol history's own forwards and from the Treasury
+    curve history (flagged as a PROXY for swap rates)."""
+
+    at = _lab()
+    at.radio(key="lab_vh_source").set_value("SYNTHETIC demo history").run()
+    at.slider(key="lab_vh_days").set_value(40).run()
+    at.button(key="lab_vh_gen").click().run()
+    assert at.selectbox(key="lab_vh_rvi_src").value == ri.HISTORY_FORWARDS
+    at.button(key="lab_vh_rvi_run").click().run()
+    assert not at.exception and not at.error
+    stored = at.session_state[lab_rates.K_VH_RVI]
+    summary = stored["result"].summary.set_index("point")
+    assert len(summary) == 6 and (summary["n_dates"] == 40 - 17).all()  # 21-day windows, >= 80% covered
+    assert np.isfinite(summary["trailing_mean_bp"]).all() and (summary["trailing_mean_bp"] > 0).all()
+    banner = next(m.value for m in at.markdown if "<b>REALISED VS IMPLIED</b>" in m.value)
+    assert "SYNTHETIC implied vols: not market data" in banner and "WEEKENDS calendar" in banner
+    assert stored["manifest"]["kind"] == "realised_vs_implied" and stored["manifest"]["inputs"]["window"] == 21
+    layout = _charts(at)["lab_volhist_rvi"][0]
+    _bounded(layout)
+    assert layout["yaxis"]["minallowed"] >= 0.0
+    assert any("BREAKEVEN, BP/DAY" in m.value and "SPREAD, BP/YR" in m.value for m in at.markdown)
+
+    at.selectbox(key="lab_vh_rvi_w").set_value(10).run()
+    assert any("Settings changed" in i.value for i in at.info)
+    at.selectbox(key="lab_vh_rvi_src").set_value("UST_PAR").run()
+    assert at.selectbox(key="lab_vh_rvi_cal_UST_PAR").value == "USGOV"
+    assert any("STALE REALISED VS IMPLIED" in m.value and "vol history" in m.value for m in at.markdown)
+    at.button(key="lab_vh_rvi_run").click().run()
+    assert not at.exception and not at.error
+    stored = at.session_state[lab_rates.K_VH_RVI]
+    result = stored["result"]
+    assert "PROXY" in result.underlying and any("PROXY underlying" in w.value for w in at.warning)
+    assert stored["rates"]["dataset"] == "UST_PAR" and "bundled snapshot" in "; ".join(stored["rates"]["origins"])
+    assert result.settings.window == 10 and result.settings.calendar == "USGOV"
+    trailing = result.summary.set_index("point")["trailing_mean_bp"]
+    assert ((trailing > 20) & (trailing < 300)).all()  # realised normal vol of forward Treasury yields, bp a year
+    assert set(result.summary["point"]) == {"3Mx2Y", "3Mx10Y", "1Yx2Y", "1Yx10Y", "5Yx2Y", "5Yx10Y"}
+    # ICE LIBOR swaps stop in 2016: the section says so instead of scoring nothing
+    at.selectbox(key="lab_vh_rvi_src").set_value("USD_SWAP_ICE").run()
+    assert not at.exception
+    assert any("cannot be the underlying of this vol history" in w.value and "2013" in w.value for w in at.warning)
