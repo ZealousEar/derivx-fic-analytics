@@ -20,8 +20,8 @@ from derivx.rates import curve_io
 from derivx.rates import portfolio as pf
 from derivx.rates.bonds import FixedRateBond, bond_position
 from derivx.rates.capfloor import CapFloor
-from derivx.rates.curves import Market
-from derivx.rates.examples import EXAMPLE_ASOF, example_market
+from derivx.rates.curves import CurveQuote, Market, bootstrap
+from derivx.rates.examples import EXAMPLE_ASOF, example_market, sofr_example_rows
 from derivx.rates.stir import RateFuture
 from derivx.rates.swaps import VanillaSwap, key_rate_matrix
 from derivx.rates.swaption_vol import cube_vol, vega_buckets
@@ -159,7 +159,8 @@ def test_notionals_in_desk_shorthand(text, value):
         ),
         (dict(type="cap", direction="long", tenor="5Y", index="3M", model="shifted black"), "error", "needs a shift"),
         (dict(type="cap", direction="long", tenor="5Y", index="3M", vol=-5), "error", "vol must be zero or positive"),
-        (dict(type="cap", direction="long", tenor="5Y", index="2M"), "error", "use 1M, 3M, 6M, 12M"),
+        (dict(type="cap", direction="long", tenor="5Y", index="2M"), "error", "1M, 3M, 6M or 12M (a single-curve"),
+        (dict(type="cap", direction="long", tenor="5Y", index="OIS 2M"), "error", "use OIS 1M, OIS 3M, OIS 6M or OIS"),
         (dict(type="cap", direction="long", tenor="5Y", index="3M", currency="CHF"), "error", "give USD, EUR or GBP"),
     ],
 )
@@ -248,10 +249,10 @@ def test_blotter_rows_become_the_trades_they_describe():
     assert by_id["US5"] == pytest.approx(future.pv(market), rel=1e-12) and by_id["US5"] < 0  # short, price rose
     bond = FixedRateBond(0.0425, dt.date(2035, 8, 15))
     assert by_id["US6"] == pytest.approx(bond_position(bond, 1e7).pv(market), rel=1e-12)
-    conv = market.curve.conventions
-    terms = dict(index_months=3, day_count=conv.irs_float_day_count, calendar=conv.calendar, fixing_lag=conv.spot_lag)
-    cap = CapFloor(25e6, "cap", 0.04, "5Y", vols.caplets["3M"], **terms)
-    floor = CapFloor(-25e6, "floor", 0.03, "5Y", 95e-4, **terms)
+    # US7/US8 are on SOFR compounded in arrears ("OIS 3M"), the way USD caps trade
+    cap = CapFloor.from_overnight("USD SOFR", 25e6, "cap", 0.04, "5Y", vols.caplets["OIS 3M"])
+    floor = CapFloor.from_overnight("USD SOFR", -25e6, "floor", 0.03, "5Y", 95e-4)
+    assert risk.positions[6].details["instrument"] == cap.pinned(asof)
     assert by_id["US7"] == pytest.approx(cap.pv(market), rel=1e-12)
     assert by_id["US8"] == pytest.approx(floor.pv(market), rel=1e-12) and by_id["US8"] < 0  # sold floor
     probe = Swaption(2e7, "1Y", "10Y", 0.0, "payer").inputs(market)
@@ -312,12 +313,12 @@ def test_vega_and_vega_buckets():
         elif trade.type in ("cap", "floor"):
             assert risk.vega[k] == pytest.approx(inst.vega(market), rel=1e-12)  # normal model: vega per bp
             assert mine["vega"].sum() == pytest.approx(risk.vega[k], rel=1e-12)  # allocated, nothing lost
-            assert set(mine["bucket"]) == {"CAP 3M"}
+            assert set(mine["bucket"]) == {"CAP OIS 3M"}
         else:
             assert risk.vega[k] == 0.0 and mine.empty
     matrix = risk.vega_matrix()
     assert float(matrix.to_numpy().sum()) == pytest.approx(buckets["vega"].sum(), rel=1e-12)
-    assert list(matrix.index) == list(vols.cubes["OIS"].expiries) and list(matrix.columns)[-1] == "CAP 3M"
+    assert list(matrix.index) == list(vols.cubes["OIS"].expiries) and list(matrix.columns)[-1] == "CAP OIS 3M"
 
 
 def test_flat_vol_and_black_vegas_are_in_normal_bp():
@@ -345,6 +346,46 @@ def test_flat_vol_and_black_vegas_are_in_normal_bp():
         down = float(lognormal_to_normal_vol(row.forward, cap.strike, row.expiry, row.vol - h))
         total += row.vega / 0.01 * (2 * h) / (up - down) * 1e-4  # caplet vega per vol point -> per bp of normal
     assert risk.vega[1] == pytest.approx(total, rel=1e-5) and risk.vega[1] < 0  # sold cap
+
+
+def test_book_caps_on_the_overnight_rate_compounded_in_arrears():
+    """``OIS 3M`` caps are on the swap curve's overnight rate compounded in
+    arrears (SOFR here: OIS day count, payment lag 2), like the CAP-FLOOR
+    tab's; a Black one's normal-equivalent vega uses each caplet's
+    Lyashenko-Mercurio option time."""
+
+    market = example_market()
+    rows = [
+        _row(id="C", type="cap", direction="long", tenor="5Y", index="ois 3m", strike=4.0, vol=95),
+        _row(id="B", type="floor", direction="short", tenor="3Y", index="3M OIS", strike=3.2, vol=30, model="black"),
+        _row(id="T", type="cap", direction="long", tenor="5Y", index="3M", strike=4.0, vol=95),
+    ]
+    trades, issues = pf.parse_blotter(pd.DataFrame(rows))
+    assert issues == [] and [t.get("index") for t in trades] == ["OIS 3M", "OIS 3M", "3M"]
+    risk = pf.price_book(trades, market)
+    cap, floor, term = (p.details["instrument"] for p in risk.positions)
+    assert cap == CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.04, "5Y", 95e-4).pinned(market.asof)
+    assert floor.compounded and floor.payment_lag == 2 and not term.compounded
+    assert risk.pv[0] != pytest.approx(risk.pv[2], rel=1e-3)  # in arrears is not the term-rate approximation
+    notes = "\n".join(risk.notes)
+    assert "T is on a 3M term rate projected off the OIS curve: an approximation" in notes and "SOFR" in notes
+    assert "C is on" not in notes and "B is on" not in notes
+    table = floor.caplets(market)
+    h = 1e-6
+    total = 0.0
+    for row in table[~table["fixed"]].itertuples():
+        up = float(lognormal_to_normal_vol(row.forward, floor.strike, row.variance_time, row.vol + h))
+        down = float(lognormal_to_normal_vol(row.forward, floor.strike, row.variance_time, row.vol - h))
+        total += row.vega / 0.01 * (2 * h) / (up - down) * 1e-4
+    assert risk.vega[1] == pytest.approx(total, rel=1e-5) and risk.vega[1] < 0  # sold floor
+    gbp = pf.parse_blotter(pf.example_blotter("GBP"))[0]
+    sonia = next(t for t in gbp if t.id == "GB3")
+    assert sonia.get("index") == "OIS 3M"
+    gbp_market = Market(bootstrap(market.asof, [CurveQuote(r["kind"], r["tenor"], r["rate"])
+                                                 for r in sofr_example_rows()], "GBP SONIA"))  # fmt: skip
+    terms = pf.cap_terms("OIS 3M", gbp_market)
+    assert terms == dict(index_months=3, day_count="ACT/365F", calendar="LONDON", bdc="MF", fixing_lag=0,
+                         payment_lag=0, rate_type="compounded")  # fmt: skip
 
 
 def test_eur_book_on_the_multi_curve_market():
@@ -673,7 +714,7 @@ def test_trades_priced_beyond_the_market_data_say_so():
         _row(id="S60", type="swap", direction="pay", tenor="60Y", index="OIS"),
         _row(id="FWD", type="swap", direction="pay", tenor="5Y", start="30Y", index="OIS"),
         _row(id="B75", type="bond", direction="long", maturity="2075-08-15", rate=4.0),
-        _row(id="C40", type="cap", direction="long", tenor="40Y", index="3M", strike=4.0),
+        _row(id="C40", type="cap", direction="long", tenor="40Y", index="OIS 3M", strike=4.0),
         _row(id="W15", type="swaption", direction="long", expiry="15Y", tenor="10Y", option="payer"),
         _row(id="IN", type="swap", direction="pay", tenor="30Y", index="OIS"),
     ]

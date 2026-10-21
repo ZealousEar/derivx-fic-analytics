@@ -12,9 +12,13 @@ derivx trade the blotter row becomes:
   price);
 * the bond - ``ql.FixedRateBond`` with a ``DiscountingBondEngine`` on the
   Treasury curve copy;
-* caps and floors - QuantLib Bachelier caplets on the derivx schedule, each
-  at the derivx caplet vol (stripped vols or a flat vol: the vol is an
-  input here; stripping is checked in tests/test_capvol.py);
+* caps and floors - on SOFR compounded in arrears (``OIS 3M``): QuantLib's
+  ``OvernightLeg`` with naked caps/floors and the Lyashenko-Mercurio
+  ``BlackCompoundingOvernightIndexedCouponPricer``
+  (:func:`golden.capfloor.ql_compounded`); on a term rate, QuantLib
+  Bachelier caplets on the derivx schedule. Each caplet is at the derivx
+  caplet vol (stripped vols or a flat vol: the vol is an input here;
+  stripping is checked in tests/test_capvol.py);
 * swaptions - ``ql.Swaption`` on QuantLib's own SOFR dates with a Bachelier
   engine at the derivx trade's vol (the SABR cube is checked in
   tests/test_swaption_vol.py).
@@ -36,7 +40,7 @@ from derivx.rates.examples import example_market
 from derivx.rates.vol_examples import illustrative_cap_atm, illustrative_swaption_grid
 
 from .bonds import ql_bond
-from .capfloor import ql_value
+from .capfloor import ql_compounded, ql_value
 from .common import qd, ql_curve, set_evaluation_date
 from .swaps import ql_swap
 from .swaptions import NOTIONAL as SWAPTION_NOTIONAL
@@ -76,6 +80,8 @@ def _bond(position, market) -> float:
 def _cap(position, market) -> float:
     cf = position.details["instrument"]
     table = cf.caplets(market)
+    if cf.compounded:
+        return ql_compounded(replace(cf, vol=0.0), market, list(table["vol"]))["npv"]
     vols = {float(t): float(v) for t, v in zip(table["expiry"], table["vol"])}
     sign = 1.0 if cf.notional > 0 else -1.0  # QuantLib caps take positive nominals: a sold cap is minus a bought one
     return sign * ql_value(replace(cf, notional=abs(cf.notional), vol=vols), market)["npv"]

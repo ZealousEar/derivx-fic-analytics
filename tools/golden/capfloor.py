@@ -17,6 +17,12 @@ Two oracles:
   with past fixings from QuantLib's own flat curve. It checks dates as
   well as prices, on awkward valuation dates, all three currency presets,
   every interpolation and negative rates.
+* :func:`ql_compounded` prices caps, floors and collars on an overnight
+  rate compounded in arrears: QuantLib's ``OvernightLeg`` (its own
+  schedule, payment lag, naked caps/floors) with
+  ``BlackCompoundingOvernightIndexedCouponPricer`` (Lyashenko-Mercurio, or
+  an effective vol input), on any derivx curve copied at the dates the leg
+  uses, with derivx's own past daily fixings.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ from typing import Dict, List, Mapping, Optional, Tuple
 import QuantLib as ql
 
 from derivx.rates.capfloor import CapFloor
-from derivx.rates.conventions import parse_tenor
+from derivx.rates.conventions import parse_tenor, year_fraction
 from derivx.rates.curves import CONVENTIONS, CurveQuote, Market, bootstrap, flat_curve
 from derivx.rates.examples import EXAMPLE_ASOF, example_market, sofr_example_rows
 
@@ -86,6 +92,28 @@ INDEPENDENT = [
     (YEAR_END, "GBP SONIA", "linear_zero", 0.0, "black", "floor", "2Y", dt.date(2026, 5, 29), 3, 0.0),
 ]
 FIXINGS = (dt.date(2024, 1, 2), 0.045)  # flat continuously compounded curve for fixings before the valuation date
+ENDED_UNPAID = dt.date(2026, 7, 16)  # SOFR start: a period ends Fri 2026-10-16, pays Tue 10-20, after EXAMPLE_ASOF
+
+# Compounded-in-arrears cases: (valuation date, curve preset, interpolation, quote shift, model, kind, tenor,
+# forward start or explicit start, index months, strike offset from ATM (cap strike), floor offset (collars),
+# effective vol input, sign of the notional).
+COMPOUNDED = [
+    (EXAMPLE_ASOF, "USD SOFR", "loglinear", 0.0, "bachelier", "cap", "5Y", None, 3, 0.0, None, False, 1),
+    (EXAMPLE_ASOF, "USD SOFR", "loglinear", 0.0, "black", "floor", "5Y", None, 3, -0.005, None, False, 1),
+    (EXAMPLE_ASOF, "USD SOFR", "linear_zero", 0.0, "shifted_black", "collar", "3Y", None, 3, 0.005, -0.005, False, 1),
+    (EXAMPLE_ASOF, "USD SOFR", "monotone_convex", 0.0, "bachelier", "cap", "2Y", None, 1, 0.0, None, True, -1),
+    (EXAMPLE_ASOF, "USD SOFR", "loglinear", 0.0, "bachelier", "floor", "3Y", "1Y", 6, 0.0, None, False, 1),
+    (EXAMPLE_ASOF, "USD SOFR", "linear_zero", 0.0, "black", "cap", "10Y", None, 12, 0.003, None, True, 1),
+    (SATURDAY, "USD SOFR", "linear_zero", 0.0, "bachelier", "cap", "2Y", SATURDAY - dt.timedelta(days=40), 3,
+     0.0, None, False, 1),
+    (EXAMPLE_ASOF, "USD SOFR", "loglinear", 0.0, "bachelier", "collar", "2Y", ENDED_UNPAID, 3, 0.002, -0.004,
+     False, -1),
+    (MONTH_END, "EUR ESTR", "monotone_convex", -0.045, "bachelier", "floor", "5Y", None, 3, -0.002, None, False, 1),
+    (LEAP, "EUR ESTR", "loglinear", -0.045, "shifted_black", "collar", "4Y", "6M", 6, 0.004, -0.003, False, 1),
+    (EXAMPLE_ASOF, "GBP SONIA", "loglinear", 0.0, "black", "cap", "3Y", None, 3, 0.0, None, False, 1),
+    (YEAR_END, "GBP SONIA", "monotone_convex", 0.0, "bachelier", "floor", "2Y", YEAR_END - dt.timedelta(days=92),
+     3, 0.0, None, True, 1),
+]  # fmt: skip
 
 
 def _flat_linear(points: Mapping[float, float], t: float) -> float:
@@ -248,6 +276,118 @@ def ql_independent(cf: CapFloor, market: Market, fixings: Optional[Tuple[dt.date
     return {"npv": inst.NPV(), "atm": inst.atmRate(copy), "caplets": rows, "explicit_start": explicit_start}
 
 
+def _ql_overnight_schedule(cf: CapFloor, asof: dt.date) -> ql.Schedule:
+    """QuantLib's schedule of ``cf``: from ``start``, or spot (``fixing_lag``
+    business days after the valuation date) plus ``forward_start`` adjusted
+    with the cap's convention, rolled backward from the maturity."""
+
+    cal, bdc = CALENDARS[cf.calendar], BDC[cf.bdc]
+    if cf.start is not None:
+        effective = qd(cf.start)
+    else:
+        effective = cal.advance(cal.adjust(qd(asof)), cf.fixing_lag, ql.Days)
+        if cf.forward_start:
+            effective = cal.adjust(effective + ql.Period(parse_tenor(cf.forward_start).months, ql.Months), bdc)
+    tenor = ql.Period(parse_tenor(cf.tenor).months, ql.Months)
+    period = ql.Period(cf.index_months, ql.Months)
+    return ql.Schedule(effective, effective + tenor, period, cal, bdc, bdc, ql.DateGeneration.Backward, False)
+
+
+def ql_compounded(cf: CapFloor, market: Market, vols: Optional[List[float]] = None) -> Dict[str, object]:
+    """QuantLib values of a cap, floor or collar on the overnight rate
+    compounded in arrears (``cf.rate_type == "compounded"``).
+
+    The leg is QuantLib's ``OvernightLeg`` on its own schedule
+    (:func:`_ql_overnight_schedule`, the first coupon dropped only if
+    ``exclude_first``) with the cap's payment lag and naked caps and/or
+    floors, each coupon priced by ``BlackCompoundingOvernightIndexedCouponPricer``
+    (``effectiveVolatilityInput`` = ``cf.effective_vol``) at a constant vol
+    (``cf.vol``, or ``vols``: one per unpaid coupon, e.g. stripped caplet vols),
+    and discounted on a copy of ``market.curve`` exact at every date the
+    leg uses (compounding is telescopic). Daily fixings before the valuation
+    date are derivx's own (``market.compounded_growth`` over each day), so
+    a seasoned coupon checks the split between fixed and forecast days. A
+    naked collar coupon is worth the floor minus the cap: its sign is
+    flipped to the derivx collar (long cap, short floor).
+
+    Rows per unpaid coupon: [first fixing, last fixing, accrual start,
+    accrual end, payment, PV (currency), compounded forward, DF(payment),
+    effective vol of the first leg, vega per unit vol (central difference)]."""
+
+    asof = market.asof
+    set_evaluation_date(asof)
+    ql.IndexManager.instance().clearHistories()
+    today = qd(asof)
+    cal, dc = CALENDARS[cf.calendar], DAY_COUNTS[cf.day_count]
+    handle = ql.RelinkableYieldTermStructureHandle()
+    index = ql.OvernightIndex("DERIVX-ON", 0, ql.USDCurrency(), cal, dc, handle)
+    legs = cf._legs()
+    caps = [k for k, call, _ in legs if call]
+    floors = [k for k, call, _ in legs if not call]
+    sign = (-1.0 if cf.kind == "collar" else 1.0) * (1.0 if cf.notional > 0 else -1.0)  # to the holder
+    leg = list(
+        ql.OvernightLeg(
+            [abs(cf.notional)], _ql_overnight_schedule(cf, asof), index, dc, ql.Following,
+            paymentCalendar=cal, paymentLag=cf.payment_lag, caps=caps, floors=floors, nakedOption=True,
+        )
+    )  # fmt: skip
+    if cf._excludes_first():
+        leg = leg[1:]
+    coupons = [ql.as_capped_floored_overnight_indexed_coupon(c) for c in leg]
+    live = [c for c in coupons if c.date() > today]
+    nodes = set()
+    for c in live:
+        under = ql.as_overnight_indexed_coupon(c.underlying())
+        values = list(under.valueDates())
+        nodes.update(pyd(d) for d in (c.accrualStartDate(), c.accrualEndDate(), c.date(), values[0], values[-1]))
+        ahead = [d for d in values if d >= today]
+        if ahead:
+            nodes.add(pyd(ahead[0]))
+        fixings = list(under.fixingDates())
+        for d, nxt in zip(values[:-1], values[1:]):
+            if d < today:  # derivx's own rate for each past day
+                day, after = pyd(d), pyd(nxt)
+                growth = market.compounded_growth(day, after)
+                index.addFixing(d, (growth - 1.0) / year_fraction(day, after, cf.day_count), True)
+        assert fixings[0] == values[0]
+    nodes = sorted(d for d in nodes if d > asof)
+    copy = ql.DiscountCurve(
+        [today] + [qd(d) for d in nodes], [1.0] + [float(market.curve.df(d)) for d in nodes], ql.Actual365Fixed()
+    )
+    handle.linkTo(copy)
+    vol_type = ql.Normal if cf.model == "bachelier" else ql.ShiftedLognormal
+    shift = cf.shift if cf.model == "shifted_black" else 0.0
+    levels = [float(v) for v in vols] if vols is not None else [float(cf.vol)] * len(live)  # type: ignore[arg-type]
+    if len(levels) != len(live):
+        raise ValueError(f"give one vol per unpaid coupon ({len(live)}), got {len(levels)}")
+    quotes = [ql.SimpleQuote(v) for v in levels]
+    for c, quote in zip(live, quotes):
+        surface = ql.ConstantOptionletVolatility(today, cal, ql.Following, ql.QuoteHandle(quote),
+                                                 ql.Actual365Fixed(), vol_type, shift)  # fmt: skip
+        c.setPricer(ql.BlackCompoundingOvernightIndexedCouponPricer(ql.OptionletVolatilityStructureHandle(surface),
+                                                                    cf.effective_vol))  # fmt: skip
+
+    def values_at(bump: float) -> List[float]:
+        for quote, v in zip(quotes, levels):
+            quote.setValue(v * (1.0 + bump))
+        return [sign * c.amount() * copy.discount(c.date()) for c in live]
+
+    # each coupon's vol moved by 1e-5 of itself: the central difference's truncation error is ~1e-10 relative
+    base, up, down = values_at(0.0), values_at(1e-5), values_at(-1e-5)
+    values_at(0.0)
+    rows = []
+    for c, pv, u, d, v in zip(live, base, up, down, levels):
+        c.amount()  # the pricer's effective vols belong to the last evaluation
+        under = ql.as_overnight_indexed_coupon(c.underlying())
+        fixes = list(under.fixingDates())
+        determined = fixes[-1] <= today
+        eff = None if determined else (c.effectiveCapletVolatility() if caps else c.effectiveFloorletVolatility())
+        rows.append([_iso(fixes[0]), _iso(fixes[-1]), _iso(c.accrualStartDate()), _iso(c.accrualEndDate()),
+                     _iso(c.date()), pv, under.rate(), copy.discount(c.date()), eff,
+                     (u - d) / (2e-5 * v) if v > 0 else 0.0])  # fmt: skip
+    return {"npv": sum(base), "caplets": rows}
+
+
 def _caplet_row(inst, i: int, coupon) -> List[object]:
     """[fixing, pay, price, vega per unit vol, forward, discount factor]."""
 
@@ -293,6 +433,11 @@ def _spec(cf: CapFloor) -> Dict[str, object]:
         "calendar": cf.calendar,
         "fixing_lag": cf.fixing_lag,
         "exclude_first": cf.exclude_first,
+        "bdc": cf.bdc,
+        "floor_strike": cf.floor_strike,
+        "rate_type": cf.rate_type,
+        "payment_lag": cf.payment_lag,
+        "effective_vol": cf.effective_vol,
     }
 
 
@@ -348,6 +493,35 @@ def _independent_cases() -> List[Dict[str, object]]:
     return cases
 
 
+def _compounded_cases() -> List[Dict[str, object]]:
+    cases = []
+    for (asof, preset, interpolation, quote_shift, model, kind, tenor, begin, months, offset, floor_offset,
+         effective, side) in COMPOUNDED:  # fmt: skip
+        vol, shift = MODELS[model]
+        start = begin if isinstance(begin, dt.date) else None
+        fixings = FIXINGS if start is not None else None
+        market = independent_market(asof, preset, interpolation, quote_shift, fixings)
+        terms = dict(forward_start=None if start else begin, start=start, index_months=months)
+        probe = CapFloor.from_overnight(preset, NOTIONAL, "cap", 0.0, tenor, 0.01, **terms)
+        atm = probe.atm_strike(market)
+        extra = dict(floor_strike=atm + floor_offset) if kind == "collar" else {}
+        cf = CapFloor.from_overnight(preset, side * NOTIONAL, kind, atm + offset, tenor, vol, model, shift,
+                                     effective_vol=effective, **terms, **extra)  # fmt: skip
+        cases.append(
+            {
+                "name": f"{preset} {interpolation} {asof} {cf.label} {model}" + (" effective vol" if effective else ""),
+                "asof": asof.isoformat(),
+                "preset": preset,
+                "interpolation": interpolation,
+                "quote_shift": quote_shift,
+                "fixings": [FIXINGS[0].isoformat(), FIXINGS[1]] if fixings else None,
+                "spec": _spec(cf),
+                **ql_compounded(cf, market),
+            }
+        )
+    return cases
+
+
 def generate() -> dict:
     market = example_market()
     cases = []
@@ -376,5 +550,6 @@ def generate() -> dict:
                 cf = CapFloor(NOTIONAL, kind, -0.005, "5Y", vol, model, shift)
                 cases.append(_case(f"{model} 5Y 3M {kind} negative strike", cf, market))
     independent = _independent_cases()
+    compounded = _compounded_cases()
     set_evaluation_date(EXAMPLE_ASOF)
-    return {"asof": EXAMPLE_ASOF.isoformat(), "cases": cases, "independent": independent}
+    return {"asof": EXAMPLE_ASOF.isoformat(), "cases": cases, "independent": independent, "compounded": compounded}

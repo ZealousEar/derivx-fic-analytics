@@ -22,12 +22,14 @@ from derivx.rates.capfloor import (
     capfloor_position,
     implied_black_vol,
     implied_normal_vol,
+    lyashenko_mercurio_time,
     model_price,
     model_vega,
     shifted_black_delta,
     shifted_black_price,
     shifted_black_vega,
 )
+from derivx.rates.conventions import Calendar
 from derivx.rates.curves import CONVENTIONS, CurveQuote, Market, bootstrap, flat_curve
 from derivx.rates.examples import EXAMPLE_ASOF, example_market, sofr_example_rows
 from derivx.rates.swaps import VanillaSwap
@@ -179,6 +181,280 @@ def test_random_caps_match_live_quantlib():
         if not cf.caplets(market).shape[0]:
             continue
         _assert_matches_independent(cf, market, ql_independent(cf, market, fixings), f"case {i}: {preset} {asof} {cf}")
+
+
+def _assert_matches_compounded(cf: CapFloor, market: Market, ref: dict, name: str) -> None:
+    """Dates, values, forwards, DFs, effective vols and vegas against
+    QuantLib's compounded overnight caplets (tools/golden/capfloor.ql_compounded)."""
+
+    table = cf.caplets(market)
+    dates = [[d.isoformat() for d in r] for r in zip(table["first_fix"], table["fix"], table["start"], table["end"],
+                                                     table["pay"])]  # fmt: skip
+    assert dates == [r[:5] for r in ref["caplets"]], name
+    # atol 1e-8 on 1e7 notional: QuantLib's normal CDF tail (see test_caps_and_floors_match_quantlib)
+    assert cf.pv(market) == pytest.approx(ref["npv"], rel=1e-10, abs=1e-8), name
+    np.testing.assert_allclose(table["pv"], [r[5] for r in ref["caplets"]], rtol=1e-10, atol=1e-8, err_msg=name)
+    np.testing.assert_allclose(table["forward"], [r[6] for r in ref["caplets"]], rtol=0, atol=1e-14, err_msg=name)
+    np.testing.assert_allclose(table["df"], [r[7] for r in ref["caplets"]], rtol=1e-14, err_msg=name)
+    live = [(ours, r[8]) for ours, r, fixed in zip(table["effective_vol"], ref["caplets"], table["fixed"]) if not fixed]
+    assert all(theirs is not None for _, theirs in live), name
+    np.testing.assert_allclose([o for o, _ in live], [t for _, t in live], rtol=1e-12, err_msg=name)
+    # QuantLib's vega is a central difference of its prices: agreement to its truncation error
+    np.testing.assert_allclose(table["vega"] / UNIT[cf.model], [r[9] for r in ref["caplets"]], rtol=1e-7, atol=1e-3,
+                               err_msg=name)  # fmt: skip
+
+
+def test_compounded_caps_floors_and_collars_match_quantlib(golden):
+    """Caps, floors and collars on SOFR, €STR and SONIA compounded in
+    arrears against QuantLib's OvernightLeg with naked caps/floors and the
+    BlackCompoundingOvernightIndexedCouponPricer: Lyashenko-Mercurio and
+    effective vol inputs, all three models, spot and forward starts, sold
+    trades, negative rates, a valuation date inside a period (past daily
+    fixings) and a period that has fixed but not yet paid."""
+
+    cases = golden("capfloor")["compounded"]
+    specs = [c["spec"] for c in cases]
+    assert {c["preset"] for c in cases} == {"USD SOFR", "EUR ESTR", "GBP SONIA"}
+    assert {s["kind"] for s in specs} == {"cap", "floor", "collar"}
+    assert {s["model"] for s in specs} == {"bachelier", "black", "shifted_black"}
+    assert {s["effective_vol"] for s in specs} == {True, False} and any(s["notional"] < 0 for s in specs)
+    assert {s["payment_lag"] for s in specs} == {0, 1, 2}
+    in_period = ended_unpaid = 0
+    for case in cases:
+        fixings = (D(case["fixings"][0]), case["fixings"][1]) if case["fixings"] else None
+        market = _case_market(D(case["asof"]), case["preset"], case["interpolation"], case["quote_shift"], fixings)
+        cf = _from_spec(case["spec"])
+        assert cf.compounded, case["name"]
+        _assert_matches_compounded(cf, market, case, case["name"])
+        table = cf.caplets(market)
+        in_period += bool(((table["start"] < market.asof) & ~table["fixed"]).any())
+        ended_unpaid += bool(table["fixed"].any())
+    assert in_period >= 2 and ended_unpaid >= 1
+
+
+def test_random_compounded_caps_match_live_quantlib():
+    """Random presets, interpolations, valuation dates, structures, kinds
+    (collars too), models, vol inputs and seasoning against QuantLib's
+    compounded overnight caplets (skipped without QuantLib)."""
+
+    pytest.importorskip("QuantLib")
+    sys.path.insert(0, str(ROOT / "tools"))
+    from golden.capfloor import ql_compounded
+
+    rng = random.Random(11)
+    for i in range(30):
+        preset = ("USD SOFR", "EUR ESTR", "GBP SONIA")[i % 3]
+        negative = preset == "EUR ESTR" and i % 2 == 0
+        asof = EXAMPLE_ASOF + dt.timedelta(days=rng.randrange(-700, 700))
+        model, vol, shift = MODELS[i % 3] if not (negative and i % 3 == 1) else MODELS[2]
+        vol *= rng.uniform(0.3, 2.0)
+        fixings, terms = None, dict(index_months=rng.choice([1, 3, 6, 12]))
+        if i % 4 == 0:
+            terms["start"] = asof - dt.timedelta(days=rng.randrange(5, 400))
+            fixings = (terms["start"] - dt.timedelta(days=10), 0.045)
+        else:
+            terms["forward_start"] = rng.choice([None, None, "3M", "1Y", "2Y"])
+        market = _case_market(asof, preset, rng.choice(["loglinear", "linear_zero", "monotone_convex"]),
+                              -0.045 if negative else 0.0, fixings)  # fmt: skip
+        kind = rng.choice(["cap", "floor", "collar"])
+        low = 0.012 if model == "black" else (-0.015 if negative else -0.01)
+        strike = rng.uniform(low + 0.01, 0.07)
+        extra = dict(floor_strike=strike - rng.uniform(0.001, 0.01)) if kind == "collar" else {}
+        if model == "black" and extra and extra["floor_strike"] <= 0:
+            extra["floor_strike"] = strike / 2
+        cf = CapFloor.from_overnight(preset, rng.choice([1, -1]) * 4e6, kind, strike,
+                                     rng.choice(["1Y", "2Y", "5Y", "10Y", "27M"]), vol, model, shift,
+                                     effective_vol=bool(rng.randrange(2)), **terms, **extra)  # fmt: skip
+        if not cf.caplets(market).shape[0]:
+            continue
+        _assert_matches_compounded(cf, market, ql_compounded(cf, market), f"case {i}: {preset} {asof} {cf}")
+
+
+def test_lyashenko_mercurio_time():
+    # before the period: t_s + (t_e - t_s) / 3; the vol decays linearly over the accrual period
+    np.testing.assert_allclose(lyashenko_mercurio_time([1.0, 0.0], [1.25, 0.25]), [1.0 + 0.25 / 3, 0.25 / 3])
+    inside = lyashenko_mercurio_time(-0.1, 0.15)  # 0.1 of a 0.25 period gone: (0.15^3) / (3 * 0.25^2)
+    assert inside == pytest.approx(0.15**3 / (3 * 0.25**2), rel=1e-15)
+    assert lyashenko_mercurio_time(-0.3, 0.0) == 0.0 and lyashenko_mercurio_time(-0.3, -0.05) == 0.0
+    assert lyashenko_mercurio_time(0.5, 0.5) == 0.5  # one-day period: all variance before it
+    days = np.linspace(-0.3, 0.75, 211)  # valuation moving through the period [0.5, 0.75] seen from 0
+    times = lyashenko_mercurio_time(0.5 - days, 0.75 - days)
+    assert np.all(np.diff(times) < 0) and times[-1] == 0.0  # falls continuously to zero at the period end
+    at_start = lyashenko_mercurio_time(np.array([1e-12, -1e-12]), 0.25)  # continuous as the period starts
+    assert at_start[0] == pytest.approx(at_start[1], abs=1e-11)
+    with pytest.raises(ValueError, match="last fixing"):
+        lyashenko_mercurio_time(1.0, 0.5)
+
+
+def test_compounded_caplet_is_black_on_the_lyashenko_mercurio_time(market):
+    """Each live caplet is the model price on the forward with variance
+    vol^2 x T_LM (or vol^2 x t_e with an effective vol), so the compounded
+    caplet is worth less than a caplet with the vol running to the last
+    fixing, and its effective vol is vol x sqrt(T_LM / t_e)."""
+
+    for model, vol, shift in MODELS:
+        cf = CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.036, "5Y", vol, model, shift)
+        table = cf.caplets(market)
+        t_s = np.array([(d - market.asof).days / 365 for d in table["first_fix"]])
+        t_e = np.array([(d - market.asof).days / 365 for d in table["fix"]])
+        np.testing.assert_allclose(table["variance_time"], t_s + (t_e - t_s) / 3, rtol=1e-15)
+        np.testing.assert_allclose(table["expiry"], t_e, rtol=1e-15)
+        for row in table.itertuples():
+            unit = model_price(model, row.forward, 0.036, row.variance_time, vol, shift)
+            assert row.pv == pytest.approx(1e7 * row.tau * row.df * unit, rel=1e-13)
+        np.testing.assert_allclose(table["effective_vol"], vol * np.sqrt(table["variance_time"] / t_e), rtol=1e-14)
+        effective = replace(cf, effective_vol=True)
+        assert effective.pv(market) > cf.pv(market)
+        np.testing.assert_allclose(effective.caplets(market)["variance_time"], t_e, rtol=1e-15)
+        # the same caplet with the vol set to the effective vol, as an effective-vol input, has the same value
+        same = replace(effective, vol=dict(zip(t_e, table["effective_vol"])))
+        np.testing.assert_allclose(same.caplets(market)["pv"], table["pv"], rtol=1e-12)
+
+
+def test_compounded_rate_and_schedule_follow_the_ois_conventions(market):
+    """A compounded caplet pays the OIS floating coupon's rate: its ATM strike
+    on the OIS schedule is the OIS par rate. Daily fixings run from the
+    period start to the business day before its end; payment is the
+    preset's OIS payment lag later; the first period is kept (it is not
+    known at trade)."""
+
+    cf = CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.035, "5Y", 0.0095, index_months=12)
+    swap = VanillaSwap.from_conventions(market.curve.conventions, "5Y", 0.0, kind="OIS", trade_date=market.asof)
+    assert cf.atm_strike(market) == pytest.approx(swap.par_rate(market), abs=1e-14)
+    quarterly = CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.035, "5Y", 0.0095)
+    periods = quarterly.periods(market.asof)
+    cal = Calendar("USD")
+    assert len(periods) == 20 and periods[0].start == quarterly.effective_date(market.asof)
+    for p in periods:
+        assert p.first_fix == p.start and p.fix == cal.add_business_days(p.end, -1) and p.fix < p.end
+        assert p.pay == cal.add_business_days(p.end, 2)
+        assert p.tau == pytest.approx((p.end - p.start).days / 360, rel=1e-15)
+    sonia = CapFloor.from_overnight("GBP SONIA", 1e7, "floor", 0.035, "2Y", 0.0095)
+    assert (sonia.day_count, sonia.calendar, sonia.payment_lag, sonia.fixing_lag) == ("ACT/365F", "LONDON", 0, 0)
+    for p in sonia.periods(market.asof):
+        assert p.pay == p.end
+    # forward rates compound on the discount curve
+    row = quarterly.caplets(market).iloc[3]
+    growth = market.curve.df(row["start"]) / market.curve.df(row["end"])
+    assert row["forward"] == pytest.approx((growth - 1) / row["tau"], rel=1e-14)
+
+
+def test_compounded_caplet_inside_its_period_uses_past_fixings(market):
+    """Seasoned compounded cap: the running period mixes fixings (the
+    fixings curve) and forecasts (today's curve); its variance shrinks with
+    the part still to fix; one that has fixed but not paid is intrinsic."""
+
+    start = market.asof - dt.timedelta(days=40)
+    fixings = flat_curve(start - dt.timedelta(days=10), 0.05)
+    seasoned = market.replace(fixings=fixings)
+    cf = CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.034, "1Y", 0.0095, start=start)
+    table = cf.caplets(seasoned)
+    first = table.iloc[0]
+    assert first["start"] < market.asof < first["fix"] and not first["fixed"]
+    growth = fixings.df(first["start"]) / fixings.df(market.asof) / market.curve.df(first["end"])
+    assert first["forward"] == pytest.approx((growth - 1) / first["tau"], rel=1e-14)
+    t_s = (first["first_fix"] - market.asof).days / 365
+    t_e = (first["fix"] - market.asof).days / 365
+    assert first["variance_time"] == pytest.approx(t_e**3 / (3 * (t_e - t_s) ** 2), rel=1e-14)
+    # moving the fixings moves only the running period
+    other = cf.caplets(market.replace(fixings=flat_curve(start - dt.timedelta(days=10), 0.02)))
+    assert other["forward"].iloc[0] < first["forward"]
+    np.testing.assert_array_equal(other["pv"].iloc[1:], table["pv"].iloc[1:])
+    # all fixings in, payment pending (SOFR pays two business days after the period end): intrinsic
+    ended = CapFloor.from_overnight("USD SOFR", 1e7, "cap", 0.03, "2Y", 0.0095, start=dt.date(2026, 7, 16))
+    row = ended.caplets(seasoned).iloc[0]
+    assert row["end"] <= market.asof < row["pay"] and row["fixed"] and row["vega"] == 0.0
+    assert row["pv"] == pytest.approx(1e7 * row["tau"] * row["df"] * max(row["forward"] - 0.03, 0.0), rel=1e-14)
+
+
+@pytest.mark.parametrize("model,vol,shift", MODELS)
+@pytest.mark.parametrize("rate_type", ["term", "compounded"])
+def test_collar_is_long_cap_short_floor(market, model, vol, shift, rate_type):
+    terms = dict(rate_type="compounded", payment_lag=2) if rate_type == "compounded" else {}
+    collar = CapFloor(1e7, "collar", 0.040, "5Y", vol, model, shift, floor_strike=0.030, **terms)
+    cap = CapFloor(1e7, "cap", 0.040, "5Y", vol, model, shift, **terms)
+    floor = CapFloor(1e7, "floor", 0.030, "5Y", vol, model, shift, **terms)
+    assert collar.pv(market) == pytest.approx(cap.pv(market) - floor.pv(market), rel=1e-13)
+    assert collar.vega(market) == pytest.approx(cap.vega(market) - floor.vega(market), rel=1e-12)
+    assert collar.decay(market) == pytest.approx(cap.decay(market) - floor.decay(market), rel=1e-11, abs=1e-9)
+    table = collar.caplets(market)
+    np.testing.assert_allclose(table["cap_pv"], cap.caplets(market)["pv"], rtol=1e-14)
+    np.testing.assert_allclose(table["floor_pv"], -floor.caplets(market)["pv"], rtol=1e-14)
+    np.testing.assert_allclose(table["pv"], table["cap_pv"] + table["floor_pv"], rtol=1e-14)
+    assert (table["floor_strike"] == 0.030).all() and "floor_pv" not in cap.caplets(market)
+    lender = replace(collar, notional=-1e7)  # long the floor, short the cap
+    assert lender.pv(market) == pytest.approx(-collar.pv(market), rel=1e-14)
+    field = "vol_shift_normal" if model == "bachelier" else "vol_shift_lognormal"
+    h = 1e-3 * UNIT[model]
+    bumped = (collar.pv(market.replace(**{field: h})) - collar.pv(market.replace(**{field: -h}))) / (2 * h)
+    assert collar.vega(market) == pytest.approx(bumped * UNIT[model], rel=1e-6)
+    end = max(p.pay for p in collar.periods(market.asof))
+    assert collar.cash(market, market.asof, end) == pytest.approx(
+        cap.cash(market, market.asof, end) - floor.cash(market, market.asof, end), abs=1e-6
+    )
+    with pytest.raises(ValueError, match="imply the cap's and the floor's vols separately"):
+        collar.implied_flat_vol(collar.pv(market), market)
+    assert "COLLAR 4.000%/3.000%" in collar.label
+
+
+def test_collar_legs_read_their_own_strikes_on_a_smile(market):
+    """On stripped caplet vols by strike each leg of a collar reads its own
+    strike's vol."""
+
+    from derivx.rates.capvol import strip_surface
+
+    strikes = np.array([0.025, 0.035, 0.045])
+    flat = np.array([[0.0110, 0.0095, 0.0090], [0.0112, 0.0098, 0.0093], [0.0108, 0.0096, 0.0092]])
+    terms = dict(rate_type="compounded", payment_lag=2)
+    surface, _ = strip_surface(market, ["2Y", "5Y", "10Y"], strikes, flat, terms=terms)
+    collar = CapFloor(1e7, "collar", 0.045, "5Y", surface, floor_strike=0.025, **terms)
+    table = collar.caplets(market)
+    np.testing.assert_allclose(table["vol"], surface.caplet_vols(table["expiry"].to_numpy(), 0.045), rtol=1e-15)
+    np.testing.assert_allclose(table["floor_vol"], surface.caplet_vols(table["expiry"].to_numpy(), 0.025), rtol=1e-15)
+    assert not np.allclose(table["vol"], table["floor_vol"])
+    cap = CapFloor(1e7, "cap", 0.045, "5Y", surface, **terms).pv(market)
+    floor = CapFloor(1e7, "floor", 0.025, "5Y", surface, **terms).pv(market)
+    assert collar.pv(market) == pytest.approx(cap - floor, rel=1e-13)
+
+
+@pytest.mark.parametrize("model,vol,shift", MODELS)
+def test_compounded_cap_greeks_parity_and_implied_vol(market, model, vol, shift):
+    cf = CapFloor.from_overnight("USD SOFR", 1e7, "floor", 0.034, "7Y", {1.0: vol, 5.0: 0.9 * vol}, model, shift,
+                                 forward_start="1Y")  # fmt: skip
+    field = "vol_shift_normal" if model == "bachelier" else "vol_shift_lognormal"
+    h = 1e-3 * UNIT[model]
+    up, down = cf.pv(market.replace(**{field: h})), cf.pv(market.replace(**{field: -h}))
+    assert cf.vega(market) == pytest.approx((up - down) / (2 * h) * UNIT[model], rel=1e-7)
+    parity = cap_floor_parity(cf, market)
+    assert parity["residual"] == pytest.approx(0.0, abs=1e-8 * 1e7)
+    flat = replace(cf, vol=vol)
+    assert flat.implied_flat_vol(flat.pv(market), market) == pytest.approx(vol, rel=1e-10)
+    # time decay: the PV with every option time a business day shorter (Lyashenko-Mercurio times recomputed)
+    days = (Calendar("USD").add_business_days(market.asof, 1) - market.asof).days
+    table = cf.caplets(market)
+    t_s = np.array([(d - market.asof).days / 365 for d in table["first_fix"]]) - days / 365
+    t_e = table["expiry"].to_numpy() - days / 365
+    later = sum(1e7 * r.tau * r.df * model_price(model, r.forward, 0.034, t, r.vol, shift, False)
+                for r, t in zip(table.itertuples(), lyashenko_mercurio_time(t_s, t_e)))  # fmt: skip
+    assert cf.decay(market) == pytest.approx(later - cf.pv(market), rel=1e-9)
+    assert cf.decay(market) < 0
+
+
+def test_compounded_caps_strip_and_reprice(market):
+    """Flat vols of compounded caps strip into caplet vols on their
+    Lyashenko-Mercurio times, and every quoted cap reprices."""
+
+    from derivx.rates.capvol import strip_caplet_vols
+
+    terms = dict(rate_type="compounded", payment_lag=2, fixing_lag=2)
+    mats, flat = ["1Y", "2Y", "5Y", "10Y"], [0.0090, 0.0100, 0.0098, 0.0088]
+    result = strip_caplet_vols(market, mats, flat, None, "constant", terms=terms)
+    assert result.max_error < 1e-12
+    for m, v in zip(mats, flat):
+        probe = CapFloor(1.0, "cap", 0.0, m, v, **terms)
+        atm = probe.atm_strike(market)
+        quoted = CapFloor(1.0, "cap", atm, m, v, **terms).pv(market)
+        assert CapFloor(1.0, "cap", atm, m, result.curve, **terms).pv(market) == pytest.approx(quoted, abs=1e-14)
 
 
 # --------------------------------------------------------------------------
@@ -453,7 +729,17 @@ def test_negative_rate_curve_needs_a_normal_or_shifted_model():
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"kind": "collar"}, "kind"),
+        ({"kind": "straddle"}, "kind"),
+        ({"kind": "collar"}, "collar needs floor_strike"),
+        ({"kind": "collar", "floor_strike": 0.03}, "must be below its cap strike"),
+        ({"floor_strike": 0.02}, "floor_strike is for collars"),
+        ({"kind": "collar", "floor_strike": -0.001, "model": "black"}, "positive strike"),
+        ({"rate_type": "averaged"}, "rate_type"),
+        ({"rate_type": "compounded", "projection": "EURIBOR 3M"}, "overnight rate of the discount curve"),
+        ({"effective_vol": True}, "effective_vol is for compounded caps"),
+        ({"rate_type": "compounded", "effective_vol": "yes"}, "effective_vol must be True or False"),
+        ({"payment_lag": -1}, "payment_lag"),
+        ({"payment_lag": 0.5}, "payment_lag"),
         ({"model": "sabr"}, "model"),
         ({"notional": 0.0}, "notional"),
         ({"tenor": "3W"}, "months or years"),
@@ -625,6 +911,11 @@ WIDGETS = {
     "cap_strip_layout": "radio",
     "cap_strip_method": "radio",
     "cap_smile_expiry": "selectbox",
+    "cap_reset": "selectbox",
+    "cap_rfr_vol": "radio",
+    "cap_floor_strike_pct": "number_input",
+    "cap_floor_offset_bp": "number_input",
+    "cap_collar_offset_bp": "number_input",
 }
 
 
@@ -636,7 +927,15 @@ def _set(at: AppTest, key: str, value) -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"cap_kind": "Floor", "cap_index": "6M", "cap_tenor": "10Y", "cap_forward_start": "2Y"},
+        {"cap_kind": "Floor", "cap_index": "6M term", "cap_tenor": "10Y", "cap_forward_start": "2Y"},
+        {"cap_kind": "Collar", "cap_reset": "1M", "cap_rfr_vol": "Effective to last fixing", "cap_tenor": "2Y"},
+        {
+            "cap_kind": "Collar",
+            "cap_strike_mode": "Absolute %",
+            "cap_strike_pct": 4.5,
+            "cap_floor_strike_pct": 3.0,
+            "cap_model": "Black (%)",
+        },
         {"cap_model": "Black (%)", "cap_atm_offset_bp": 100.0},
         {"cap_model": "Shifted Black (%)", "cap_vol_mode": "Term structure"},
         {"cap_vol_mode": "Term structure", "cap_tenor": "30Y", "cap_forward_start": "10Y"},
@@ -658,8 +957,11 @@ def test_tab_handles_edge_inputs(changes):
     [
         {"cap_vol_mode": "Stripped from cap quotes"},
         {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_method": "Linear", "cap_tenor": "7Y"},
-        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike",
+        {"cap_index": "3M term", "cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike",
          "cap_smile_expiry": "10Y (9.75Y)"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike",
+         "cap_smile_expiry": "10Y (10.01Y)"},
+        {"cap_kind": "Collar", "cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike"},
         {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike", "cap_strike_mode": "Absolute %",
          "cap_strike_pct": 4.25, "cap_kind": "Floor", "cap_forward_start": "2Y"},
     ],
@@ -695,16 +997,21 @@ def test_stripped_vols_need_the_normal_model_and_show_quote_vegas():
     assert at.session_state["cap_test_positions"] == []
 
 
-def test_a_forward_start_trade_strips_the_spot_start_cap_quotes():
+@pytest.mark.parametrize("index", ["SOFR compounded", "3M term"])
+def test_a_forward_start_trade_strips_the_spot_start_cap_quotes(index):
     """Cap vols are quoted on spot-start caps: picking a forward start for
     the trade used to strip the quotes as forward-start caps too (the 1Y
     quote's caplets fixing 2.25Y-2.75Y ahead), so the trade was priced on
-    wrong caplet vols."""
+    wrong caplet vols. The quotes are caps on the trade's rate: SOFR
+    compounded in arrears (every caplet, the last fixing a business day
+    before the 1Y end) or the 3M term rate (first caplet excluded, the last
+    fixing at 0.75Y)."""
 
     from derivx.rates.capvol import strip_caplet_vols
     from derivx.rates.vol_examples import illustrative_cap_atm
 
     at = _app()
+    _set(at, "cap_index", index)
     _set(at, "cap_vol_mode", "Stripped from cap quotes")
     spot_curve = at.session_state["cap_test_positions"][0].details["trade"].vol
     _set(at, "cap_forward_start", "2Y")
@@ -714,9 +1021,15 @@ def test_a_forward_start_trade_strips_the_spot_start_cap_quotes():
     assert position.details["forward_start"] == "2Y" and trade.vol == spot_curve
     assert (trade.start - EXAMPLE_ASOF).days > 700
     repricing = next(d.value for d in at.dataframe if "ERROR (BP UPFRONT)" in d.value.columns)
-    assert repricing["LAST CAPLET EXPIRY (Y)"].iloc[0] < 1.0  # the 1Y quote is a spot-start 1Y cap
+    first = repricing.iloc[0]
+    if index == "3M term":
+        assert first["LAST CAPLET EXPIRY (Y)"] < 1.0 and first["CAPLETS"] == 3  # the 1Y quote: a spot-start 1Y cap
+    else:
+        assert 1.0 < first["LAST CAPLET EXPIRY (Y)"] < 1.01 and first["CAPLETS"] == 4
     quotes = illustrative_cap_atm("USD")
     terms = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
+    if index == "SOFR compounded":
+        terms.update(rate_type="compounded", payment_lag=2, effective_vol=False)
     expected = strip_caplet_vols(example_market(), list(quotes["maturity"]), quotes["vol_bp"].to_numpy() * 1e-4,
                                  terms=terms).curve  # fmt: skip
     assert trade.vol.nodes == expected.nodes
@@ -801,3 +1114,80 @@ def test_tab_reports_black_with_a_negative_strike_as_an_error():
     _set(at, "cap_atm_offset_bp", -500.0)
     assert at.error and "positive strike" in at.error[0].value
     assert at.session_state["cap_test_positions"] == []
+
+
+def test_tab_prices_sofr_compounded_caps_by_default_and_flags_term_caps():
+    """USD caps trade on SOFR compounded in arrears: that is the tab's
+    default, with the Lyashenko-Mercurio option time and effective vol per
+    caplet. A 3M/6M term cap on the SOFR curve is still available, marked as
+    the approximation it is."""
+
+    at = _app()
+    trade = at.session_state["cap_test_positions"][0].details["trade"]
+    assert trade.compounded and not trade.effective_vol and (trade.payment_lag, trade.index_months) == (2, 3)
+    caplets = next(d.value for d in at.dataframe if "OPTION TIME (Y)" in d.value.columns)
+    assert {"FIRST FIXING", "LAST FIXING", "EFF VOL (bp)"} <= set(caplets.columns)
+    assert (caplets["OPTION TIME (Y)"] < caplets["EXPIRY (Y)"]).all()
+    assert (caplets["EFF VOL (bp)"] < caplets["VOL (bp)"]).all()
+    schedule = next(c.value for c in at.caption if c.value.startswith("Schedule:"))
+    assert "SOFR compounded in arrears" in schedule and "Lyashenko-Mercurio" in schedule
+    assert not at.warning
+    _set(at, "cap_rfr_vol", "Effective to last fixing")
+    effective = at.session_state["cap_test_positions"][0].details["trade"]
+    assert effective.effective_vol and effective.pv(example_market()) > trade.pv(example_market())
+    _set(at, "cap_index", "3M term")
+    term = at.session_state["cap_test_positions"][0].details["trade"]
+    assert not term.compounded and term.projection is None
+    assert any("Term-rate approximation" in w.value and "SOFR" in w.value for w in at.warning)
+
+
+def test_tab_prices_a_collar_as_long_cap_short_floor():
+    at = _app()
+    _set(at, "cap_kind", "Collar")
+    assert not at.error, [e.value for e in at.error]
+    collar = at.session_state["cap_test_positions"][0].details["trade"]
+    market = example_market()
+    atm = replace(collar, kind="cap", floor_strike=None, strike=0.0).atm_strike(market)
+    assert collar.strike == pytest.approx(atm + 0.005, abs=1e-15)  # ATM +/- 50bp by default
+    assert collar.floor_strike == pytest.approx(atm - 0.005, abs=1e-15)
+    cap = replace(collar, kind="cap", floor_strike=None).pv(market)
+    floor = replace(collar, kind="floor", strike=collar.floor_strike, floor_strike=None).pv(market)
+    pv = float(at.metric[0].value.replace(",", ""))
+    assert pv == pytest.approx(cap - floor, abs=0.01)
+    caplets = next(d.value for d in at.dataframe if "FLOOR STRIKE (%)" in d.value.columns)
+    np.testing.assert_allclose(caplets["PV"], caplets["CAP PV"] + caplets["FLOOR PV"], rtol=1e-12)
+    assert (caplets["FLOOR PV"] <= 0).all()
+    strip = json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith("cap_strip_chart")).proto.spec)
+    assert {"CAP STRIKE", "FLOOR STRIKE", "FORWARD"} <= {t["name"] for t in strip["data"]}
+    _set(at, "cap_floor_offset_bp", 75.0)  # floor above the cap: refused with the reason
+    assert at.error and "must be below its cap strike" in at.error[0].value
+
+
+def test_stripped_vols_carry_the_caplets_they_were_stripped_on(market):
+    """Flat cap quotes imply different caplet vols on term caplets, on
+    compounded caplets with a Lyashenko-Mercurio vol and with an effective
+    vol: stripped vols record which, and a cap of another basis is refused
+    instead of being priced on vols that mean something else."""
+
+    from derivx.rates.capvol import CapletVolSurface, strip_caplet_vols
+
+    mats, flat = ["1Y", "2Y", "5Y"], [0.0090, 0.0100, 0.0098]
+    bases = {}
+    for name, terms in {
+        "term": {},
+        "lyashenko_mercurio": dict(rate_type="compounded", payment_lag=2),
+        "effective": dict(rate_type="compounded", payment_lag=2, effective_vol=True),
+    }.items():
+        curve = strip_caplet_vols(market, mats, flat, None, "constant", terms=terms).curve
+        assert curve.vol_basis == name
+        bases[name] = (curve, terms)
+    assert bases["term"][0].vols != bases["lyashenko_mercurio"][0].vols != bases["effective"][0].vols
+    for name, (curve, terms) in bases.items():
+        CapFloor(1e7, "cap", 0.035, "5Y", curve, **terms)  # its own basis prices
+        for other, (_, other_terms) in bases.items():
+            if other != name:
+                with pytest.raises(ValueError, match="stripped on"):
+                    CapFloor(1e7, "cap", 0.035, "5Y", curve, **other_terms)
+    lm, effective = bases["lyashenko_mercurio"][0], bases["effective"][0]
+    with pytest.raises(ValueError, match="vol basis"):
+        CapletVolSurface((replace(lm, strike=0.03), replace(effective, strike=0.04)))

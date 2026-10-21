@@ -24,8 +24,11 @@ index      swap: ``OIS`` (the currency's OIS conventions), ``IRS`` (term leg on
            the OIS curve, single-curve) or a term index (``EURIBOR 6M``);
            basis swap: ``EURIBOR 3M/EURIBOR 6M`` (spread leg / other leg); FRA:
            a term index; future: ``SR1``, ``SR3`` or ``EURIBOR 3M``; cap /
-           floor: ``3M`` / ``6M`` (single-curve term rate) or a term index;
-           swaption: ``OIS`` or a term index
+           floor: ``OIS 3M`` (the currency's overnight rate, SOFR / €STR /
+           SONIA, compounded in arrears over 1M, 3M, 6M or 12M periods, as
+           those caps trade), ``3M`` / ``6M`` (a single-curve term rate on
+           the OIS curve: an approximation) or a term index; swaption:
+           ``OIS`` or a term index
 option     swaption: ``payer``, ``receiver`` or ``straddle``
 rate       fixed rate (%) of a swap or FRA (blank = par on the valuation
            date); bond coupon (%)
@@ -96,7 +99,7 @@ import pandas as pd
 from scipy.optimize import brentq
 
 from derivx.rates.bonds import FixedRateBond, benchmark_bond, bond_position
-from derivx.rates.capfloor import CapFloor, bachelier_vega, capfloor_position
+from derivx.rates.capfloor import OVERNIGHT_NAMES, CapFloor, bachelier_vega, capfloor_position
 from derivx.rates.capvol import strip_caplet_vols
 from derivx.rates.conventions import Calendar, parse_tenor
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Market
@@ -202,7 +205,8 @@ COLUMN_HELP = {
     "maturity": "Bond maturity date; or a swap end date instead of a tenor (YYYY-MM-DD)",
     "expiry": "Swaption option expiry (1Y)",
     "index": "Swap OIS / IRS / EURIBOR 6M; basis EURIBOR 3M/EURIBOR 6M; FRA index; future SR1/SR3/EURIBOR 3M; cap "
-    "3M/6M or EURIBOR 3M/6M; swaption OIS or EURIBOR 6M",
+    "OIS 3M (SOFR/€STR/SONIA compounded in arrears), 3M/6M (term rate on the OIS curve, an approximation) or "
+    "EURIBOR 3M/6M; swaption OIS or EURIBOR 6M",
     "option": "Swaption: payer, receiver or straddle",
     "rate": "Swap or FRA fixed rate in % (blank = par); bond coupon in %",
     "spread": "bp: swap float spread; basis spread (blank = par); bond z-spread",
@@ -377,7 +381,13 @@ def _parse_index(kind: str, value: object) -> str:
         match = re.match(r"^(\d{1,2})M$", text)
         if match and int(match.group(1)) in CAP_MONTHS:
             return text
-        raise ValueError(f"index {value!r}: use 1M, 3M, 6M, 12M (single-curve) or a term index ({', '.join(INDICES)})")
+        match = re.match(r"^(?:OIS\s*(\d{1,2})M|(\d{1,2})M\s*OIS)$", text)
+        if match and int(match.group(1) or match.group(2)) in CAP_MONTHS:
+            return f"OIS {int(match.group(1) or match.group(2))}M"
+        raise ValueError(
+            f"index {value!r}: use OIS 1M, OIS 3M, OIS 6M or OIS 12M (the overnight rate compounded in arrears), "
+            f"1M, 3M, 6M or 12M (a single-curve term rate) or a term index ({', '.join(INDICES)})"
+        )
     if kind == "swaption":
         if text in ("OIS", "") or text in INDICES:
             return text or "OIS"
@@ -689,9 +699,9 @@ _EXAMPLES: Dict[str, Tuple[Dict[str, object], ...]] = {
         dict(id="US4", type="swap", direction="pay", notional="20mm", tenor="2Y", start="1Y", index="OIS"),
         dict(id="US5", type="future", direction="short", notional="100", tenor="DEC26", index="SR3", price=96.20),
         dict(id="US6", type="bond", direction="long", notional="10mm", maturity="2035-08-15", rate=4.25),
-        dict(id="US7", type="cap", direction="long", notional="25mm", tenor="5Y", index="3M", strike=4.00),
-        dict(id="US8", type="floor", direction="short", notional="25mm", tenor="5Y", index="3M", strike=3.00, vol=95,
-             model="normal"),
+        dict(id="US7", type="cap", direction="long", notional="25mm", tenor="5Y", index="OIS 3M", strike=4.00),
+        dict(id="US8", type="floor", direction="short", notional="25mm", tenor="5Y", index="OIS 3M", strike=3.00,
+             vol=95, model="normal"),
         dict(id="US9", type="swaption", direction="long", notional="20mm", expiry="1Y", tenor="10Y", option="payer",
              index="OIS"),
         dict(id="US10", type="swaption", direction="short", notional="20mm", expiry="2Y", tenor="5Y",
@@ -713,7 +723,8 @@ _EXAMPLES: Dict[str, Tuple[Dict[str, object], ...]] = {
     "GBP": (
         dict(id="GB1", type="swap", direction="receive", notional="50mm", tenor="5Y", index="OIS", rate=4.85),
         dict(id="GB2", type="swap", direction="pay", notional="25mm", tenor="2Y", index="OIS"),
-        dict(id="GB3", type="cap", direction="long", notional="20mm", tenor="3Y", index="3M", strike=5.00, vol=90),
+        dict(id="GB3", type="cap", direction="long", notional="20mm", tenor="3Y", index="OIS 3M", strike=5.00,
+             vol=90),
         dict(id="GB4", type="swaption", direction="long", notional="20mm", expiry="1Y", tenor="5Y",
              option="straddle", index="OIS", vol=85),
     ),
@@ -853,10 +864,12 @@ def _vol_units(model: str) -> float:
 
 
 def cap_terms(key: str, market: Market) -> Dict[str, object]:
-    """Schedule fields of a cap on ``key``: a term index (its calendar, day
-    count and fixing lag, projected on its curve) or ``"3M"``-style months
-    of a single-curve term rate on the swap curve's IRS float conventions,
-    as on the CAP-FLOOR tab."""
+    """Schedule fields of a cap on ``key``, as on the CAP-FLOOR tab: a term
+    index (its calendar, day count and fixing lag, projected on its curve),
+    ``"OIS 3M"``-style periods of the swap curve's overnight rate
+    compounded in arrears (its OIS day count, spot lag and payment lag), or
+    ``"3M"``-style months of a single-curve term rate on the swap curve's
+    IRS float conventions."""
 
     if key in INDICES:
         market.projection(key)
@@ -864,6 +877,10 @@ def cap_terms(key: str, market: Market) -> Dict[str, object]:
         return dict(index_months=ix.months, day_count=ix.day_count, calendar=ix.calendar, fixing_lag=ix.fixing_lag,
                     projection=ix.name)  # fmt: skip
     conv = market.curve.conventions
+    if key.startswith("OIS "):
+        return dict(index_months=int(key[4:-1]), day_count=conv.ois_day_count, calendar=conv.calendar,
+                    bdc=conv.bdc, fixing_lag=conv.spot_lag, payment_lag=conv.payment_lag,
+                    rate_type="compounded")  # fmt: skip
     return dict(index_months=int(key[:-1]), day_count=conv.irs_float_day_count, calendar=conv.calendar,
                 fixing_lag=conv.spot_lag)  # fmt: skip
 
@@ -1077,12 +1094,17 @@ def cap_normal_vegas(cf: CapFloor, market: Market) -> pd.DataFrame:
     price, so every option's vega is in one unit; a caplet worth under
     1e-12 of the notional has no such vol and a vega of 0)."""
 
+    if cf.kind == "collar":  # the long cap plus the short floor, each at its own strike and vol
+        cap = cap_normal_vegas(replace(cf, kind="cap", floor_strike=None), market)
+        floor = replace(cf, kind="floor", strike=cf.floor_strike, floor_strike=None, notional=-cf.notional)
+        return cap.assign(vega=cap["vega"] + cap_normal_vegas(floor, market)["vega"])
     table = cf.caplets(market)
     table = table[~table["fixed"]].reset_index(drop=True)
     if cf.model == "bachelier" or table.empty:
         return pd.DataFrame({"expiry": table["expiry"], "vega": table["vega"]})
     shift = cf.shift if cf.model == "shifted_black" else 0.0
-    F, T, vols = table["forward"].to_numpy(), table["expiry"].to_numpy(), table["vol"].to_numpy()
+    F, vols = table["forward"].to_numpy(), table["vol"].to_numpy()
+    T = table["variance_time"].to_numpy()  # the option time (Lyashenko-Mercurio for a compounded rate)
     K = np.full(F.size, cf.strike)
     normal = np.asarray(lognormal_to_normal_vol(F, K, T, vols, shift=shift), dtype=float)
     scale = cf.notional * table["tau"].to_numpy() * table["df"].to_numpy()
@@ -1092,7 +1114,7 @@ def cap_normal_vegas(cf: CapFloor, market: Market) -> pd.DataFrame:
         raise ValueError(f"no normal vol matches the {cf.model} price of the caplet fixing {table['fix'][bad].iloc[0]}")
     vega = np.array([0.0 if w else s * bachelier_vega(f, k, t, n) * 1e-4
                      for s, f, k, t, n, w in zip(scale, F, K, T, normal, worthless)])  # fmt: skip
-    return pd.DataFrame({"expiry": T, "vega": vega})
+    return pd.DataFrame({"expiry": table["expiry"].to_numpy(), "vega": vega})
 
 
 def _labels_years(labels: Sequence[str]) -> np.ndarray:
@@ -1284,8 +1306,10 @@ def extrapolation_notes(trades: Sequence[Trade], positions: Sequence[Position], 
     """Where the book is priced beyond its market data, as on the SWAP and
     SWAPTION tabs: a trade paying after the last quote of a curve it uses
     (forwards there are flat extrapolations, not market data), a
-    cube-priced swaption outside the cube's expiries or tenors and a cap on
-    stripped vols beyond the last stripped caplet (vols held flat)."""
+    cube-priced swaption outside the cube's expiries or tenors, a cap on
+    stripped vols beyond the last stripped caplet (vols held flat) and a cap
+    on a single-curve term rate (an approximation of the compounded
+    overnight-rate caps that trade)."""
 
     vols = vols or VolSet()
     notes: List[str] = []
@@ -1325,7 +1349,14 @@ def _trade_notes(trade: Trade, position: Position, market: Market, vols: VolSet)
             if outside:
                 notes.append(f"{trade.id} is outside the swaption cube ({cube.expiries[-1]} x {cube.tenors[-1]} "
                              "at most): its vol is held flat from the cube's edge")  # fmt: skip
-    elif source == "stripped":
+    if trade.type in ("cap", "floor") and not inst.compounded and inst.projection is None:
+        conv = market.curve.conventions
+        overnight = OVERNIGHT_NAMES.get(conv.currency, conv.name) if conv is not None else "the overnight rate"
+        notes.append(
+            f"{trade.id} is on a {inst.index_months}M term rate projected off the OIS curve: an approximation "
+            f"(caps in this currency trade on {overnight} compounded in arrears: index OIS {inst.index_months}M)"
+        )
+    if source == "stripped":
         stripped = vols.caplets.get(cap_key(trade))
         curve = (list(getattr(stripped, "curves", ())) or [stripped])[0] if stripped is not None else None
         live = inst.caplets(market)
