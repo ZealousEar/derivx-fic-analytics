@@ -30,6 +30,7 @@ import streamlit as st
 from derivx.data import rates_history as rh
 from derivx.rates import carry, rv
 from derivx.rates import pca as pca_mod
+from derivx.rates import portfolio as pf
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
 from derivx.risk import var as var_mod
@@ -1061,10 +1062,14 @@ def _render_var(
         vegas = _cached("vegas", key, lambda: position_vegas(positions, market))
     except ValueError:
         vegas = None
-    report = var_mod.risk_report(names, risk, table, vegas, [p.vol_model for p in positions], currencies)
+    try:
+        buckets = _cached("vega_buckets", key, lambda: [pf.position_vega_buckets(p, market) for p in positions])
+    except ValueError:
+        buckets = None
+    report = var_mod.risk_report(names, risk, table, vegas, [p.vol_model for p in positions], currencies, buckets)
     _download(
-        "Download risk report CSV (key-rate PV01, gamma, vega, VaR)", _csv(report), file_name="risk_report.csv",
-        key="rs_var_report_csv",
+        "Download risk report CSV (key-rate PV01, gamma, vega and vega buckets, VaR)", _csv(report),
+        file_name="risk_report.csv", key="rs_var_report_csv",
     )  # fmt: skip
     worst = var_mod.worst_days(scen, book, 10)
     names_by_column = {"pnl": f"BOOK P&L ({book_unit})", "date": "DATE", "from": "FROM"}
@@ -1106,7 +1111,10 @@ def _render_var(
         "first-order P&L, mean taken as zero. Vols are held (no free vol history); no carry over the day. Losses "
         "are positive numbers, in each row's currency (CCY): a TOTAL row adds the P&L of one currency's positions "
         "per scenario." + rates_fx.conversion_note(currencies, rep, market.asof) + " FX spots are held: no FX risk "
-        "(the store has no FX history)."
+        "(the store has no FX history). The risk report CSV holds the key-rate PV01s and gammas, each option's vega "
+        "and its vega by bucket (swaptions by option expiry x swap tenor: the SABR cube's ATM points for book "
+        "swaptions priced on the cube, the vega split between the nearest grid points otherwise; caps by caplet "
+        "expiry) and the VaR table."
     )
 
 

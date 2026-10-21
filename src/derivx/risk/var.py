@@ -502,14 +502,22 @@ def risk_report(
     vegas: Optional[Sequence[float]] = None,
     vol_models: Optional[Sequence[Optional[str]]] = None,
     currencies: Optional[Sequence[str]] = None,
+    vega_buckets: Optional[Sequence[Sequence[Mapping[str, object]]]] = None,
 ) -> pd.DataFrame:
     """One long table of the book's risk, for export: ``section``
-    (``pv01``, ``gamma``, ``vega``, ``var``), ``position``, ``curve``,
-    ``item`` (quote label or measure), ``value``, ``unit`` and ``currency``
-    (of ``value``; ``currencies`` gives each position's). PV01 is P&L per
-    +1bp of one curve quote, gamma per (1bp)^2, vega per +1bp normal vol or
-    +1 lognormal vol point (the vol shift the position's model takes). The
-    VaR rows are ``var_table``'s columns, in the currency of their row."""
+    (``pv01``, ``gamma``, ``vega``, ``vega_bucket``, ``var``), ``position``,
+    ``curve``, ``item`` (quote label, bucket or measure), ``value``,
+    ``unit`` and ``currency`` (of ``value``; ``currencies`` gives each
+    position's). PV01 is P&L per +1bp of one curve quote, gamma per
+    (1bp)^2, vega per +1bp normal vol or +1 lognormal vol point (the vol
+    shift the position's model takes). ``vega_buckets`` (per position, rows
+    of ``expiry``, ``bucket``, ``vega``, ``method`` as
+    :func:`derivx.rates.portfolio.position_vega_buckets` gives them) adds
+    one ``vega_bucket`` row per bucket, P&L per +1bp normal vol: item
+    ``"<option expiry> x <swap tenor>"`` for a swaption, ``"<caplet expiry>
+    x CAP <index>"`` for a cap, and a ``TOTAL`` row per currency and bucket
+    (``TOTAL <CCY>`` for a book in several). The VaR rows are
+    ``var_table``'s columns, in the currency of their row."""
 
     ccys = list(currencies) if currencies is not None else [""] * len(names)
     if len(ccys) != len(names):
@@ -531,6 +539,26 @@ def risk_report(
             unit = "P&L per +1bp normal vol" if model == "normal" else "P&L per +1 lognormal vol point"
             rows.append({"section": "vega", "position": name, "curve": "", "item": f"{model} vol",
                          "value": float(vega), "unit": unit, "currency": ccy})  # fmt: skip
+    if vega_buckets is not None:
+        if len(vega_buckets) != len(names):
+            raise ValueError(f"{len(names)} positions but vega buckets for {len(vega_buckets)}")
+        totals: Dict[Tuple[str, str], float] = {}
+        order: List[Tuple[str, str]] = []
+        for name, buckets, ccy in zip(names, vega_buckets, ccys):
+            for b in buckets:
+                item = f"{b['expiry']} x {b['bucket']}"
+                rows.append({"section": "vega_bucket", "position": name, "curve": "", "item": item,
+                             "value": float(b["vega"]), "unit": f"P&L per +1bp normal vol ({b['method']})",
+                             "currency": ccy})  # fmt: skip
+                if (ccy, item) not in totals:
+                    order.append((ccy, item))
+                    totals[(ccy, item)] = 0.0
+                totals[(ccy, item)] += float(b["vega"])
+        groups = ordered([c for c, _ in order])
+        for ccy, item in order:
+            rows.append({"section": "vega_bucket", "position": total_label(ccy, len(groups) > 1), "curve": "",
+                         "item": item, "value": totals[(ccy, item)], "unit": "P&L per +1bp normal vol",
+                         "currency": ccy})  # fmt: skip
     by_position = dict(zip(names, ccys))
     for _, row in table.iterrows():
         ccy = str(row["currency"]) if "currency" in row.index else by_position.get(str(row["position"]), "")

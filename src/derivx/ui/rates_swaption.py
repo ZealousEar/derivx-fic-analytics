@@ -721,4 +721,10 @@ def render(market: Market) -> List[Position]:
          "atm_interpolation": "variance-time in expiry, linear in tenor", "greeks": "analytic in the trade's model"},
         key="swn_export",
     )  # fmt: skip
-    return [swaption_position(trade, market)]
+    position = swaption_position(trade, market)
+    if buckets is not None:  # the RESEARCH risk report reads them: vega by the cube's ATM points
+        position.details["vega_buckets"] = tuple(
+            {"expiry": e, "bucket": t, "vega": float(buckets[i, j]), "method": "cube"}
+            for i, e in enumerate(cube.expiries) for j, t in enumerate(cube.tenors) if buckets[i, j] != 0.0
+        )  # fmt: skip
+    return [position]

@@ -321,6 +321,46 @@ def test_vega_and_vega_buckets():
     assert list(matrix.index) == list(vols.cubes["OIS"].expiries) and list(matrix.columns)[-1] == "CAP OIS 3M"
 
 
+def test_any_option_position_has_vega_buckets():
+    """Review finding (R4, A2): the RESEARCH risk report needs vega by bucket
+    for every option position, not only the BOOK's: the book's trades carry
+    their own rows (cube buckets for cube-priced swaptions), any other
+    swaption or cap gets its vega split on the standard grid."""
+
+    market, _, _, risk = _usd()
+    for trade, position in zip(risk.trades, risk.positions):
+        rows = pf.position_vega_buckets(position, market)
+        mine = risk.vega_buckets[risk.vega_buckets["id"] == trade.id]
+        assert [(r["expiry"], r["bucket"], r["vega"], r["method"]) for r in rows] == list(
+            mine[["expiry", "bucket", "vega", "method"]].itertuples(index=False, name=None)
+        )
+    from derivx.rates.capfloor import capfloor_position
+    from derivx.rates.swaptions import swaption_position
+
+    off_grid = Swaption(1e7, "18M", "7Y", 0.036, "receiver", 0.0090).pinned(market)
+    position = swaption_position(off_grid, market)
+    rows = pf.position_vega_buckets(position, market)
+    vega = off_grid.greeks(market)["vega_normal_bp"]
+    assert {(r["expiry"], r["bucket"]) for r in rows} == {("1Y", "5Y"), ("1Y", "10Y"), ("2Y", "5Y"), ("2Y", "10Y")}
+    assert sum(r["vega"] for r in rows) == pytest.approx(vega, rel=1e-12) and {r["method"] for r in rows} == {
+        "allocated"
+    }
+    tenor = {t: sum(r["vega"] for r in rows if r["bucket"] == t) for t in ("5Y", "10Y")}
+    assert tenor["5Y"] / vega == pytest.approx(0.6, rel=1e-12)  # 7Y is 40% of the way from 5Y to 10Y
+    cap = CapFloor(1e7, "floor", 0.03, "4Y", 0.0088, calendar="USD").pinned(market.asof)
+    rows = pf.position_vega_buckets(capfloor_position(cap, asof=market.asof), market)
+    assert {r["bucket"] for r in rows} == {"CAP 3M"} and sum(r["vega"] for r in rows) == pytest.approx(
+        pf.cap_normal_vegas(cap, market)["vega"].sum(), rel=1e-12
+    )
+    assert pf.position_vega_buckets(risk.positions[0], market) == []  # a swap has no vega
+    report = var_mod.risk_report(["SWN", "CAP"], {}, pd.DataFrame(columns=["position"]), currencies=["USD", "USD"],
+                                 vega_buckets=[pf.position_vega_buckets(position, market), rows])  # fmt: skip
+    totals = report[(report["section"] == "vega_bucket") & (report["position"] == "TOTAL")]
+    assert totals["value"].sum() == pytest.approx(vega + sum(r["vega"] for r in rows), rel=1e-12)
+    with pytest.raises(ValueError, match="vega buckets for 1"):
+        var_mod.risk_report(["A", "B"], {}, pd.DataFrame(columns=["position"]), vega_buckets=[[]])
+
+
 def test_flat_vol_and_black_vegas_are_in_normal_bp():
     market, _, _, _ = _usd()
     rows = [
