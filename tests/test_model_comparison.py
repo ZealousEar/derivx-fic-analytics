@@ -36,8 +36,15 @@ def test_compare_models_returns_results():
     chain = _chain(dt.date(2024, 1, 2))
     results = compare_models(chain)
     assert set(results["model"]) == {"svi", "sabr", "spline"}
-    assert (results["rmse"] >= 0).all()
     assert np.isfinite(results["rmse_cv"]).all()
+    t = results.set_index("model")
+    # the quotes are exact SVI vols: SVI fits and predicts held-out strikes exactly, SABR (another
+    # family) misses by a fraction of a vol bp, and the spline interpolates its knots but not the gaps
+    assert t.loc["svi", "rmse_bp"] < 1e-3 and t.loc["svi", "rmse_cv_bp"] < 1e-3
+    assert 1e-3 < t.loc["sabr", "rmse_bp"] < 1.0
+    assert t.loc["spline", "rmse_bp"] == 0.0 and t.loc["spline", "rmse_cv_bp"] > 1e-2
+    assert t.loc["svi", "rmse_cv_bp"] < t.loc["spline", "rmse_cv_bp"]
+    assert (t["n_points"] == len(chain)).all()
 
 
 def _slice(days=30, **kw):

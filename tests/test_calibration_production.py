@@ -49,8 +49,28 @@ def test_calibrate_with_constraints_recovers_params():
     assert len(results) == 1
     result = results[0]
     assert result.n_points == len(chain)
-    assert result.rmse < 0.01
+    assert result.tau == pytest.approx(30 / 365) and result.forward == pytest.approx(100.0)
+    assert result.rmse < 0.0005  # the 5 vol bp quote noise (was < 100 bp)
     assert "condition_number" in result.diagnostics
+    # the fitted smile is the true one to within the noise (single-slice SVI parameters themselves are not
+    # identified that precisely; the exact-quote test below checks them)
+    err = result.iv(chain["strike"].to_numpy()) - _true_vols(chain)
+    assert np.sqrt(np.mean(err**2)) < 0.0005 and np.abs(err).max() < 0.001
+
+
+def _true_vols(chain: pd.DataFrame) -> np.ndarray:
+    return svi_iv(chain["strike"].to_numpy(), {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "s": 0.4}, F=100.0, T=1.0)
+
+
+def test_exact_quotes_recover_total_variance_parameters_at_the_slice_maturity():
+    chain = _synthetic_chain(dt.date(2024, 1, 2))
+    chain["implied_vol"] = _true_vols(chain)
+    result = calibrate_with_constraints(chain, enforce_arbitrage=False, hygiene={"recompute_iv": False})[0]
+    tau = 30 / 365  # the helper's params are total variance at T = 1, so a and b scale by tau
+    expected = {"a": 0.02 * tau, "b": 0.3 * tau, "rho": -0.2, "m": 0.0, "sigma": 0.4}
+    for name, value in expected.items():
+        assert result.params[name] == pytest.approx(value, abs=1e-6), name
+    assert result.rmse < 1e-8
 
 
 def test_benchmark_vs_baseline_reports_metrics():
@@ -59,8 +79,22 @@ def test_benchmark_vs_baseline_reports_metrics():
     result = calibrate_with_constraints(chain, enforce_arbitrage=False, hygiene={"recompute_iv": False})[0]
     metrics = benchmark_vs_baseline(result, chain)
     assert {"rmse_svi_in_sample", "rmse_svi_cv", "rmse_spline_cv", "relative_improvement"} <= set(metrics)
-    assert metrics["rmse_svi_cv"] >= 0 and metrics["rmse_spline_cv"] > 0
-    assert np.isfinite(metrics["relative_improvement"])
+    assert metrics["rmse_svi_in_sample"] == result.rmse and metrics["n_scored"] == len(chain) - 2  # no end points
+    assert metrics["relative_improvement"] == pytest.approx(1 - metrics["rmse_svi_cv"] / metrics["rmse_spline_cv"])
+    # held-out errors exceed the in-sample fit and are of the order of the 5 vol bp quote noise
+    assert metrics["rmse_svi_cv"] > metrics["rmse_svi_in_sample"]
+    for key in ("rmse_svi_cv", "rmse_spline_cv"):
+        assert 0.0001 < metrics[key] < 0.001, key
+
+
+def test_on_exact_svi_quotes_svi_predicts_held_out_strikes_and_the_spline_does_not():
+    chain = _synthetic_chain(dt.date(2024, 1, 2))
+    chain["implied_vol"] = _true_vols(chain)
+    result = calibrate_with_constraints(chain, enforce_arbitrage=False, hygiene={"recompute_iv": False})[0]
+    metrics = benchmark_vs_baseline(result)
+    assert metrics["rmse_svi_cv"] < 1e-8  # the model is right, so unseen strikes are predicted exactly
+    assert metrics["rmse_spline_cv"] > 5e-5  # the spline interpolates across each held-out strike with error
+    assert metrics["relative_improvement"] > 0.999
 
 
 @pytest.fixture(scope="module")

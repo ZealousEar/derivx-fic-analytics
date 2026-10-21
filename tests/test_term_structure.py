@@ -46,6 +46,14 @@ def test_calibrate_surface_builds_model():
     assert isinstance(surface, SurfaceModel)
     assert len(surface.slices) == 2
     assert surface.calendar_violations == 0
+    # exact SVI quotes: each slice reproduces them, on the stated forward and ACT/365F year fraction
+    for slc, days in zip(surface.slices, (30, 59)):
+        quotes = chains[pd.Timestamp(slc.expiry)]
+        assert slc.tau == pytest.approx(days / 365.0) and slc.forward == pytest.approx(100.0)
+        np.testing.assert_allclose(slc.iv(quotes["strike"].to_numpy()), quotes["implied_vol"], atol=1e-7)
+        np.testing.assert_allclose(
+            surface.implied_vol(quotes["strike"].to_numpy(), slc.tau), quotes["implied_vol"], atol=1e-7
+        )
 
 
 def test_compute_cross_greeks_returns_rows():
@@ -54,7 +62,16 @@ def test_compute_cross_greeks_returns_rows():
     surface = calibrate_surface(chains)
     greeks = compute_cross_greeks(surface, strikes=[95, 100, 105])
     assert {"vega", "volga", "vanna"}.issubset(greeks.columns)
-    assert len(greeks) > 0
+    assert greeks["strike"].tolist() == [95.0, 100.0, 105.0]
+    # Black-76 at the smile vol of each strike (the quotes were exact SVI vols), no discounting at rate 0
+    true_vols = svi_iv(
+        np.array([95.0, 100.0, 105.0]), {"a": 0.02, "b": 0.28, "rho": -0.2, "m": 0.0, "s": 0.4}, 100.0, 1.0
+    )
+    np.testing.assert_allclose(greeks["vol"], true_vols, atol=1e-7)
+    ref = black76_cross_greeks(100.0, greeks["strike"].to_numpy(), 30 / 365.0, greeks["vol"].to_numpy(), 1.0)
+    for name in ("delta", "vega", "volga", "vanna", "charm"):
+        np.testing.assert_allclose(greeks[name], ref[name], rtol=1e-12, atol=1e-12)
+    assert greeks["vega"].idxmax() == 1  # vega peaks at the money
 
 
 def _price(F, K, T, vol, r):
