@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -316,6 +318,41 @@ def _csv_bytes(chain: pd.DataFrame, compress: bool = False) -> bytes:
 
     data = chain_to_csv(chain)
     return gzip.compress(data, mtime=0) if compress else data
+
+
+class _ResultStore:
+    """A small thread-safe LRU of results keyed by the fingerprint of their
+    data and settings, shared by the sessions of this server (see
+    :func:`_calibration_store`). Stored results are read, never mutated."""
+
+    def __init__(self, max_entries: int) -> None:
+        self._items: "OrderedDict[str, Any]" = OrderedDict()
+        self._max = int(max_entries)
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Any:
+        with self._lock:
+            if key not in self._items:
+                return None
+            self._items.move_to_end(key)
+            return self._items[key]
+
+    def put(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._max:
+                self._items.popitem(last=False)
+
+
+@st.cache_resource(show_spinner=False)
+def _calibration_store() -> _ResultStore:
+    """Calibrations by fingerprint of (data, filters, discounting, settings):
+    pressing Calibrate again with inputs already calibrated, in this session
+    or another, shows the stored result at once. st.cache_data cannot hold
+    these runs because they draw a progress bar while they compute."""
+
+    return _ResultStore(max_entries=16)
 
 
 @st.cache_data(max_entries=8, show_spinner=False)
@@ -849,8 +886,17 @@ def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
     }
     settings_key = _key(settings)
     if st.button("Calibrate selected expiries", key="lab_cal_run", width="stretch", disabled=not sel):
-        subset = chain[pd.to_datetime(chain["expiry"]).dt.normalize().isin(set(sel))]
-        with st.spinner(f"Calibrating {len(sel)} SVI slice(s)..."):
+        cache_key = _key(ctx["data_key"], settings_key)
+        store = _calibration_store()
+        result = store.get(cache_key)
+        if result is None:
+            subset = chain[pd.to_datetime(chain["expiry"]).dt.normalize().isin(set(sel))]
+            bar = st.progress(0.0, text=f"Calibrating {len(sel)} SVI slice(s)...")
+
+            def show(done: int, total: int, label: str) -> None:
+                text = "Calibration done." if done >= total else f"Calibrating {label} ({done + 1} of {total})..."
+                bar.progress(min(done / max(total, 1), 1.0), text=text)
+
             result = calibrate_chain(
                 subset,
                 enforce_arbitrage=enforce,
@@ -859,7 +905,10 @@ def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
                 discount=ctx["discount"],
                 min_days=MIN_FIT_DAYS,
                 cv_folds=5,
+                progress=show,
             )
+            bar.empty()
+            store.put(cache_key, result)
         st.session_state[K_CAL] = {
             "data_key": ctx["data_key"],
             "settings_key": settings_key,

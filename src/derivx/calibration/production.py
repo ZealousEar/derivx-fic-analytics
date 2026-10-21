@@ -38,7 +38,7 @@ ACT/365F years; SVI parameters are total-variance parameters for ``tau``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -263,6 +263,7 @@ def calibrate_chain(
     cv_folds: int = 5,
     hygiene: Optional[Dict[str, object]] = None,
     discount: Optional[Discounting] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> ChainCalibration:
     """Calibrate SVI to every (trade_date, expiry) slice of ``chain``.
 
@@ -276,7 +277,9 @@ def calibrate_chain(
     ``min_points`` must exceed the 5 SVI parameters. ``hygiene`` passes
     extra keyword arguments to :func:`clean_option_slice` (e.g.
     ``{"max_stale_days": None}``). ``cv_folds=0`` skips the out-of-sample
-    benchmark."""
+    benchmark. ``progress(done, total, label)``, when given, is called
+    before each slice is fitted (``label``: its expiry, ISO date) and once
+    at the end with ``done == total``, for a progress bar on long runs."""
 
     if min_points <= SVI_N_PARAMS:
         raise ValueError(
@@ -300,7 +303,9 @@ def calibrate_chain(
         hygiene=hygiene,
         discount=discount,
     )
-    for td, exp, group, clean in cleaned:
+    for done, (td, exp, group, clean) in enumerate(cleaned):
+        if progress is not None:
+            progress(done, len(cleaned), f"{exp.date()}")
         if clean.days < min_days:
             skipped.append(SkippedSlice(td, exp, f"expired or same-day (tau = {clean.tau:.4f}y)", len(group)))
             continue
@@ -398,6 +403,8 @@ def calibrate_chain(
             check = check_calendar([(prev.tau, prev.params), (nxt.tau, nxt.params)], np.linspace(lo, hi, 401))[0]
             nxt.diagnostics.update(check.as_dict())
             calendar_rows.append({"trade_date": td, "expiry_1": prev.expiry, "expiry_2": nxt.expiry, **check.as_dict()})
+    if progress is not None:
+        progress(len(cleaned), len(cleaned), "done")
     return ChainCalibration(slices, skipped, pd.DataFrame(calendar_rows))
 
 

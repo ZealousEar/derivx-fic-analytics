@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 from derivx.ui import (
@@ -29,43 +31,52 @@ choice = st.sidebar.radio(
     ["[ EQUITY ]", "[ FX ]", "[ RATES ]", "[ ANALYTICS ]"],
     format_func=lambda x: x,
     label_visibility="collapsed",
+    key="app_mode",
 )
 mode = (choice or "").replace("[", "").replace("]", "").strip()  # Extract mode name (a radio always has one)
 
 apply_app_style()
 
-if mode == "EQUITY":
-    pricer_page.render(mode)
-elif mode == "FX":
-    fx_page.render()
-elif mode == "RATES":
-    st.markdown("## / INTEREST RATES")
-    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ BOOK", "/ SCENARIOS", "/ RESEARCH"])
-    with tabs[0]:
-        market = rates_curve.render()
-    if market is None:
-        for tab in tabs[1:]:
-            with tab:
-                st.info("Fix the quotes on the CURVE tab to price instruments.")
-    else:
-        tab_trades = []
-        with tabs[1]:
-            tab_trades += rates_swap.render(market)
-        with tabs[2]:
-            tab_trades += rates_swaption.render(market)
-        with tabs[3]:
-            tab_trades += rates_capfloor.render(market)
-        with tabs[4]:
-            tab_trades += rates_bonds.render(market)
-        with tabs[5]:
-            book = rates_book.render(market)
-        positions, scope = rates_book.risk_scope(book, tab_trades)  # one position set for SCENARIOS and RESEARCH
-        with tabs[6]:
-            rates_scenarios.render(market, positions, scope)
-        with tabs[7]:
-            rates_research.render(market, positions, scope)
-elif mode == "ANALYTICS":
-    analytics_lab.render()
-
-keep_widget_values()  # widget values of the modes not drawn this run survive the switch (UIE-04)
-mount_zoom_guard()
+try:
+    if mode == "EQUITY":
+        pricer_page.render(mode)
+    elif mode == "FX":
+        fx_page.render()
+    elif mode == "RATES":
+        st.markdown("## / INTEREST RATES")
+        tabs = st.tabs(
+            ["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ BOOK", "/ SCENARIOS", "/ RESEARCH"]
+        )
+        with tabs[0]:
+            market = rates_curve.render()
+        if market is None:
+            for tab in tabs[1:]:
+                with tab:
+                    st.info("Fix the quotes on the CURVE tab to price instruments.")
+        else:
+            tab_trades = []
+            with tabs[1]:
+                tab_trades += rates_swap.render(market)
+            with tabs[2]:
+                tab_trades += rates_swaption.render(market)
+            with tabs[3]:
+                tab_trades += rates_capfloor.render(market)
+            with tabs[4]:
+                tab_trades += rates_bonds.render(market)
+            with tabs[5]:
+                book = rates_book.render(market)
+            positions, scope = rates_book.risk_scope(book, tab_trades)  # one position set for SCENARIOS and RESEARCH
+            with tabs[6]:
+                rates_scenarios.render(market, positions, scope)
+            with tabs[7]:
+                rates_research.render(market, positions, scope)
+    elif mode == "ANALYTICS":
+        analytics_lab.render()
+finally:
+    # Even when a page raises (Streamlit still shows its error), the other modes' widget values are kept
+    # (UIE-04, B2); a failure in the helper itself must not hide the page's error, so it only logs.
+    try:
+        keep_widget_values()
+    except Exception:  # noqa: BLE001 - defensive: never mask the page's own exception
+        logging.getLogger(__name__).exception("keep_widget_values failed")
+    mount_zoom_guard()

@@ -726,13 +726,15 @@ def _market_smile(spec: ModeSpec, inp: calc.Inputs, chain: pd.DataFrame) -> None
     _finish_smile(spec, fig, grid, np.r_[model, sl.observed_ivs])
     d = sl.diagnostics
     vols = "re-inverted from bid/ask mids" if clean.iv_source == "mid" else "as quoted"
+    # With the lab's discounting every expiry is discounted as there (Treasury curve, parity, or the lab's own flat
+    # rate, also its fallback where no curve exists); RATE.R is used only for a chain published without one.
     st.caption(
         f"T = {sl.tau:.4f}y ({clean.days} days ACT/365F), spot {calc.fmt_sig(clean.spot, 6)}, forward "
         f"{calc.fmt_sig(sl.forward, 6)} ({d.get('forward_source')}), vols {vols} "
         + (
             f"discounted as on the ANALYTICS lab: {d.get('discount_method')} DF {clean.discount_factor:.6f} = "
             f"{clean.rate:.3%} cc ({d.get('discount_source')}). "
-            if clean.discount_method != "rate"
+            if discount is not None
             else f"with r = RATE.R = {inp.r:.2%}. "
         )
         + f"SVI fit RMSE {fit.rmse_bp:.1f} vol bp (max {fit.max_abs_error_bp:.1f}) over "

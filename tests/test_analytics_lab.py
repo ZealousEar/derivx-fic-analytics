@@ -364,6 +364,24 @@ def test_the_equity_page_gets_standard_tenors_of_the_active_chain_with_provenanc
     )
 
 
+def test_the_equity_market_smile_says_which_rate_it_was_discounted_at():
+    """B5: with the lab on a flat rate (its own input, also the fallback where no
+    Treasury curve exists) the EQUITY caption claimed 'r = RATE.R', the pricer's
+    unrelated rate input, while the vols were re-inverted at the lab's rate."""
+
+    at = _lab()
+    at.selectbox(key="lab_discount").set_value("rate").run()
+    at.number_input(key="lab_rate").set_value(0.5).run()
+    assert at.session_state["market_chain_discount"].describe()["mode"] == "rate"
+    at.sidebar.radio[0].set_value("[ EQUITY ]").run()
+    at.number_input(key="eq_r").set_value(0.07).run()
+    at.radio(key="eq_smile_src").set_value("MARKET").run()
+    assert not at.exception
+    caption = " ".join(c.value for c in at.caption)
+    assert "discounted as on the ANALYTICS lab: rate DF" in caption and "= 0.500% cc" in caption
+    assert "RATE.R" not in caption
+
+
 def test_a_file_with_only_the_required_columns_never_crashes_the_lab():
     """volume is optional in the schema: the default min volume filter used to
     raise a ValueError traceback (with server paths) on such a file."""
