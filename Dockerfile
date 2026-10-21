@@ -64,8 +64,10 @@ ENV STREAMLIT_SERVER_PORT=8501 \
 
 EXPOSE 8501
 
-# Healthy only when Streamlit answers 200 on its health endpoint.
+# Healthy only when Streamlit answers 200 on its health endpoint. The opener
+# ignores HTTP(S)_PROXY, which a host may pass in for outbound data requests:
+# a proxy cannot reach the container's own 127.0.0.1.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/_stcore/health' % os.environ.get('STREAMLIT_SERVER_PORT', '8501'), timeout=4)"]
+    CMD ["python", "-c", "import os, urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:%s/_stcore/health' % os.environ.get('STREAMLIT_SERVER_PORT', '8501'), timeout=4)"]
 
 CMD ["streamlit", "run", "src/derivx/ui/streamlit_app.py"]

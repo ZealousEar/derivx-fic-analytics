@@ -7,7 +7,7 @@ pandas>=2.1,<3
 pyarrow>=14
 plotly>=5.22,<8
 streamlit>=1.59,<2
-yfinance>=0.2.66,<0.3
+yfinance>=0.2.66,<2
 # The derivx package itself, editable so that it reads its bundled sample data
 # from data/examples next to src/ (Streamlit Community Cloud installs this file
 # from the repository root and runs src/derivx/ui/streamlit_app.py).
