@@ -21,7 +21,7 @@ class ZeroCurve:
         return np.interp(ts, self.ts, self.dfs)
 
     def fwd_rate(self, t1: float, t2: float) -> float:
-        t1 = float(t1); t2 = float(t2)
+        t1, t2 = float(t1), float(t2)
         if t2 <= t1:
             return 0.0
         df1 = self.discount(t1)
@@ -51,8 +51,9 @@ def build_zero_curve(
     from .curves import bootstrap
     from .quotes import clean_quotes
 
+    overnight = ("ON", "O/N", "TN", "T/N", "SN", "S/N")
     rows = [
-        {"kind": "DEPO" if str(t).strip().upper() in ("ON", "O/N", "TN", "T/N", "SN", "S/N") else "OIS", "tenor": t, "rate": r}
+        {"kind": "DEPO" if str(t).strip().upper() in overnight else "OIS", "tenor": t, "rate": r}
         for t, r in quotes.items()
     ]
     clean, issues, _ = clean_quotes(rows)
