@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -419,6 +419,28 @@ def fx_library(currencies: Sequence[str], reporting: str, pct: float = 10.0) -> 
         return []
     pairs = [f"{c}USD" for c in ordered(list(currencies) + [reporting]) if c != "USD"]
     return [fx_spot({pair: sign * pct}) for pair in pairs for sign in (1.0, -1.0)]
+
+
+def add_fx(shock: Shock, moves: Mapping[str, float]) -> Shock:
+    """``shock`` with the FX moves ``moves`` (``{"EURUSD": 2}``, % of each
+    spot against the dollar) added to its own: % moves of the same pair add
+    (EURUSD +10% and +2% make EURUSD +12%), the other pairs keep their
+    moves. The name and description say what was added (``Parallel +10bp
+    + FX EURUSD +2%``), so a scenario's label always states its FX moves.
+    Zero moves change nothing (``shock`` is returned as it is); a total move
+    of -100% or less raises ``ValueError``."""
+
+    extra = tuple((pair, pct) for pair, pct in _clean_fx(moves) if pct != 0.0)
+    if not extra:
+        return shock
+    total = dict(shock.fx)
+    for pair, pct in extra:
+        total[pair] = total.get(pair, 0.0) + pct
+    text = ", ".join(f"{p} {m:+g}%" for p, m in extra)
+    note = f"FX {text} added" + (f" (FX moves now {', '.join(f'{p} {m:+g}%' for p, m in _clean_fx(total))})"
+                                 if shock.fx else "")  # fmt: skip
+    description = f"{shock.description}; {note}" if shock.description else note
+    return replace(shock, name=f"{shock.name} + FX {text}", description=description, fx=tuple(total.items()))
 
 
 def ibor_ois_basis(bp: float, indices: Optional[Sequence[str]] = None, **settings) -> Shock:

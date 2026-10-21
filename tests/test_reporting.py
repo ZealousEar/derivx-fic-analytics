@@ -412,3 +412,50 @@ def test_cli_scenario_with_fx_shocks_on_a_eur_usd_gbp_book(mixed, tmp_path, caps
     assert (trades["pnl"] == 0.0).all()
     assert cli.main(["scenario", "--trades", str(mixed), "--asof", "2026-10-19", "--shock", "fx:USDJPY=+3"]) == 2
     assert "write EURUSD=+10" in capsys.readouterr().err
+
+
+def test_cli_fx_move_adds_to_every_shock_and_names_itself(mixed, tmp_path, capsys):
+    """Follow-up review: ``--fx-move EURUSD=+2`` replaced an ``fx:`` shock's
+    moves (EURUSD +10%, GBPUSD -5% became EURUSD +2% alone) while its row
+    kept the old label, and no row said that the rates shocks moved FX too.
+    The moves now add (EURUSD +12%, GBPUSD -5%) and every label names them."""
+
+    grid = tmp_path / "grid.csv"
+    code = cli.main(["scenario", "--trades", str(mixed), "--asof", "2026-10-19", "--conventions", "all",
+                     "--illustrative-vols", "--shock", "parallel:+25", "--shock", "fx:EURUSD=+10,GBPUSD=-5",
+                     "--fx-move", "EURUSD=+2", "--fx", "EURUSD=1.10,GBPUSD=1.25", "--out", str(grid)])  # fmt: skip
+    assert code == 0
+    table = pd.read_csv(grid).set_index("scenario")
+    assert list(table.index) == ["Parallel +25bp + FX EURUSD +2%", "FX EURUSD +10%, GBPUSD -5% + FX EURUSD +2%"]
+    rates, fx = table.iloc[0], table.iloc[1]
+    assert (fx[[c for c in table.columns if not c.startswith(("TOTAL", "ALL IN"))]] == 0.0).all()
+    # The FX row has no local P&L: its ALL IN USD is the translation of the book's value at EURUSD +12%, GBPUSD -5%
+    risk = tmp_path / "risk.csv"
+    assert cli.main(["risk", "--trades", str(mixed), "--asof", "2026-10-19", "--conventions", "all",
+                     "--illustrative-vols", "--fx", "EURUSD=1.10,GBPUSD=1.25", "--out", str(risk)]) == 0  # fmt: skip
+    pv = pd.read_csv(risk).query("section == 'pv'").set_index("id")["value"]
+    translation = pv["TOTAL EUR"] * 1.10 * 0.12 + pv["TOTAL GBP"] * 1.25 * -0.05
+    assert fx["ALL IN USD"] == pytest.approx(translation, rel=1e-9)
+    after = {c: pv[f"TOTAL {c}"] + rates[f"TOTAL {c}"] for c in ("EUR", "GBP")}
+    assert rates["ALL IN USD"] == pytest.approx(
+        rates["TOTAL USD"] + 1.10 * rates["TOTAL EUR"] + 1.25 * rates["TOTAL GBP"] + after["EUR"] * 1.10 * 0.02,
+        rel=1e-9,
+    )
+    capsys.readouterr()
+    assert cli.main(["scenario", "--trades", str(mixed), "--asof", "2026-10-19", "--conventions", "all",
+                     "--illustrative-vols", "--shock", "fx:EURUSD=-60", "--fx-move", "EURUSD=-50"]) == 2  # fmt: skip
+    assert "above -100%" in capsys.readouterr().err
+
+
+def test_add_fx_adds_moves_and_leaves_a_shock_without_them_alone():
+    from derivx.risk.scenarios import add_fx
+
+    shock = fx_spot({"EURUSD": 10.0, "GBPUSD": -5.0})
+    moved = add_fx(shock, {"EURUSD": 2.0, "GBPUSD": 0.0})
+    assert moved.fx == (("EURUSD", 12.0), ("GBPUSD", -5.0))
+    assert moved.name == "FX EURUSD +10%, GBPUSD -5% + FX EURUSD +2%" and "EURUSD +12%" in moved.description
+    rates = add_fx(parallel(25.0), {"GBPUSD": -3.0})
+    assert rates.fx == (("GBPUSD", -3.0),) and rates.profile == parallel(25.0).profile and rates.moves_local
+    assert add_fx(shock, {}) is shock and add_fx(shock, {"EURUSD": 0.0}) is shock
+    with pytest.raises(ValueError, match="above -100%"):
+        add_fx(fx_spot({"EURUSD": -60.0}), {"EURUSD": -50.0})
