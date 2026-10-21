@@ -313,7 +313,9 @@ def test_fras_match_quantlib(data):
         fra = ForwardRateAgreement(index, rate, months_to_start=months, notional=NOTIONAL, pay_fixed=pay_fixed)
         assert fra.value_date(market.asof).isoformat() == case["value_date"]
         assert fra.forward(market) == pytest.approx(case["forward"], rel=REL)
-        assert fra.settlement(market) == pytest.approx(case["amount"], rel=REL)
+        # A money amount on a 10mm notional, (F - K) x tau / (1 + F tau): with F close to K the relative error
+        # of F is amplified, so like the PV below it gets an absolute floor (numpy 2.4 lands 2e-9 away).
+        assert fra.settlement(market) == pytest.approx(case["amount"], rel=REL, abs=1e-8)
         assert fra.pv(market) == pytest.approx(case["npv"], rel=REL, abs=1e-8)
 
 

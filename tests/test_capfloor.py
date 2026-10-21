@@ -732,6 +732,9 @@ def test_a_forward_start_trade_strips_the_spot_start_cap_quotes():
     assert by_quote.sum() == pytest.approx(total, rel=0.02)
 
 
+# The patch is undone after every run: AppTest runs scripts in the test process, so a module attribute left
+# patched leaks into every later test (final review: under numpy 2 the quote was written as np.float64(...),
+# a NameError here that then broke the BOOK and multi-curve UI tests that ran after this file).
 EDGE_APP = """
 import streamlit as st
 import derivx.ui.rates_capfloor as cap
@@ -742,12 +745,15 @@ _base = cap.illustrative_cap_atm
 
 def _edge(currency):
     table = _base(currency)
-    table.loc[table.index[-1], "vol_bp"] = {vol_bp!r}
+    table.loc[table.index[-1], "vol_bp"] = {vol_bp:.4f}
     return table
 
 
 cap.illustrative_cap_atm = _edge
-st.session_state["cap_test_positions"] = cap.render(example_market())
+try:
+    st.session_state["cap_test_positions"] = cap.render(example_market())
+finally:
+    cap.illustrative_cap_atm = _base
 """
 
 
@@ -774,7 +780,7 @@ def test_quote_vegas_at_the_stripping_limit_do_not_break_the_tab():
     for _ in range(40):
         mid = 0.5 * (lo + hi)
         lo, hi = (lo, mid) if strips(mid) else (mid, hi)
-    at = AppTest.from_string(EDGE_APP.format(vol_bp=round((hi + 0.4e-4) * 1e4, 4)), default_timeout=120)
+    at = AppTest.from_string(EDGE_APP.format(vol_bp=float((hi + 0.4e-4) * 1e4)), default_timeout=120)
     at.run()
     _set(at, "cap_vol_mode", "Stripped from cap quotes")
     _set(at, "cap_tenor", "30Y")
@@ -784,6 +790,9 @@ def test_quote_vegas_at_the_stripping_limit_do_not_break_the_tab():
     vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
     assert vegas.set_index("QUOTED CAP").loc["30Y", "DIFFERENCE"] == "up only"
     assert any("One-sided at" in c.value and "30Y" in c.value for c in at.caption)
+    import derivx.ui.rates_capfloor as cap_ui
+
+    assert cap_ui.illustrative_cap_atm is illustrative_cap_atm  # the script undid its patch: nothing leaks
 
 
 def test_tab_reports_black_with_a_negative_strike_as_an_error():
