@@ -1852,8 +1852,11 @@ def hedge_book(
     hedged with the instruments on those curves, so no norm or cost adds
     amounts in different currencies (a hedge on one currency's curves has
     no risk on another's, so without costs this is the least-squares hedge
-    of the whole stacked ladder). The cost of a hedge is half its bid/ask
-    times its quote DV01 per unit. ``ladders`` reuses :func:`unit_ladders`."""
+    of the whole stacked ladder). A currency that holds none of the book's
+    trades and whose curves carry none of its risk (the US Treasury curve
+    under a euro swap book) is left out of ``by_currency``, and hedges on
+    its curves stay at zero. The cost of a hedge is half its bid/ask times
+    its quote DV01 per unit. ``ladders`` reuses :func:`unit_ladders`."""
 
     curves = list(risk.risk)
     target = risk.stacked()
@@ -1867,8 +1870,10 @@ def hedge_book(
     costs = np.array([0.5 * h.bid_ask_bp * h.quote_dv01 for h in instruments])
     row_ccy = np.array([risk.curve_currency[key] for key, qr in risk.risk.items() for _ in qr.labels], dtype=object)
     hedge_ccy = [risk.curve_currency[h.curve] for h in instruments]
+    every = ordered(list(risk.curve_currency[k] for k in curves))
+    blocks = [c for c in every if c in risk.currencies or np.any(target[row_ccy == c] != 0.0)] or every
     x = np.zeros(len(instruments))
-    for ccy in ordered(list(risk.curve_currency[k] for k in curves)):
+    for ccy in blocks:
         rows_c = np.flatnonzero(row_ccy == ccy)
         cols_c = [j for j, c in enumerate(hedge_ccy) if c == ccy]
         if cols_c and rows_c.size:
@@ -1878,7 +1883,7 @@ def hedge_book(
     residual = target + hedge
     penalised = move_bp is not None and bool(np.any(costs))
     by_currency: Dict[str, HedgeRisk] = {}
-    for ccy in ordered(list(risk.curve_currency[k] for k in curves)):
+    for ccy in blocks:
         rows_c = row_ccy == ccy
         cols_c = [j for j, c in enumerate(hedge_ccy) if c == ccy]
         by_currency[ccy] = HedgeRisk(
