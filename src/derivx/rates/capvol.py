@@ -25,13 +25,15 @@ strikes. A cap whose flat vol cannot be met by non-negative caplet vols
 (flat vols falling too fast, or quotes out of order) raises with the
 maturity named: nothing is clipped.
 
-Caps are :class:`~derivx.rates.capfloor.CapFloor` spot-start caps (first
-caplet excluded, as quoted), so stripping uses exactly the caplet schedule,
-forwards, discount factors and model of the pricer; QuantLib's
-``OptionletStripper1`` gives the same caplet vols when every caplet
-maturity is quoted (``tests/test_capvol.py``). Expiries are ACT/365F years
-to the fixing; vols in the model's units (normal: rate units, 1bp = 1e-4;
-lognormal: decimal).
+Caps are :class:`~derivx.rates.capfloor.CapFloor` spot-start caps (a term
+cap's first caplet excluded, as quoted), so stripping uses exactly the
+caplet schedule, forwards, discount factors and model of the pricer;
+QuantLib's ``OptionletStripper1`` gives the same caplet vols when every
+caplet maturity is quoted (``tests/test_capvol.py``). Caps on a compounded
+overnight rate (``terms`` with ``rate_type="compounded"``) strip the same
+way, each caplet priced on its Lyashenko-Mercurio option time. Expiries are
+ACT/365F years to the (last) fixing; vols in the model's units (normal:
+rate units, 1bp = 1e-4; lognormal: decimal).
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
 
-from derivx.rates.capfloor import MODELS, CapFloor, _model_shift, model_price
+from derivx.rates.capfloor import MODELS, VOL_BASES, CapFloor, _model_shift, model_price
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
 
@@ -63,8 +65,10 @@ class CapletVolCurve:
     strike (``strike=None``: an ATM strip). ``nodes`` are the last caplet
     expiry of each quoted cap; ``method`` says how vols run between them
     (see the module docstring). ``model``/``shift`` are the pricing model
-    the vols belong to; :class:`~derivx.rates.capfloor.CapFloor` checks a
-    cap uses the same."""
+    the vols belong to, and ``vol_basis`` the caplets they were stripped
+    on (:data:`~derivx.rates.capfloor.VOL_BASES`: term-rate caplets, or
+    compounded-rate caplets with a Lyashenko-Mercurio or an effective vol);
+    :class:`~derivx.rates.capfloor.CapFloor` checks a cap uses the same."""
 
     nodes: Tuple[float, ...]
     vols: Tuple[float, ...]
@@ -72,10 +76,13 @@ class CapletVolCurve:
     model: str
     shift: float = 0.0
     strike: Optional[float] = None
+    vol_basis: str = "term"
 
     def __post_init__(self) -> None:
         if self.method not in STRIP_METHODS:
             raise ValueError(f"method must be one of {STRIP_METHODS}, got {self.method!r}")
+        if self.vol_basis not in VOL_BASES:
+            raise ValueError(f"vol_basis must be one of {VOL_BASES}, got {self.vol_basis!r}")
         if self.model not in MODELS:
             raise ValueError(f"model must be one of {MODELS}, got {self.model!r}")
         nodes, vols = np.asarray(self.nodes, dtype=float), np.asarray(self.vols, dtype=float)
@@ -118,12 +125,17 @@ class CapletVolSurface:
         if any(k is None for k in strikes) or np.any(np.diff(np.asarray(strikes, dtype=float)) <= 0):
             raise ValueError("a caplet vol surface needs fixed strikes in increasing order")
         first = self.curves[0]
-        if any((c.model, c.shift, c.method) != (first.model, first.shift, first.method) for c in self.curves):
-            raise ValueError("every strike of a caplet vol surface must share its model, shift and method")
+        same = (first.model, first.shift, first.method, first.vol_basis)
+        if any((c.model, c.shift, c.method, c.vol_basis) != same for c in self.curves):
+            raise ValueError("every strike of a caplet vol surface must share its model, shift, method and vol basis")
 
     @property
     def model(self) -> str:
         return self.curves[0].model
+
+    @property
+    def vol_basis(self) -> str:
+        return self.curves[0].vol_basis
 
     @property
     def shift(self) -> float:
@@ -237,11 +249,13 @@ def strip_caplet_vols(
         live = strip.live
         if not live.any():
             raise ValueError(f"the {m} cap has no caplet left to expire")
-        T, F, scale = strip.expiry, strip.forward, strip.tau * strip.df
+        # T (years to the last fixing) places the vols; V is the option time the model uses (T itself for a
+        # term caplet, the Lyashenko-Mercurio time of a compounded one).
+        T, V, F, scale = strip.expiry, strip.variance, strip.forward, strip.tau * strip.df
         node = float(T[live].max())
         if nodes and node <= nodes[-1] + 1e-12:
             raise ValueError(f"the {m} cap ends on the same caplet as a shorter quoted cap: drop one of them")
-        target = float(np.dot(scale, _unit(model, F, K, T, np.full(T.size, flat), shift)))
+        target = float(np.dot(scale, _unit(model, F, K, V, np.full(T.size, flat), shift)))
         prev_node, prev_vol = (nodes[-1], vols[-1]) if nodes else (0.0, None)
         new = T > prev_node + 1e-12
         known = np.zeros(T.size)
@@ -258,7 +272,7 @@ def strip_caplet_vols(
             return sig
 
         def excess(x: float) -> float:
-            return float(np.dot(scale, _unit(model, F, K, T, trial(x), shift))) - target
+            return float(np.dot(scale, _unit(model, F, K, V, trial(x), shift))) - target
 
         lowest = excess(0.0)
         if lowest > 16 * _EPS * max(abs(target), 1e-12):
@@ -279,7 +293,9 @@ def strip_caplet_vols(
         stripped = target + excess(x)
         rows.append({"maturity": m, "strike": K, "flat_vol": flat, "node": node, "caplets": int(live.sum()),
                      "target_pv": target, "stripped_pv": stripped, "error": stripped - target})  # fmt: skip
-    curve = CapletVolCurve(tuple(nodes), tuple(vols), method, model, shift, None if strike is None else float(strike))
+    basis = cap.vol_basis  # every quoted cap has the same terms
+    curve = CapletVolCurve(tuple(nodes), tuple(vols), method, model, shift, None if strike is None else float(strike),
+                           basis)  # fmt: skip
     return StripResult(curve, pd.DataFrame(rows))
 
 

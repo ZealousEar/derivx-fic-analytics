@@ -1,9 +1,14 @@
-"""CAP / FLOOR tab: caps and floors on a term rate, priced with the
-Bachelier (normal), Black or shifted Black model.
+"""CAP / FLOOR tab: caps, floors and collars priced with the Bachelier
+(normal), Black or shifted Black model.
 
-On a single-curve market the term rate projects on the swap curve. On a
-multi-curve market (EUR) the cap is on EURIBOR 3M or 6M: forwards from its
-projection curve, discounting on €STR, and key-rate risk bucketed per curve.
+The rate is the curve's overnight rate (SOFR, €STR, SONIA) compounded in
+arrears, the way USD and GBP caps trade since LIBOR ended, with the
+Lyashenko-Mercurio vol (or an effective vol to the last fixing); or a term
+rate. On a multi-curve market (EUR) the term rate is EURIBOR 3M or 6M:
+forwards from its projection curve, discounting on €STR, and key-rate risk
+bucketed per curve. On a single-curve market a 3M/6M term rate projects on
+the OIS curve: an approximation, labelled as one (no USD or GBP term-rate
+cap market or curve).
 
 Vols are one flat vol, a term structure, or caplet vols stripped from flat
 cap vol quotes (ATM or by strike; ILLUSTRATIVE defaults, editable) so that
@@ -14,7 +19,7 @@ and a one-day theta."""
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,7 +27,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from derivx.rates.capfloor import CapFloor, cap_floor_parity, capfloor_position
+from derivx.rates.capfloor import OVERNIGHT_NAMES, CapFloor, cap_floor_parity, capfloor_position
 from derivx.rates.capvol import CapletVolSurface, quote_vegas, strip_caplet_vols, strip_surface, vega_by_expiry
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
@@ -43,6 +48,10 @@ MONEY_2DP = st.column_config.NumberColumn(format="%,.2f")
 TENORS = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y", "12Y", "15Y", "20Y", "25Y", "30Y"]
 BOOK_QUOTES_KEY = "_cap_book_quotes"  # session state: the cap quotes in use, for the BOOK tab
 FORWARD_STARTS = ["Spot", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y"]
+KINDS = ["Cap", "Floor", "Collar"]
+TERM_CHOICES = ["3M term", "6M term"]  # single-curve term rates on the OIS curve (approximations)
+RESETS = ["3M", "1M", "6M", "12M"]  # compounded periods
+RFR_VOLS = {"Forward-looking (Lyashenko-Mercurio)": False, "Effective to last fixing": True}
 # Vol inputs are in display units: bp for the normal model, % for the Black models.
 VOL_UNITS = {"bachelier": ("bp", 1e-4, 2000.0), "black": ("%", 0.01, 300.0), "shifted_black": ("%", 0.01, 300.0)}
 DEFAULT_FLAT_VOL = {"bachelier": 100.0, "black": 28.0, "shifted_black": 18.0}
@@ -53,11 +62,15 @@ DEFAULT_TERM_VOLS = {
 }
 CAPLET_FORMATS = {
     "EXPIRY (Y)": st.column_config.NumberColumn(format="%.4f"),
+    "OPTION TIME (Y)": st.column_config.NumberColumn(format="%.4f"),
     "TAU": st.column_config.NumberColumn(format="%.6f"),
     "FORWARD (%)": st.column_config.NumberColumn(format="%.4f"),
     "STRIKE (%)": st.column_config.NumberColumn(format="%.4f"),
+    "FLOOR STRIKE (%)": st.column_config.NumberColumn(format="%.4f"),
     "DF": st.column_config.NumberColumn(format="%.8f"),
     "PV": st.column_config.NumberColumn(format="%.2f"),
+    "CAP PV": st.column_config.NumberColumn(format="%.2f"),
+    "FLOOR PV": st.column_config.NumberColumn(format="%.2f"),
     "PV01 (/BP)": st.column_config.NumberColumn(format="%.2f"),
 }
 
@@ -88,26 +101,30 @@ def _vol_table(model: str) -> Dict[float, float]:
     return {float(t): float(v) * unit for t, v in zip(expiries, rows[column].astype(float))}
 
 
-def _caplet_view(table: pd.DataFrame, model: str) -> pd.DataFrame:
+def _caplet_view(table: pd.DataFrame, model: str, compounded: bool = False) -> pd.DataFrame:
+    """The caplet table in display units: a compounded rate adds its first
+    daily fixing, option (variance) time and effective vol; a collar its
+    floor strike, floor vol and the PVs of both legs."""
+
     label, unit, _ = VOL_UNITS[model]
     per = "1BP" if model == "bachelier" else "VOL PT"
-    return pd.DataFrame(
-        {
-            "FIXING": table["fix"],
-            "START": table["start"],
-            "END": table["end"],
-            "PAY": table["pay"],
-            "EXPIRY (Y)": table["expiry"],
-            "TAU": table["tau"],
-            "FORWARD (%)": table["forward"] * 100,
-            "STRIKE (%)": table["strike"] * 100,
-            f"VOL ({label})": table["vol"] / unit,
-            "DF": table["df"],
-            "PV": table["pv"],
-            f"VEGA (/{per})": table["vega"],
-            "STATUS": np.where(table["fixed"], "fixed", "live"),
-        }
-    )
+    cols: Dict[str, object] = {}
+    if compounded:
+        cols["FIRST FIXING"] = table["first_fix"]
+    cols.update({"LAST FIXING" if compounded else "FIXING": table["fix"], "START": table["start"], "END": table["end"],
+                 "PAY": table["pay"], "EXPIRY (Y)": table["expiry"]})  # fmt: skip
+    if compounded:
+        cols["OPTION TIME (Y)"] = table["variance_time"]
+    cols.update({"TAU": table["tau"], "FORWARD (%)": table["forward"] * 100, "STRIKE (%)": table["strike"] * 100,
+                 f"VOL ({label})": table["vol"] / unit})  # fmt: skip
+    if compounded:
+        cols[f"EFF VOL ({label})"] = table["effective_vol"] / unit
+    if "floor_strike" in table:
+        cols.update({"FLOOR STRIKE (%)": table["floor_strike"] * 100, f"FLOOR VOL ({label})": table["floor_vol"] / unit,
+                     "CAP PV": table["cap_pv"], "FLOOR PV": table["floor_pv"]})  # fmt: skip
+    cols.update({"DF": table["df"], "PV": table["pv"], f"VEGA (/{per})": table["vega"],
+                 "STATUS": np.where(table["fixed"], "fixed", "live")})  # fmt: skip
+    return pd.DataFrame(cols)
 
 
 def _date_limits(days: List[dt.date]) -> Dict[str, str]:
@@ -115,7 +132,9 @@ def _date_limits(days: List[dt.date]) -> Dict[str, str]:
     return {"min": (min(days) - pad).isoformat(), "max": (max(days) + pad).isoformat()}
 
 
-def _strip_chart(table: pd.DataFrame, strike: float, kind: str) -> go.Figure:
+def _strip_chart(table: pd.DataFrame, strike: float, kind: str, floor_strike: Optional[float] = None) -> go.Figure:
+    """Forward against the strike(s) by (last) fixing date, and each period's PV."""
+
     fixes = list(table["fix"])
     forwards = (table["forward"] * 100).tolist()
     pvs = table["pv"].tolist()
@@ -144,9 +163,25 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str) -> go.Figure:
         row=1,
         col=1,
     )
+    levels = [*forwards, strike * 100]
+    if floor_strike is not None:
+        fig.data[-1].name = "CAP STRIKE"
+        fig.add_trace(
+            go.Scatter(
+                x=fixes,
+                y=[floor_strike * 100] * len(fixes),
+                mode="lines" if len(fixes) > 1 else "markers",
+                name="FLOOR STRIKE",
+                line=dict(color=SERIES[3], width=2, dash="dot"),
+                marker=dict(color=SERIES[3], symbol="line-ew-open", size=14),
+            ),
+            row=1,
+            col=1,
+        )
+        levels.append(floor_strike * 100)
     fig.add_trace(go.Bar(x=fixes, y=pvs, name="PV", marker=dict(color=SERIES[2])), row=2, col=1)
     dark_layout(fig, height=520)
-    fig.update_xaxes(title_text="FIXING DATE", row=2, col=1)
+    fig.update_xaxes(title_text="FIXING DATE (LAST FIXING IF COMPOUNDED)", row=2, col=1)
     fig.update_yaxes(title_text="RATE (%)", row=1, col=1)
     fig.update_yaxes(title_text="PV", row=2, col=1)
     dates = _date_limits(fixes)
@@ -154,7 +189,7 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str) -> go.Figure:
         fig,
         xaxis=dates,
         xaxis2=dates,
-        yaxis=axis_limits([*forwards, strike * 100], pad=0.1),
+        yaxis=axis_limits(levels, pad=0.1),
         yaxis2=axis_limits([0.0, *pvs], pad=0.1, floor=min(0.0, *pvs)),
     )
     return fig
@@ -263,8 +298,13 @@ def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, obje
     c1, c2 = st.columns(2)
     layout = c1.radio("QUOTES", ["ATM", "By strike"], horizontal=True, key="cap_strip_layout")
     method = STRIP_METHODS[c2.radio("CAPLET VOLS", list(STRIP_METHODS), horizontal=True, key="cap_strip_method")]
+    caps = (
+        "spot-start caps on the compounded overnight rate, every caplet included, its vol read the same way as the "
+        "trade's (forward-looking or effective)"
+        if terms.get("rate_type") == "compounded" else "spot-start caps, first caplet excluded"
+    )  # fmt: skip
     st.caption(
-        "Flat normal cap vols (bp) by cap maturity on the selected index: spot-start caps, first caplet excluded. "
+        f"Flat normal cap vols (bp) by cap maturity on the selected index: {caps}. "
         f"Defaults are {ILLUSTRATIVE}; edit the table or paste your broker's quotes."
     )
     currency = _currency(market)
@@ -446,17 +486,30 @@ def _greeks(position: Position, market: Market, trade_key: tuple) -> Dict[str, f
     return rates_risk.cached("cap_greeks", (rates_risk.market_key(market), trade_key), compute)
 
 
-def render(market: Market) -> List[Position]:
-    """Draw the tab and return the priced cap/floor as a position."""
+def _index_choices(market: Market) -> Tuple[List[str], str]:
+    """INDEX options (term indices of a multi-curve market or single-curve
+    term rates, and the compounded overnight rate) and the overnight
+    rate's name. Single-curve, the compounded rate comes first: USD and GBP
+    caps trade on SOFR and SONIA compounded in arrears."""
 
-    st.markdown("### / CAP & FLOOR")
+    conv = market.curve.conventions
+    overnight = OVERNIGHT_NAMES.get(conv.currency if conv is not None else "USD", "OIS")
+    compounded = f"{overnight} compounded"
+    indices = [k for k in market.projections if not market.projections.is_discount(k)]
+    return (indices + [compounded], compounded) if indices else ([compounded] + TERM_CHOICES, compounded)
+
+
+def render(market: Market) -> List[Position]:
+    """Draw the tab and return the priced cap, floor or collar as a position."""
+
+    st.markdown("### / CAP, FLOOR & COLLAR")
     conv = market.curve.conventions
     calendar = conv.calendar if conv else "USD"
     day_count = conv.irs_float_day_count if conv else "ACT/360"
     fixing_lag = conv.spot_lag if conv else 2
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    kind = c1.radio("TYPE", ["Cap", "Floor"], horizontal=True, key="cap_kind").lower()
+    kind = c1.radio("TYPE", KINDS, horizontal=True, key="cap_kind").lower()
     notional = c2.number_input(
         "NOTIONAL",
         min_value=1.0,
@@ -468,32 +521,62 @@ def render(market: Market) -> List[Position]:
     )
     tenor = c3.selectbox("TENOR", TENORS, index=TENORS.index("5Y"), key="cap_tenor")
     fwd = c4.selectbox("FORWARD START", FORWARD_STARTS, key="cap_forward_start")
-    indices = [k for k in market.projections if not market.projections.is_discount(k)]
-    index_choice = c5.radio("INDEX", indices or ["3M", "6M"], horizontal=True, key="cap_index")
-    projection = index_choice if indices else None
-    index_months = market.get_curve(projection).index.months if projection else int(index_choice[:-1])
+    choices, compounded_choice = _index_choices(market)
+    index_choice = c5.radio("INDEX", choices, horizontal=True, key="cap_index")
+    compounded = index_choice == compounded_choice
+    projection = index_choice if index_choice in market.projections else None
+    effective_vol = False
+    if compounded:
+        c1, c2 = st.columns([1, 2])
+        index_months = int(c1.selectbox("RESET PERIOD", RESETS, key="cap_reset")[:-1])
+        vol_input = c2.radio("VOL QUOTE", list(RFR_VOLS), horizontal=True, key="cap_rfr_vol")
+        effective_vol = RFR_VOLS[vol_input]
+    elif projection:
+        index_months = market.get_curve(projection).index.months
+    else:
+        index_months = int(index_choice.split("M")[0])
+    overnight = compounded_choice.split(" ")[0]
+    if not compounded and not projection:
+        st.warning(
+            f"Term-rate approximation: a {index_months}M rate fixed in advance, projected off the {overnight} OIS "
+            f"curve. The app has no {overnight} term-rate curve, and standard caps in this currency are on "
+            f"{overnight} compounded in arrears: pick {compounded_choice} for those."
+        )
 
-    c1, c2, c3, c4 = st.columns(4)
+    collar = kind == "collar"
+    c1, c2, c3, c4, c5 = st.columns(5)
     strike_mode = c1.radio("STRIKE", ["ATM ± bp", "Absolute %"], horizontal=True, key="cap_strike_mode")
+    strike_word = "CAP STRIKE" if collar else "STRIKE"
     if strike_mode == "Absolute %":
         strike_pct = c2.number_input(
-            "STRIKE (%)", min_value=-5.0, max_value=30.0, value=4.0, step=0.125, format="%.4f", key="cap_strike_pct"
-        )
+            f"{strike_word} (%)", min_value=-5.0, max_value=30.0, value=4.0, step=0.125, format="%.4f",
+            key="cap_strike_pct",
+        )  # fmt: skip
+        if collar:
+            floor_pct = c3.number_input(
+                "FLOOR STRIKE (%)", min_value=-5.0, max_value=30.0, value=3.0, step=0.125, format="%.4f",
+                key="cap_floor_strike_pct",
+            )  # fmt: skip
     else:
         offset_bp = c2.number_input(
-            "ATM OFFSET (BP)",
+            "CAP ATM OFFSET (BP)" if collar else "ATM OFFSET (BP)",
             min_value=-1000.0,
             max_value=1000.0,
-            value=0.0,
+            value=50.0 if collar else 0.0,
             step=25.0,
             format="%.1f",
-            key="cap_atm_offset_bp",
+            key="cap_collar_offset_bp" if collar else "cap_atm_offset_bp",
         )
-    model = MODEL_LABELS[c3.selectbox("MODEL", list(MODEL_LABELS), key="cap_model")]
+        if collar:
+            floor_offset_bp = c3.number_input(
+                "FLOOR ATM OFFSET (BP)", min_value=-1000.0, max_value=1000.0, value=-50.0, step=25.0, format="%.1f",
+                key="cap_floor_offset_bp",
+            )  # fmt: skip
+    model = MODEL_LABELS[c4.selectbox("MODEL", list(MODEL_LABELS), key="cap_model")]
     shift = 0.0
     if model == "shifted_black":
         shift = (
-            c4.number_input(
+            c5.number_input(
                 "SHIFT (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f", key="cap_shift_pct"
             )
             / 100
@@ -517,7 +600,10 @@ def render(market: Market) -> List[Position]:
                 * vol_unit
             )
         elif vol_mode == "Term structure":
-            st.caption("Vol by option expiry (years to fixing), linear in expiry and flat outside the table.")
+            st.caption(
+                "Vol by option expiry (years to the fixing; to the last daily fixing for a compounded rate), "
+                "linear in expiry and flat outside the table."
+            )
             vol = _vol_table(model)
         else:
             vol = 0.0  # replaced by the stripped caplet vols below
@@ -526,7 +612,15 @@ def render(market: Market) -> List[Position]:
                     "cap vol quotes here are flat normal vols (bp), the way USD and EUR caps are quoted: pick the "
                     "Normal (bp) model to strip them, or enter a lognormal term structure"
                 )
-        if projection:
+        terms: Dict[str, object]
+        if compounded:
+            terms = dict(
+                forward_start=None if fwd == "Spot" else fwd, index_months=index_months,
+                day_count=conv.ois_day_count if conv else "ACT/360", calendar=calendar, fixing_lag=fixing_lag,
+                payment_lag=conv.payment_lag if conv else 2, rate_type="compounded", effective_vol=effective_vol,
+            )  # fmt: skip
+            day_count = str(terms["day_count"])
+        elif projection:
             index = market.get_curve(projection).index
             terms = dict(
                 forward_start=None if fwd == "Spot" else fwd, index_months=index.months, day_count=index.day_count,
@@ -541,12 +635,15 @@ def render(market: Market) -> List[Position]:
                 calendar=calendar,
                 fixing_lag=fixing_lag,
             )
-        atm = CapFloor(notional, kind, 0.0, tenor, 0.0, **terms).atm_strike(market)
+        atm = CapFloor(notional, "cap", 0.0, tenor, 0.0, **terms).atm_strike(market)
         strike = strike_pct / 100 if strike_mode == "Absolute %" else atm + offset_bp * 1e-4
+        floor_strike = None
+        if collar:
+            floor_strike = floor_pct / 100 if strike_mode == "Absolute %" else atm + floor_offset_bp * 1e-4
         if vol_mode == "Stripped from cap quotes":
             stripped = _stripped_inputs(market, _quote_terms(terms))
             vol = stripped["vol"]
-        cf = CapFloor(notional, kind, strike, tenor, vol, model, shift, **terms)
+        cf = CapFloor(notional, kind, strike, tenor, vol, model, shift, floor_strike=floor_strike, **terms)
         table = cf.caplets(market)
         position = capfloor_position(cf, asof=market.asof)
         pv = float(table["pv"].sum())
@@ -587,21 +684,45 @@ def render(market: Market) -> List[Position]:
         "+1bp on every rate quote of the OIS and EURIBOR curves, rebuilt (basis spreads held)"
         if ladders is not None else "+1bp on every curve quote with the curve rebuilt"
     )  # fmt: skip
+    legs = (
+        f" Long the cap at {strike:.4%} ({float(table['cap_pv'].sum()):,.2f}) and short the floor at "
+        f"{floor_strike:.4%} ({float(table['floor_pv'].sum()):,.2f})."
+        if collar and floor_strike is not None else ""
+    )  # fmt: skip
     st.caption(
         f"{cf.label}, {len(table)} {kind}lets. PV, vega and PV01 are P&L to the holder in "
         f"currency for the notional; PV01 is {shift_text}. Running premium is "
-        f"PV over the strip annuity (sum of notional x accrual x DF). Cap - floor - payer swap = "
-        f"{parity['residual']:.2e}."
+        f"PV over the strip annuity (sum of notional x accrual x DF).{legs} Cap - floor - payer swap at "
+        f"{'the cap strike' if collar else 'the strike'} = {parity['residual']:.2e}."
     )
-    st.caption(
-        f"Schedule: {index_months}M periods rolled back from maturity, {calendar} calendar, modified following, "
-        f"{day_count} accrual; each rate fixes {fixing_lag} business days before its period starts and pays at "
-        "the period end. A spot-starting cap leaves out the first period (it fixes at trade); a forward start is "
-        "spot plus the forward period, modified following, as on the swap tab. Option time is ACT/365F to the "
-        "fixing; "
-        + (f"forwards from the {projection} projection curve, discounting on the OIS curve." if projection
-           else "one curve projects and discounts.")
-    )  # fmt: skip
+    if compounded:
+        vol_rule = (
+            "the vol is the effective vol to the last fixing (variance vol² x time to the last fixing)"
+            if effective_vol else
+            "the vol is that of the period's forward-looking rate, decaying linearly to zero over the accrual "
+            "period (Lyashenko-Mercurio): variance vol² x (t_start + (t_end - t_start)/3) before the period, "
+            "shrinking as it fixes (the table's OPTION TIME; EFF VOL is the equivalent vol to the last fixing)"
+        )  # fmt: skip
+        st.caption(
+            f"Schedule: {index_months}M periods rolled back from maturity, {calendar} calendar, modified following, "
+            f"{day_count} accrual. Each caplet pays on {overnight} compounded in arrears over its period, as the "
+            f"{overnight} OIS floating leg: daily fixings from the period start to the business day before its end, "
+            + ("paid at the period end" if cf.payment_lag == 0 else
+               f"paid {cf.payment_lag} business day{'s' if cf.payment_lag != 1 else ''} after the period end")
+            + ", no lookback or observation shift. Every period is included (a compounded rate is unknown until its "
+            "period ends); a forward start is spot plus the forward period, modified following. Option time is "
+            f"ACT/365F; {vol_rule}. Forwards and discounting on the {overnight} OIS curve."
+        )  # fmt: skip
+    else:
+        st.caption(
+            f"Schedule: {index_months}M periods rolled back from maturity, {calendar} calendar, modified "
+            f"following, {day_count} accrual; each rate fixes {fixing_lag} business days before its period starts "
+            "and pays at the period end. A spot-starting cap leaves out the first period (it fixes at trade); a "
+            "forward start is spot plus the forward period, modified following, as on the swap tab. Option time is "
+            "ACT/365F to the fixing; "
+            + (f"forwards from the {projection} projection curve, discounting on the OIS curve." if projection
+               else "one curve projects and discounts.")
+        )  # fmt: skip
     st.caption(
         "GAMMA: P&L per (1bp)² for a move of every rate quote (central second difference, curves rebuilt), so "
         "P&L(x bp) ~ PV01 x + gamma x²/2. THETA: value on the next business day with quotes and vols unchanged "
@@ -617,10 +738,14 @@ def render(market: Market) -> List[Position]:
         st.warning(f"The {kind} pays after the curve's last quote ({pillars[-1]}); forwards beyond it are held flat.")
 
     st.markdown(f"### / {kind.upper()}LETS")
-    st.plotly_chart(_strip_chart(table, strike, kind), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_strip_chart")
-    view = _caplet_view(table, model)
+    st.plotly_chart(_strip_chart(table, strike, kind, floor_strike), width="stretch", config=PLOTLY_2D_CONFIG,
+                    key="cap_strip_chart")  # fmt: skip
+    view = _caplet_view(table, model, compounded)
     two_dp = st.column_config.NumberColumn(format="%.2f")
-    formats = {**CAPLET_FORMATS, **{c: two_dp for c in view.columns if c.startswith(("VOL (", "VEGA ("))}}
+    formats = {
+        **CAPLET_FORMATS,
+        **{c: two_dp for c in view.columns if c.startswith(("VOL (", "VEGA (", "EFF VOL (", "FLOOR VOL ("))},
+    }
     st.dataframe(view, width="stretch", hide_index=True, column_config=formats)
     st.download_button(
         "DOWNLOAD CAPLETS CSV",
@@ -695,9 +820,14 @@ def render(market: Market) -> List[Position]:
     rates_exports.export_row(
         "cap floor", market, tables,
         {"trade": {"kind": kind, "notional": notional, "tenor": tenor, "forward_start": fwd, "strike": strike,
-                   "model": model, "shift": shift, **terms}, "vol": vol_input, "vol_mode": vol_mode},
-        {"pricing": f"{model} per caplet, forwards from {'the ' + projection if projection else 'the swap curve'}, "
-         "OIS discounting", "strip_method": stripped["method"] if stripped else None,
+                   "floor_strike": floor_strike, "model": model, "shift": shift, **terms}, "vol": vol_input,
+         "vol_mode": vol_mode},
+        {"pricing": f"{model} per caplet, "
+         + (f"{overnight} compounded in arrears, "
+            + ("effective vol to the last fixing" if effective_vol else "Lyashenko-Mercurio vol decay")
+            if compounded else
+            f"term rate from {'the ' + projection if projection else 'the OIS curve (approximation)'}")
+         + ", OIS discounting", "strip_method": stripped["method"] if stripped else None,
          "risk": "+/-1bp per curve quote, curves rebuilt, central difference"},
         key="cap_export",
     )  # fmt: skip

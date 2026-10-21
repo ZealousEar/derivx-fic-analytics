@@ -224,3 +224,22 @@ def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
     assert any("without FX conversion" in w.value for w in at.warning)  # EUR swaps and caps with a USD bond
     assert any(m.label.startswith("TOTAL P&L (") and "€" in m.label for m in at.metric)
     _assert_bounded(at)
+
+
+def test_estr_compounded_cap_on_the_eur_curve_set(eur):
+    """On the EUR curve set the CAP-FLOOR tab also prices caps on €STR
+    compounded in arrears: forwards and discounting on the €STR curve (one
+    key-rate ladder), paid one business day after each period, as €STR OIS."""
+
+    eur.radio(key="cap_index").set_value("€STR compounded").run()
+    assert not eur.exception and not eur.error, [e.value for e in eur.error]
+    caps = [c.proto.id for c in eur.get("plotly_chart") if "cap_ladder_chart" in c.proto.id]
+    assert len(caps) == 1  # the €STR curve only: no EURIBOR projection
+    schedule = next(c.value for c in eur.caption if c.value.startswith("Schedule:"))
+    assert "€STR compounded in arrears" in schedule and "paid 1 business day after" in schedule
+    assert not any("Term-rate approximation" in w.value for w in eur.warning)
+    caplets = next(d.value for d in eur.dataframe if "OPTION TIME (Y)" in d.value.columns)
+    assert (caplets["FIRST FIXING"] < caplets["LAST FIXING"]).all()
+    assert (caplets["OPTION TIME (Y)"] < caplets["EXPIRY (Y)"]).all()  # Lyashenko-Mercurio: vol decays in-period
+    eur.radio(key="cap_index").set_value("EURIBOR 6M").run()
+    assert not eur.exception

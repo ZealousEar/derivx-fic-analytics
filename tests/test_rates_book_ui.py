@@ -128,7 +128,7 @@ def test_book_export_zip_holds_the_tables_and_the_manifest(monkeypatch):
         "curve_grid",
         "risk_report",
         "sabr_ois",
-        "caplets_3m",
+        "caplets_ois_3m",
     } <= set(tables)
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         names = zf.namelist()
