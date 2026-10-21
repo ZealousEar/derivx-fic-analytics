@@ -848,9 +848,8 @@ def _scenario(args: argparse.Namespace) -> int:
         raise ValueError("give at least one --shock (see derivx scenario --help)")
     settings: Dict[str, object] = {"horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
                                    "lognormal_vol_pts": args.vol_lognormal}  # fmt: skip
-    if args.fx_move:
-        settings["fx"] = tuple(args.fx_move.items())
-    shocks = [dc_replace(s, **settings) for s in shocks]
+    # --fx-move adds to each shock's own FX moves (an fx: shock keeps its moves) and names itself in the label
+    shocks = [sc.add_fx(dc_replace(s, **settings), args.fx_move or {}) for s in shocks]
     asof = books[0].market.asof
     reporting = _reporting(args, asof)
     parts, failed, skipped, vol_inputs, vol_sources = [], {}, 0, {}, {}
@@ -1009,7 +1008,7 @@ def _register_scenario(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vol-lognormal", type=float, default=0.0, help="lognormal vol shock (vol points)")
     parser.add_argument("--fx-move", type=_fx_moves,
                         help="FX moves added to every shock, e.g. EURUSD=+10,GBPUSD=-5 (%%; only converted totals "
-                        "move)")  # fmt: skip
+                        "move; added to an fx: shock's own move of the same pair; named in each scenario)")  # fmt: skip
     _market_options(parser)
     _vol_options(parser)
     parser.add_argument("--out", type=Path, help="write the scenario grid CSV (scenarios x trades)")
