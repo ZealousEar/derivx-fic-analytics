@@ -21,7 +21,7 @@ spot date (multiply by the base notional), per +1 vol point (0.01) or per
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -55,16 +55,22 @@ def quote_vegas(
     K: float,
     call: bool,
     h: float = QUOTE_BUMP,
+    base: Optional[FxSmile] = None,
 ) -> pd.DataFrame:
     """Vega of an option at strike ``K`` to each market quote of its tenor
     (module docs). Columns: quote, quoted (decimal), vega (per +1 vol point
-    on that quote), used (whether the model fits that quote)."""
+    on that quote), used (whether the model fits that quote). ``base``: the
+    smile of the unbumped quotes when the caller has it (built otherwise);
+    the bumped SABR fits start from its (rho, nu), a 5 vol bp move away,
+    and converge in a few steps to the same optimum as a cold start."""
 
     if not (np.isfinite(K) and K > 0):
         raise ValueError(f"strike must be > 0, got {K}")
     if m.tau_e <= 0:
         raise ValueError("at expiry an option has no vega")
-    base = build_smile(m, quote, conventions, model)
+    if base is None:
+        base = build_smile(m, quote, conventions, model)
+    start = (float(base.params["rho"]), float(base.params["nu"])) if base.model == "SABR" else None
     used = {q.lower() for q in base.used_quotes}
     rows: List[Dict[str, object]] = []
     for name in _quote_names(quote):
@@ -72,8 +78,8 @@ def quote_vegas(
         if name not in used:
             rows.append({"quote": name.upper(), "quoted": value, "vega": 0.0, "used": False})
             continue
-        up = build_smile(m, replace(quote, **{name: value + h}), conventions, model)
-        dn = build_smile(m, replace(quote, **{name: value - h}), conventions, model)
+        up = build_smile(m, replace(quote, **{name: value + h}), conventions, model, start=start)
+        dn = build_smile(m, replace(quote, **{name: value - h}), conventions, model, start=start)
         d = (_price(m, up, K, call) - _price(m, dn, K, call)) / (2.0 * h)
         rows.append({"quote": name.upper(), "quoted": value, "vega": 0.01 * d, "used": True})
     return pd.DataFrame(rows)
