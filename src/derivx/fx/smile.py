@@ -60,12 +60,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.special import ndtr, ndtri
 
 from derivx.fx.conventions import DELTA_TYPES
 from derivx.fx.pricing import (
     ATM_TYPES,
     FxMarket,
     atm_strike,
+    check_delta_type,
     gk_price,
     is_premium_adjusted,
     strike_from_delta,
@@ -88,6 +90,26 @@ STALL_CYCLES = 12  # a trial smile's delta strike fails when its fixed-point ste
 FIT_CYCLES = 30  # ... or after 30 cycles
 FIT_NFEV = 80  # function evaluations per least-squares start
 FIT_BUDGET = 400  # residual evaluations per SABR fit: no further starts once spent
+
+
+def _black_value(F: float, K: float, T: float, vol: float, call: bool, df: float) -> float:
+    """Garman-Kohlhagen value of one option (quote currency per unit of base;
+    ``F`` the forward, ``df`` the domestic discount factor): the Black-76
+    formula of :func:`derivx.vol.implied.black_price` that :func:`gk_price`
+    uses, for one strike and vol, without its vectorised input checks (it
+    runs in the calibration's inner loop). Raises ``ValueError`` on a
+    non-finite or negative vol, as :func:`gk_price` does."""
+
+    if not (math.isfinite(vol) and vol >= 0.0):
+        raise ValueError(f"vols must be finite and >= 0 (decimals, 0.08 = 8%), got [{vol}]")
+    std = vol * math.sqrt(T)
+    if std > 0:
+        w = 1.0 if call else -1.0
+        d1 = math.log(F / K) / std + 0.5 * std
+        price = w * (F * float(ndtr(w * d1)) - K * float(ndtr(w * (d1 - std))))
+    else:
+        price = max(F - K, 0.0) if call else max(K - F, 0.0)
+    return df * price
 
 
 def _delta_grid(deltas: Sequence[int]) -> Tuple[Tuple[str, float, Optional[bool]], ...]:
@@ -180,8 +202,11 @@ class MarketStrangle:
     vega: float
 
     def smile_value(self, m: FxMarket, vol_fn: Callable) -> float:
-        vols = vol_fn(np.array([self.call_strike, self.put_strike]))
-        return float(gk_price(m, self.call_strike, vols[0], True) + gk_price(m, self.put_strike, vols[1], False))
+        vols = np.asarray(vol_fn(np.array([self.call_strike, self.put_strike])), dtype=float).ravel()
+        F, T, df = m.forward, m.tau_e, m.df_d
+        return _black_value(F, self.call_strike, T, float(vols[0]), True, df) + _black_value(
+            F, self.put_strike, T, float(vols[1]), False, df
+        )
 
     def error(self, m: FxMarket, vol_fn: Callable) -> float:
         """(smile value - quoted value) / vega: the mismatch in vol units."""
@@ -200,6 +225,71 @@ def market_strangle(m: FxMarket, quote: TenorQuote, level: int, delta_type: str)
         black_vega(m.forward, kc, m.tau_e, vol, df=m.df_d) + black_vega(m.forward, kp, m.tau_e, vol, df=m.df_d)
     )
     return MarketStrangle(level, vol, kc, kp, value, vega)
+
+
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+_EPS4 = 4.0 * float(np.finfo(float).eps)
+
+
+def strikes_from_deltas(
+    m: FxMarket, deltas: Sequence[float], vols, calls: Sequence[bool], delta_type: str
+) -> np.ndarray:
+    """:func:`derivx.fx.pricing.strike_from_delta` for several (delta, vol,
+    call), as an array. A premium-adjusted delta (``w scale K / F N(w d2)``)
+    is solved by Newton's method in ln K from the unadjusted strike, to the
+    tolerance of the scalar function's Brent search (1e-15 + 4 eps |ln K|),
+    and accepted for a call only right of its delta's peak (where the delta
+    falls with K, the market convention); without the peak search and the
+    bracketing that the scalar function needs, that is a few times faster.
+    Unadjusted deltas, invalid inputs and an entry Newton does not settle go
+    to the scalar function, which returns the strike or raises its
+    ``ValueError``. (Plain floats: the calibration passes 1-4 strikes, where
+    numpy calls cost more than the arithmetic.)"""
+
+    vols = np.broadcast_to(np.asarray(vols, dtype=float), (len(deltas),)).tolist()
+    if not is_premium_adjusted(check_delta_type(delta_type)):
+        return np.array([strike_from_delta(m, d, v, c, delta_type) for d, v, c in zip(deltas, vols, calls)])
+    out = []
+    for delta, vol, call in zip(deltas, vols, calls):
+        K = _pa_strike(m, float(delta), vol, bool(call), delta_type)
+        out.append(K if K is not None else strike_from_delta(m, float(delta), vol, bool(call), delta_type))
+    return np.array(out)
+
+
+def _pa_strike(m: FxMarket, delta: float, vol: float, call: bool, delta_type: str) -> Optional[float]:
+    """Premium-adjusted strike by Newton in y = ln K (see
+    :func:`strikes_from_deltas`); None when the inputs are invalid or it did
+    not settle (the scalar function then decides)."""
+
+    w = 1.0 if call else -1.0
+    scale = m.df_f if delta_type.startswith("spot") else 1.0
+    if not (math.isfinite(vol) and vol > 0 and m.tau_e > 0 and math.isfinite(delta) and 0 < w * delta < scale):
+        return None
+    std = vol * math.sqrt(m.tau_e)
+    F = m.forward
+    lnF = math.log(F)
+    try:
+        y = lnF - w * std * float(ndtri(w * delta / scale)) + 0.5 * std * std  # ln of the unadjusted strike
+        for _ in range(50):
+            d2 = (lnF - y) / std - 0.5 * std
+            n_w = 0.5 * math.erfc(-w * d2 / math.sqrt(2.0))  # N(w d2), as derivx.fx.pricing does
+            e = math.exp(y) / F
+            slope = w * scale * e * (n_w - w * math.exp(-0.5 * d2 * d2) * _INV_SQRT_2PI / std)  # d delta / d ln K
+            if not (math.isfinite(slope) and slope != 0.0):
+                return None
+            step = (w * scale * e * n_w - delta) / slope
+            y -= step
+            if abs(step) <= 1e-15 + _EPS4 * abs(y):
+                break
+        else:
+            return None
+        d2 = (lnF - y) / std - 0.5 * std
+        n_w = 0.5 * math.erfc(-w * d2 / math.sqrt(2.0))
+        falling = scale * (n_w - w * math.exp(-0.5 * d2 * d2) * _INV_SQRT_2PI / std) * w < 0
+        K = math.exp(y)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    return K if (falling or not call) and math.isfinite(K) and K > 0 else None
 
 
 def smile_delta_strikes(
@@ -237,12 +327,12 @@ def smile_delta_strikes(
             raise ValueError(
                 f"the smile has no vol at K = {K[i]:.6g} (on the way to the {abs(deltas[i]):.0%}-delta strike)"
             )
-        return np.array([strike_from_delta(m, d, v, c, delta_type) for d, v, c in zip(deltas, vols, calls)])
+        return strikes_from_deltas(m, deltas, vols, calls, delta_type)
 
     def done(new: np.ndarray, old: np.ndarray) -> bool:
         return bool(np.all(np.abs(new - old) <= 1e-14 * old))
 
-    K = np.array([strike_from_delta(m, d, v, c, delta_type) for d, v, c in zip(deltas, guess, calls)])
+    K = strikes_from_deltas(m, deltas, guess, calls, delta_type)
     best, stalled = math.inf, 0
     for _ in range(max_cycles):  # Aitken-accelerated (Steffensen) fixed point: two map steps per cycle
         K1 = g(K)
@@ -280,8 +370,41 @@ def sabr_beta1_vol(F: float, K, T: float, alpha: float, rho: float, nu: float) -
     input checks: the calibration's inner loop). Callers validate."""
 
     K = np.asarray(K, dtype=float)
+    corr = 1.0 + T * (0.25 * rho * nu * alpha + (2.0 - 3.0 * rho * rho) * nu * nu / 24.0)
+    if K.size <= _SCALAR_MAX:  # the calibration's 1-4 strikes: plain floats cost a fraction of numpy calls
+        c = nu / alpha
+        out = [alpha * _z_over_x_scalar(c * _log(F / k), rho) * corr for k in K.ravel().tolist()]
+        return np.array(out, dtype=float).reshape(K.shape)
     z = (nu / alpha) * np.log(F / K)
-    return alpha * z_over_x(z, rho) * (1.0 + T * (0.25 * rho * nu * alpha + (2.0 - 3.0 * rho * rho) * nu * nu / 24.0))
+    return alpha * z_over_x(z, rho) * corr
+
+
+_SCALAR_MAX = 8  # sabr_beta1_vol evaluates up to this many strikes with floats, more with numpy
+
+
+def _log(x: float) -> float:
+    """math.log with numpy's convention (NaN or -inf instead of an error)."""
+
+    if x > 0:
+        return math.log(x)
+    return -math.inf if x == 0 else math.nan
+
+
+def _z_over_x_scalar(z: float, rho: float) -> float:
+    """:func:`derivx.vol.sabr.z_over_x` for one float (same branches and
+    formulas, NaN where numpy would give NaN)."""
+
+    if not math.isfinite(z):
+        return math.nan
+    if abs(z) < 1e-6:
+        return 1.0 - 0.5 * rho * z + (2.0 - 3.0 * rho * rho) * z * z / 12.0
+    sq = math.sqrt(1.0 - 2.0 * rho * z + z * z)
+    core = (z * z - 2.0 * rho * z) / (sq + 1.0)
+    arg = (core + z) / (1.0 - rho) if z >= 0 else (core - z) / (1.0 + rho)
+    if not arg > -1.0:
+        return math.nan
+    x = math.log1p(arg) if z >= 0 else -math.log1p(arg)
+    return z / x if x != 0.0 else math.nan
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +428,44 @@ def _safe_vols(fn: Callable, K) -> np.ndarray:
         return out
 
 
+def _beta1_alpha_at_forward(F: float, T: float, vol_atm: float, rho: float, nu: float) -> float:
+    """:func:`derivx.vol.sabr.sabr_alpha_from_atm` for beta = 1, where the
+    ATM cubic is the quadratic ``c2 a^2 + c1 a - vol_atm = 0`` with ``c1 = 1
+    + T (2 - 3 rho^2) nu^2 / 24`` and ``c2 = T rho nu / 4``: its smallest
+    positive root in closed form (cancellation-free), instead of companion
+    matrix eigenvalues. Other inputs go to the general function, which
+    raises the same errors."""
+
+    if not (abs(rho) < 1.0 and nu >= 0.0 and T >= 0.0 and vol_atm > 0.0 and math.isfinite(vol_atm) and F > 0.0):
+        return sabr_alpha_from_atm(F, T, vol_atm, SABR_BETA, rho, nu)
+    c1 = 1.0 + T * (2.0 - 3.0 * rho * rho) * nu * nu / 24.0
+    c2 = T * rho * nu / 4.0
+    if c2 == 0.0:
+        roots = [vol_atm / c1] if c1 != 0.0 else []
+    else:
+        disc = c1 * c1 + 4.0 * c2 * vol_atm
+        if disc < 0.0:
+            roots = []
+        else:
+            q = -0.5 * (c1 + math.copysign(math.sqrt(disc), c1))
+            roots = [q / c2, -vol_atm / q] if q != 0.0 else [-c1 / c2]
+    positive = sorted(r for r in roots if r > 0.0 and math.isfinite(r))
+    if not positive:
+        raise ValueError(
+            "no positive alpha reproduces this ATM vol with these rho, nu and T (the ATM cubic has no "
+            "positive root): Hagan's expansion is outside its range"
+        )
+    return positive[0]
+
+
 def _sabr_alpha(F: float, T: float, k_atm: float, vol_atm: float, rho: float, nu: float) -> float:
     """Alpha with ``sigma_SABR(K_ATM) = vol_ATM`` (beta = 1): start from the
     ATM-forward cubic, then rescale (the vol is nearly proportional to
     alpha) until it matches to 1e-15."""
 
-    a = sabr_alpha_from_atm(F, T, vol_atm, SABR_BETA, rho, nu)
+    a = _beta1_alpha_at_forward(F, T, vol_atm, rho, nu)
     for _ in range(60):
-        vol = float(sabr_beta1_vol(F, k_atm, T, a, rho, nu))
+        vol = float(sabr_beta1_vol(F, np.array([k_atm]), T, a, rho, nu)[0])
         if not (np.isfinite(vol) and vol > 0):
             break
         if abs(vol - vol_atm) <= 1e-15 * vol_atm:
@@ -630,10 +783,23 @@ class FxSmile:
         return ("ATM",) + tuple(f"{q}{lv}" for lv in levels for q in ("RR", "BF"))
 
 
-def build_smile(m: FxMarket, quote: TenorQuote, conventions: SmileConventions, model: str = "SABR") -> FxSmile:
+def build_smile(
+    m: FxMarket,
+    quote: TenorQuote,
+    conventions: SmileConventions,
+    model: str = "SABR",
+    start: Optional[Tuple[float, float]] = None,
+) -> FxSmile:
     """Smile of one tenor from its quotes (module docs). Raises
     ``ValueError`` at expiry (``tau_e = 0``) or for quotes no smile of the
-    model can match (pillar vols <= 0, no strike for a delta)."""
+    model can match (pillar vols <= 0, no strike for a delta).
+
+    ``start`` (SABR only): ``(rho, nu)`` to start the fit from, e.g. the
+    parameters of the smile of nearby quotes (the smile-risk bumps); it
+    replaces the exact 25-delta pre-fit as the first start, and the default
+    starts follow if the fit from it fails. The optimum is the same, so the
+    smile is the same to the fit's tolerance (1e-13 in the quote
+    conditions)."""
 
     model = model.upper()
     if model not in SMILE_MODELS:
@@ -680,8 +846,7 @@ def build_smile(m: FxMarket, quote: TenorQuote, conventions: SmileConventions, m
         fixed: Tuple[str, ...] = ()
         used = (25,)
     else:
-        start = None
-        if quote.has_10d:  # the exact 25-delta fit is the start of the five-quote fit
+        if start is None and quote.has_10d:  # the exact 25-delta fit is the start of the five-quote fit
             q25 = TenorQuote(quote.tenor, quote.atm, quote.rr25, quote.bf25)
             fit25 = _calibrate_sabr(m, q25, conventions, k_atm, {25: strangles[25]})
             start = (fit25.rho, fit25.nu)
