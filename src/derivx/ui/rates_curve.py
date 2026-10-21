@@ -20,6 +20,7 @@ import streamlit as st
 
 from derivx.data.rates_history import HistoryStore, dataset_info
 from derivx.rates.curves import CONVENTIONS, INTERPOLATIONS, OIS_FUTURES, Curve, CurveQuote, Market, bootstrap
+from derivx.rates.exports import market_tables
 from derivx.rates.indices import CURRENCY_INDICES, FUTURES_KINDS, HullWhite, price_from_futures_rate
 from derivx.rates.market_quotes import treasury_quotes
 from derivx.rates.multicurve import (
@@ -32,7 +33,7 @@ from derivx.rates.multicurve import (
     illustrative_quotes,
 )
 from derivx.rates.quotes import clean_quotes
-from derivx.ui import rates_data
+from derivx.ui import rates_data, rates_exports
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -651,4 +652,28 @@ def render() -> Optional[Market]:
     _market_data_panel(data.store, asof)
     proj_badges = {key: (f"{key} | {proj_sources[key]}", asof) for key in projections}
     rates_data.set_badges(curve=(curve_badge, asof), govt=(t_badge, asof), **proj_badges)
-    return market.replace(govt=treasury)
+    full = market.replace(govt=treasury)
+    st.markdown("### / EXPORT")
+    tables = dict(market_tables(full))
+    tables["swap_repricing"] = repricing
+    tables["treasury_repricing"] = _repricing_table(treasury)
+    for key in projections:
+        tables[f"{key.replace(' ', '_').lower()}_repricing"] = _repricing_table(projections[key])
+    rates_exports.export_row(
+        "curve set", full, tables,
+        {"data_source": data.mode, "valuation_date": asof, "swap_curve": conv, "interpolation": interpolation,
+         "quote_units": used_units, "swap_quotes_edited_rows": changed,
+         "projection_quotes_edited_rows": {k: v[0] for k, v in edits.items()},
+         "upload": None if data.uploaded is None else {"name": data.uploaded.get("name"),
+                                                       "sha256": data.uploaded.get("sha")}},
+        {"bootstrap": "every quote reprices exactly; curve time ACT/365F; flat forward beyond the last pillar",
+         "interpolation": interpolation, "hull_white": {"mean_reversion": hw.mean_reversion, "sigma": hw.sigma,
+                                                        "used": hw_key is not None}},
+        key="rates_curve_export", store=data.store,
+    )  # fmt: skip
+    st.caption(
+        "Curve nodes (pillar dates, discount factors, zero rates, forwards between pillars, the quote solved at "
+        "each) and a dated grid of every curve, the repricing checks and manifest.json (code version, packages, "
+        "quotes and their sources, the history store's hash and download URLs)."
+    )
+    return full

@@ -32,7 +32,7 @@ from derivx.rates.swaps import (
     swap_position,
 )
 from derivx.risk.sensitivities import Position
-from derivx.ui import rates_risk
+from derivx.ui import rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -290,6 +290,20 @@ def render(market: Market) -> List[Position]:
     """Swap pricer tab; returns the swap (and its hedges, if asked)."""
 
     st.markdown("### / SWAP")
+    exports: Dict[str, pd.DataFrame] = {}
+    positions = _render(market, exports)
+    if positions:
+        swap = positions[0].details
+        rates_exports.export_row(
+            "swap", market, exports, {"swap": swap, "hedges_added": len(positions) - 1},
+            {"pricing": "OIS discounting; OIS legs compounded on the OIS curve, term legs on their projection curve",
+             "risk": "+/-1bp per curve quote, curves rebuilt, central difference"},
+            key="swap_export",
+        )  # fmt: skip
+    return positions
+
+
+def _render(market: Market, exports: Dict[str, pd.DataFrame]) -> List[Position]:
     conv = market.curve.conventions or DEFAULT_CONVENTIONS
     built = _swap_inputs(market, conv)
     if built is None:
@@ -302,7 +316,7 @@ def render(market: Market) -> List[Position]:
         st.warning(f"The swap pays after the curve's last quote ({pillars[-1]}); forwards beyond it are held flat.")
 
     if market.is_multi_curve:
-        return _render_multi_curve(swap, par, market, positions)
+        return _render_multi_curve(swap, par, market, positions, exports)
     bumps, no_risk = _bumps(market)
     pv01 = None if bumps is None else bumps.parallel_pv01(swap.pv)
     c = rates_risk.money(market)
@@ -320,6 +334,7 @@ def render(market: Market) -> List[Position]:
 
     st.markdown("#### / CASH FLOWS")
     table = _cashflow_table(swap, market)
+    exports["cashflows"] = table
     st.dataframe(table, hide_index=True, width="stretch", column_config=_cashflow_formats(c))
     st.download_button("Download cash flows CSV", _csv(table), file_name="swap_cashflows.csv", key="swap_cf_csv")
     st.caption("Amounts are signed to you (+ received, - paid); float rates include the spread.")
@@ -350,6 +365,7 @@ def render(market: Market) -> List[Position]:
     else:
         ladder = _cached("ladder", (swap, _curve_key(market)), lambda: _ladder_only(swap, market, bumps))
 
+    exports["key_rate_pv01"] = pd.DataFrame(ladder)
     with ladder_slot:
         st.plotly_chart(
             _ladder_chart(ladder, hedge is not None, c),
@@ -366,6 +382,7 @@ def render(market: Market) -> List[Position]:
         st.info("Pick at least one benchmark tenor to size a hedge.")
         return positions
     rows, ladder_table = _hedge_tables(hedge, c)
+    exports["hedge"] = rows
     h1, h2, h3 = st.columns(3)
     h1.metric(f"SWAP PV01 ({c})", _num(hedge["position_pv01"]))
     h2.metric(f"HEDGED PV01 ({c})", _num(hedge["hedged_pv01"]))
@@ -410,7 +427,9 @@ def _default_benchmarks(market: Market, swap: VanillaSwap, key: str) -> List[str
     return list(BENCHMARK_TENORS) if key in chain else []
 
 
-def _render_multi_curve(swap: VanillaSwap, par: float, market: Market, positions: List[Position]) -> List[Position]:
+def _render_multi_curve(
+    swap: VanillaSwap, par: float, market: Market, positions: List[Position], exports: Dict[str, pd.DataFrame]
+) -> List[Position]:
     """Metrics, per-curve ladders and the multi-curve hedge."""
 
     curves = rates_risk.risk_keys(market)
@@ -436,6 +455,11 @@ def _render_multi_curve(swap: VanillaSwap, par: float, market: Market, positions
 
     st.markdown("#### / CASH FLOWS")
     table = _cashflow_table(swap, market)
+    exports["cashflows"] = table
+    exports["key_rate_pv01"] = pd.DataFrame(
+        [{"curve": key, **{k: r[k] for k in ("label", "tenor", "years")}, "pv01": float(v)}
+         for key in curves for r, v in zip(*ladders[key])]
+    )  # fmt: skip
     st.dataframe(table, hide_index=True, width="stretch", column_config=_cashflow_formats(c))
     st.download_button("Download cash flows CSV", _csv(table), file_name="swap_cashflows.csv", key="swap_cf_csv")
     st.caption("Amounts are signed to you (+ received, - paid); float rates include the spread. DF is the OIS curve.")
@@ -523,6 +547,7 @@ def _render_multi_curve(swap: VanillaSwap, par: float, market: Market, positions
     h3.metric("LADDER RISK REMOVED (%)", f"{hedge['risk_removed'] * 100:.2f}")
     formats = {**_hedge_formats(c), "PAR SPREAD (BP)": st.column_config.NumberColumn(format="%.2f")}
     st.dataframe(rows, hide_index=True, width="stretch", column_config=formats)
+    exports["hedge"] = rows
     st.download_button("Download hedge CSV", _csv(rows), file_name="swap_hedge.csv", key="swap_hedge_csv")
     st.caption(
         "Least-squares notionals that minimise the stacked residual ladder of every curve (every quote of every "
