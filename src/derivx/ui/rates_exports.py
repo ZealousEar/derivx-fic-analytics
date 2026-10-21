@@ -60,19 +60,22 @@ def export_row(
     store: Optional[HistoryStore] = None,
 ) -> RunManifest:
     """Two download buttons: every table plus the manifest (ZIP), and the
-    manifest (JSON). Returns the manifest."""
+    manifest (JSON). Returns the manifest. The files are written when a
+    button is clicked, not on every rerun (zipping every tab's tables as CSV
+    on each rerun cost about a tenth of a second)."""
 
     record = manifest(kind, market, inputs, model, store)
+    frozen = dict(tables)
     stem = f"{kind.replace(' ', '_')}_{market.asof.isoformat()}"
     c1, c2 = st.columns(2)
     c1.download_button(
-        "DOWNLOAD TABLES + MANIFEST (ZIP)", bundle_zip(record, tables), file_name=f"{stem}.zip",
+        "DOWNLOAD TABLES + MANIFEST (ZIP)", lambda: bundle_zip(record, frozen), file_name=f"{stem}.zip",
         mime="application/zip", key=f"{key}_zip", on_click="ignore",
         help="Every table of this tab as CSV, with manifest.json: code version, packages, inputs, model settings, "
         "curve quotes and their sources, the history store's hash and download URLs.",
     )  # fmt: skip
     c2.download_button(
-        "DOWNLOAD RUN MANIFEST (JSON)", record.to_json(), file_name=f"{stem}_manifest.json", mime="application/json",
+        "DOWNLOAD RUN MANIFEST (JSON)", record.to_json, file_name=f"{stem}_manifest.json", mime="application/json",
         key=f"{key}_manifest", on_click="ignore",
     )  # fmt: skip
     return record

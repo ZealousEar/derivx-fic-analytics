@@ -447,3 +447,31 @@ def test_mixed_book_export_states_the_conversion(monkeypatch):
     )
     assert {"TOTAL USD", "TOTAL EUR", "ALL IN USD"} <= set(tables["scenario_grid"].columns)
     assert set(tables["hedges"]["CCY"]) <= {"EUR", "USD"}
+
+
+def test_reruns_skip_work_nobody_asked_for(monkeypatch):
+    """A3: the export ZIP and manifest are written when their button is
+    clicked, not on every rerun, and the scenario library (episodes and PCA
+    factors read from the history) is built once per store and date."""
+
+    from derivx.ui import rates_exports, rates_scenarios
+
+    calls = {"zip": 0, "library": 0}
+    zipper, library = rates_exports.bundle_zip, rates_scenarios.standard_library
+
+    def counted_zip(*args, **kwargs):
+        calls["zip"] += 1
+        return zipper(*args, **kwargs)
+
+    def counted_library(*args, **kwargs):
+        calls["library"] += 1
+        return library(*args, **kwargs)
+
+    monkeypatch.setattr(rates_exports, "bundle_zip", counted_zip)
+    monkeypatch.setattr(rates_scenarios, "standard_library", counted_library)
+    at = _app()
+    at.number_input(key="book_hedge_move").set_value(6.0).run()
+    _ok(at)
+    assert calls == {"zip": 0, "library": 1}
+    export = _downloads(at)["book_export_zip"]
+    assert export.proto.label == "DOWNLOAD TABLES + MANIFEST (ZIP)"
