@@ -68,7 +68,9 @@ dev = [
   "black>=24",
   "ruff==0.17.1",
   # Pinned like ruff: a new mypy release adds checks, so CI only changes when this does.
-  "mypy==2.4.0"
+  "mypy==2.4.0",
+  # tests/test_collect_workflow.py parses the GitHub workflow files
+  "PyYAML>=6,<7"
 ]
 notebooks = [
   "matplotlib>=3.8,<4",
