@@ -1147,6 +1147,8 @@ def _snapshots_sync(args: argparse.Namespace) -> int:
             print(f"  note: {notice}")
         for problem in result.failed:
             print(f"  failed: {problem}", file=sys.stderr)
+    else:
+        print(f"{store.label}: read in place, nothing downloaded")
     _print_coverage(store, args.tickers)
     return EXIT_SOURCE_ERROR if result is not None and result.failed else 0
 
@@ -1160,8 +1162,7 @@ def _snapshots_list(args: argparse.Namespace) -> int:
     except SnapshotError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_SOURCE_ERROR
-    if result is not None:
-        print(f"{store.label} (synced {result.synced_at}) in {store.root}")
+    print(f"{store.label} (synced {result.synced_at}) in {store.root}" if result is not None else store.label)
     _print_coverage(store, args.tickers)
     if args.sessions:
         for ticker in args.tickers or store.tickers():
