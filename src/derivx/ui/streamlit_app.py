@@ -16,10 +16,11 @@ from derivx.ui import (
     rates_swaption,
 )
 from derivx.ui.plot_limits import mount_zoom_guard
-from derivx.ui.state import keep_widget_values
+from derivx.ui.state import keep_widget_values, restore_widget_values
 from derivx.ui.theme import apply_app_style
 
 st.set_page_config(page_title="DERIVX / FIC ANALYTICS", layout="wide", initial_sidebar_state="auto")
+restore_widget_values()  # before any page draws: inputs of a mode switched back to show their kept values
 
 # Minimalist mode selector - architectural, no emojis
 st.sidebar.markdown("### / NAVIGATION")

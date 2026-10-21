@@ -79,6 +79,25 @@ def test_css_does_not_fight_streamlit_layout_or_fonts():
     assert re.search(r'stSidebar"\] \[data-testid="stWidgetLabel"\] p \{ text-transform: none; \}', css)
 
 
+def test_checkbox_labels_and_uploader_notes_wrap_instead_of_being_cut_off():
+    """Final review: at 1280 px the SCENARIOS checkboxes read 'MOVE SWAP CU...' and 'MOVE TREASUR...', the
+    lab's uploader cut its file-type list, and at 1024 px a dozen buttons (the sidebar's 'DOWNLOAD TABLES +
+    MANIFEST (ZIP)') lost their ends: Streamlit draws all of them with an ellipsis. Measured in the browser: no
+    ellipsis-truncated text on any view at 390, 1024, 1280 or 1920 px after these rules."""
+
+    css = theme.APP_CSS
+    for scope in (
+        '[data-testid="stCheckbox"] [data-testid="stWidgetLabel"]',
+        '[data-testid="stFileUploaderDropzoneInstructions"] *',
+        ".stButton button *",
+        ".stDownloadButton button *",
+    ):
+        rule = re.search(re.escape(scope) + r"[^{]*\{([^}]*)\}", css)
+        assert rule, scope
+        body = rule.group(1)
+        assert "white-space: normal !important" in body and "text-overflow: clip !important" in body, scope
+
+
 def test_committed_streamlit_theme_is_dark_with_the_app_colours():
     config = tomllib.loads((ROOT / ".streamlit" / "config.toml").read_text())
     t = config["theme"]

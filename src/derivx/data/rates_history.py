@@ -651,7 +651,16 @@ def parse_history_upload(
     if "date" not in lower:
         return rs.empty_frame(), [Issue("error", "the history needs a 'date' column")], units
     table = table.rename(columns={lower["date"]: "date"})
-    if {"tenor", "rate"} <= set(lower):
+    half = {"tenor", "rate"} & set(lower)
+    if len(half) == 1:
+        (given,) = half
+        other = ({"tenor", "rate"} - half).pop()
+        message = (
+            f"the history has a '{given}' column but no '{other}' column: a long table needs date, tenor and "
+            "rate; a wide one has date plus one column per tenor (2Y, 5Y, 10Y ...)"
+        )
+        return rs.empty_frame(), [Issue("error", message)], units
+    if half:
         long = table.rename(columns={lower["tenor"]: "tenor", lower["rate"]: "rate"})[["date", "tenor", "rate"]]
     else:
         long = table.melt(id_vars="date", var_name="tenor", value_name="rate")

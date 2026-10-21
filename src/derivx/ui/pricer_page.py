@@ -408,7 +408,7 @@ def _scenario(spec: ModeSpec, inp: calc.Inputs, position: float, ccy: Optional[s
         f"(base premium {calc.fmt_sig(grid.base_value)}). Cell labels are rounded to 2 significant figures; "
         "hover or open the table for exact values."
         + (
-            f" Vol shocks below -{inp.sigma * 100:.2f} pts are omitted (negative vol)."
+            f" Vol shocks below {(-inp.sigma * 100) or 0.0:.2f} pts are omitted (negative vol)."
             if grid.dropped_vol_shocks
             else ""
         )

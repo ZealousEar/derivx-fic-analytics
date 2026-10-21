@@ -579,7 +579,7 @@ def parse_quote_rows(pair: CurrencyPair, trade: dt.date, frame: pd.DataFrame) ->
         if atm is None or rr25 is None or bf25 is None:
             error = f"{tenor}: ATM, RR25 and BF25 are required"
         elif not 0 < atm <= 300:
-            error = f"{tenor}: ATM must be between 0 and 300 vol points (7.5 = 7.5%), got {atm:g}"
+            error = f"{tenor}: ATM must be above 0 and at most 300 vol points (7.5 = 7.5%), got {atm:g}"
         elif any(v is not None and abs(v) > 100 for v in (rr25, bf25, rr10, bf10)):
             error = f"{tenor}: RR and BF are in vol points (0.25 = 0.25%); |value| above 100 is not a quote"
         else:

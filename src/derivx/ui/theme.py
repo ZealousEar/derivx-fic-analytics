@@ -216,10 +216,19 @@ h3 { border-bottom: 1px solid #999999; font-size: 1.2rem; font-weight: 500; }
 [data-testid="stFileUploader"] button:hover { background: #FFFFFF; color: #000000; border-color: #FFFFFF; }
 .stButton button:disabled, .stDownloadButton button:disabled { color: #A6A6A6; border-color: #666666; }
 
-/* File uploader: a dashed drop zone on black. */
+/* Checkbox and button labels wrap instead of ending in an ellipsis (Streamlit truncates them: 'MOVE TREASURY
+   CURVE' read 'MOVE TREASUR...' in a five-column row at 1280px, the sidebar's 'DOWNLOAD TABLES + MANIFEST (ZIP)'
+   was cut at 1024px). */
+[data-testid="stCheckbox"] [data-testid="stWidgetLabel"], [data-testid="stCheckbox"] [data-testid="stWidgetLabel"] *,
+.stButton button *, .stDownloadButton button *, .stFormSubmitButton button * {
+  white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+}
+
+/* File uploader: a dashed drop zone on black; its size and file-type line wraps rather than being cut off. */
 [data-testid="stFileUploaderDropzone"] { background: #000000 !important; border: 2px dashed #FFFFFF !important;
   border-radius: 0 !important; }
-[data-testid="stFileUploaderDropzoneInstructions"] * { color: #E0E0E0 !important; }
+[data-testid="stFileUploaderDropzoneInstructions"] * { color: #E0E0E0 !important; white-space: normal !important;
+  overflow: visible !important; text-overflow: clip !important; }
 [data-testid="stFileUploaderFile"] { border: 1px solid #FFFFFF; }
 
 /* Multiselect chips: white on the dark accent (#B91C1C, 6.5:1); white on #FF4444 is only 3.4:1. */

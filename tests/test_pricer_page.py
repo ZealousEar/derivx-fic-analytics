@@ -196,6 +196,17 @@ def test_scenario_horizon_past_expiry_is_valued_at_intrinsic_and_says_so():
     assert any("reaches the expiry" in c.value for c in at.caption)
 
 
+@pytest.mark.parametrize("vol, shown", [(0.0, "below 0.00 pts"), (0.03, "below -3.00 pts")])
+def test_omitted_vol_shocks_caption_has_no_negative_zero(vol, shown):
+    """Final review: at vol 0 the caption said 'Vol shocks below -0.00 pts'."""
+
+    at = _app()
+    at.number_input(key="eq_vol").set_value(vol).run()
+    assert not at.exception
+    caption = next(c.value for c in at.caption if "are omitted (negative vol)" in c.value)
+    assert f"Vol shocks {shown} are omitted" in caption and "-0.00" not in caption
+
+
 def test_surface_domain_scales_with_vol_and_time_not_a_fixed_box():
     """PP-09: the spot axis covers spot and strike +- n sigma sqrt(T), at
     any price level (here an FX-like 1.08, which used to give 1e-6..11.08)."""

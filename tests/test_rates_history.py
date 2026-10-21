@@ -150,6 +150,10 @@ def test_parse_history_upload_long_and_wide():
         (pd.DataFrame({"date": ["2024-01-02", "2024-02-01"], "2Y": [45.0, 46.0]}), "outside"),
         (pd.DataFrame({"date": ["2024-01-02"], "2Y": [4.0]}), "two dates"),
         (pd.DataFrame({"date": ["not a date", "2024-02-01"], "2Y": [4.0, 4.1]}), "dates"),
+        # Final review: a 'rate' column without 'tenor' (one series) raised pandas' melt ValueError on the
+        # SCENARIOS tab; a 'tenor' column without 'rate' was read as a tenor named 'tenor'.
+        (pd.DataFrame({"date": ["2024-01-02", "2024-02-01"], "Rate": [4.0, 4.1]}), "'rate' column but no 'tenor'"),
+        (pd.DataFrame({"date": ["2024-01-02"], "tenor": ["2Y"], "2Y": [4.0]}), "'tenor' column but no 'rate'"),
     ],
 )
 def test_parse_history_upload_errors(table, message):
