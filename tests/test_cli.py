@@ -302,3 +302,64 @@ def test_risk_runs_as_a_module(book, tmp_path):
     )
     assert done.returncode == 0, done.stderr
     assert "TOTAL" in done.stdout and "key-rate PV01 of the book" in done.stdout
+
+
+# --------------------------------------------------------------------------
+# Review findings (regressions)
+# --------------------------------------------------------------------------
+
+
+def test_missing_and_broken_files_are_errors_not_tracebacks(book, tmp_path, capsys):
+    assert cli.main(["risk", "--trades", str(tmp_path / "nope.csv"), "--asof", "2026-10-19"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: No such file or directory") and "nope.csv" in err and "Traceback" not in err
+    assert cli.main(["risk", "--trades", str(book), "--curve", str(tmp_path / "nope.json")]) == 2
+    assert "nope.json" in capsys.readouterr().err
+    cases = {
+        "list.json": "[1, 2]",
+        "part.json": '{"format": "derivx.curve_set", "version": 1, "asof": "2026-10-19", "curves": {"curve": {}}}',
+        "text.json": "not json",
+    }
+    for name, text in cases.items():
+        path = tmp_path / name
+        path.write_text(text)
+        assert cli.main(["curve", "show", "--curve", str(path)]) == 2, name
+        err = capsys.readouterr().err
+        assert err.startswith("error: ") and "Traceback" not in err, (name, err)
+    assert cli.main(["curve", "show", "--curve", str(tmp_path / "part.json")]) == 2
+    assert "not a complete derivx.curve_set v1 file (KeyError: 'quotes')" in capsys.readouterr().err
+
+
+def test_unreadable_blotter_files_exit_with_the_reason(tmp_path, capsys):
+    for name, payload in {"empty.csv": b"", "ids.csv": b"id\nX1\n", "other.csv": b"foo,bar\n1,2\n"}.items():
+        path = tmp_path / name
+        path.write_bytes(payload)
+        assert cli.main(["book", "check", "--trades", str(path)]) == cli.EXIT_TRADES, name
+        err = capsys.readouterr().err
+        assert f"error: {name} blotter: " in err, err
+    assert cli.main(["risk", "--trades", str(tmp_path / "empty.csv"), "--asof", "2026-10-19"]) == cli.EXIT_TRADES
+    assert "the file is empty" in capsys.readouterr().err
+
+
+def test_bid_ask_without_a_move_uses_the_apps_move(book, capsys):
+    args = ["risk", "--trades", str(book), "--asof", "2026-10-19", "--illustrative-vols", "--hedge", "2Y,5Y,10Y,30Y"]
+    assert cli.main(args + ["--bid-ask", "0.25"]) == 0
+    penalised = capsys.readouterr().out
+    assert "the cost penalty hedges against 5bp curve moves" in penalised
+    assert cli.main(args + ["--bid-ask", "0.25", "--move", "5"]) == 0
+    explicit = capsys.readouterr().out
+    assert penalised.split("hedge: ")[1] == explicit.split("hedge: ")[1]  # the same hedge as --move 5
+    assert cli.main(args + ["--move", "5"]) == 0
+    plain = capsys.readouterr().out
+    assert "--move only sizes the cost penalty" in plain and "bid/ask cost 0.00" in plain
+    assert "e+0" not in explicit.split("hedge: ")[1]  # notionals printed as money, not 1.2e+07
+
+
+def test_trades_in_another_currency_say_how_to_build_their_market(book, tmp_path, capsys):
+    curve = tmp_path / "eur.json"
+    assert cli.main(["curve", "build", "--asof", "2026-10-19", "--conventions", "EUR ESTR", "--out", str(curve)]) == 0
+    capsys.readouterr()
+    assert cli.main(["scenario", "--trades", str(book), "--curve", str(curve), "--shock", "parallel:10"]) == 3
+    err = capsys.readouterr().err
+    assert "skipped: US1 (swap): a USD swap: the market is EUR ESTR" in err
+    assert "(here: --asof with --conventions 'USD SOFR', or a curve set built with them)" in err

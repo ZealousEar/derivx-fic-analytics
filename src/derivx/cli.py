@@ -441,6 +441,7 @@ def _register_curve(parser: argparse.ArgumentParser) -> None:
 # --------------------------------------------------------------------------
 
 EXIT_TRADES = 3  # some blotter rows had errors or could not be priced (the rest were)
+DEFAULT_HEDGE_MOVE_BP = 5.0  # the BOOK tab's default curve move for the cost-penalised hedge
 
 
 def _trades(path: Path):
@@ -505,7 +506,12 @@ def _skipped(risk) -> None:
         hint = ""
         if "vol cube" in reason or "caplet vols" in reason:
             hint = " (or pass --swaption-vols / --cap-vols / --illustrative-vols)"
+        elif "switch the swap curve to" in reason:
+            conventions = reason.rsplit("switch the swap curve to ", 1)[1].split(" to price it")[0]
+            hint = f" (here: --asof with --conventions {conventions!r}, or a curve set built with them)"
         print(f"skipped: {trade.id} ({trade.type}): {reason}{hint}", file=sys.stderr)
+    for note in risk.notes:
+        print(f"  note: priced beyond the market data: {note}")
 
 
 def _money(value: float) -> str:
@@ -540,15 +546,27 @@ def _risk(args: argparse.Namespace) -> int:
         print("key-rate PV01 of the book (P&L per +1bp of one quote; buckets under half a cent left out):")
         print(loaded.assign(pv01=loaded["pv01"].map(_money)).drop(columns=["gamma"]).to_string(index=False))
     hedge = None
+    move = args.move
     if args.hedge:
+        if args.bid_ask is not None and move is None:
+            move = DEFAULT_HEDGE_MOVE_BP
+            print(f"  note: --bid-ask without --move: the cost penalty hedges against {move:g}bp curve moves (the "
+                  "app's default; set it with --move)")  # fmt: skip
+        elif args.bid_ask is None and move is not None:
+            print("  note: --move only sizes the cost penalty, and there is none without --bid-ask: least-squares "
+                  "hedge")  # fmt: skip
         bench = {key: list(args.hedge) for key in pf.default_benchmarks(risk, market)}
         costs = {k: args.bid_ask for k in pf.assumed_bid_ask(market, bench)} if args.bid_ask is not None else {}
         instruments = pf.hedge_instruments(market, bench, bid_ask_bp=costs)
-        hedge = pf.hedge_book(risk, market, instruments, args.move)
-        table = hedge.table[hedge.table["notional"] != 0.0]
+        hedge = pf.hedge_book(risk, market, instruments, move)
+        table = hedge.table[hedge.table["notional"] != 0.0].copy()
+        for column in ("notional", "cost", "pv01"):
+            table[column] = table[column].map(_money)
+        table["par"] = table["par"].map(lambda v: f"{100 * v:.4f}%")  # par rate, basis spread or coupon
         print(f"hedge: residual risk {_money(hedge.risk_after)} vs {_money(hedge.risk_before)} per bp (root sum of "
               f"squares of the key-rate ladder, {100 * hedge.risk_removed:.2f}% of its square removed), bid/ask cost "
-              f"{_money(hedge.cost)}")  # fmt: skip
+              f"{_money(hedge.cost)}; notional > 0 receives fixed, receives the spread leg or buys the bond; pv01 per "
+              "+1bp on every quote")  # fmt: skip
         print(table.to_string(index=False))
     report = exports.risk_report(risk)
     _write_table(report, args.out, "risk report")
@@ -559,7 +577,7 @@ def _risk(args: argparse.Namespace) -> int:
         "book risk",
         {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes()),
                     "rows_valid": len(trades)}, "vols": vol_inputs,
-         "hedge": None if hedge is None else {"tenors": list(args.hedge), "move_bp": args.move,
+         "hedge": None if hedge is None else {"tenors": list(args.hedge), "move_bp": move,
                                               "bid_ask_bp": args.bid_ask}},
         data,
         {"bump_bp": pf.BP, "risk": "central differences on full revaluation, curves rebuilt",
@@ -748,7 +766,9 @@ def _register_risk(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ladder", type=Path, help="write the key-rate ladder by trade CSV")
     parser.add_argument("--ladder-all", action="store_true", help="print every key-rate bucket, zeros included")
     parser.add_argument("--hedge", type=_list, help="hedge with par instruments at these tenors, e.g. 2Y,5Y,10Y,30Y")
-    parser.add_argument("--move", type=float, help="with --bid-ask: hedge against curve moves of this size (bp)")
+    parser.add_argument("--move", type=float,
+                        help=f"with --bid-ask: hedge against curve moves of this size (bp; default "
+                        f"{DEFAULT_HEDGE_MOVE_BP:g})")  # fmt: skip
     parser.add_argument("--bid-ask", type=float, help="bid/ask (bp of the hedge's quote) of every hedge")
     parser.add_argument("--hedge-out", type=Path, help="write the book / hedge / residual ladder CSV")
     parser.add_argument("--manifest", type=Path, help="write the run manifest JSON")
@@ -795,6 +815,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return int(args.func(args))
     except ValueError as exc:  # bad combinations of arguments the parser cannot see
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:  # a file to read is missing or unreadable, or one to write cannot be
+        where = f": {exc.filename}" if getattr(exc, "filename", None) else ""
+        print(f"error: {exc.strerror or exc}{where}", file=sys.stderr)
         return 2
 
 

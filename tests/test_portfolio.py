@@ -511,3 +511,178 @@ def test_summary_and_ladder_tables():
     buf = io.StringIO()
     risk.vega_buckets.to_csv(buf, index=False)
     assert buf.getvalue().startswith("id,expiry,bucket,vega,method")
+
+
+# --------------------------------------------------------------------------
+# Review findings (regressions)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cells, text",
+    [
+        (dict(notional="1,5mm"), "a comma is read only as a thousands separator"),  # was read as 15mm
+        (dict(spread="2,5"), "a comma is read only as a thousands separator"),  # was read as 25bp
+        (dict(rate="3,5"), "a comma is read only as a thousands separator"),
+        (dict(notional="1,00,000"), "a comma is read only as a thousands separator"),
+    ],
+)
+def test_decimal_commas_are_refused_not_misread(cells, text):
+    row = _row(type="swap", direction="pay", tenor="5Y", index="OIS", **cells)
+    trades, issues = pf.parse_blotter(pd.DataFrame([row]))
+    assert trades == [] and any(text in i.message and i.level == "error" for i in issues), [str(i) for i in issues]
+
+
+@pytest.mark.parametrize("text, value", [("1,000,000", 1e6), ("10,000mm", 1e10), ("2,500.5k", 2.5005e6)])
+def test_thousands_separators_still_read(text, value):
+    trades, issues = pf.parse_blotter(pd.DataFrame([_row(type="swap", direction="pay", tenor="5Y", index="OIS",
+                                                         notional=text)]))  # fmt: skip
+    assert issues == [] and trades[0].notional == value
+
+
+@pytest.mark.parametrize("price", [0, 150, "96,2", 69.99, 110.01])
+def test_futures_prices_outside_the_rate_range_are_refused(price):
+    row = _row(type="future", direction="short", tenor="DEC26", index="SR3", price=price, notional=10)
+    trades, issues = pf.parse_blotter(pd.DataFrame([row]))
+    assert trades == [] and any(i.level == "error" and "price" in i.message for i in issues), [str(i) for i in issues]
+    ok = _row(type="future", direction="short", tenor="DEC26", index="SR3", price=96.2, notional=10)
+    assert pf.parse_blotter(pd.DataFrame([ok]))[1] == []
+
+
+def test_bond_clean_price_must_be_positive():
+    row = _row(type="bond", direction="long", maturity="2035-08-15", rate=4.25, price=0)
+    _, issues = pf.parse_blotter(pd.DataFrame([row]))
+    assert any("bond clean price must be positive" in i.message for i in issues)
+
+
+@pytest.mark.parametrize(
+    "cells, level, text",
+    [
+        (dict(vol=10000), "error", "above 2000bp for the normal model"),
+        (dict(vol=500, model="black"), "error", "above 300% for the black model"),
+        (dict(vol=0.9), "warning", "looks like a decimal"),
+        (dict(vol=0.25, model="black"), "warning", "looks like a decimal"),
+    ],
+)
+def test_implausible_vols_say_which_units(cells, level, text):
+    row = _row(type="cap", direction="long", tenor="5Y", index="3M", strike=4, **cells)
+    issues = _issues(row)
+    found = [i for i in issues if text in i.message]
+    assert found and found[0].level == level, [str(i) for i in issues]
+    assert pf.parse_blotter(pd.DataFrame([_row(type="cap", direction="long", tenor="5Y", index="3M", vol=0)]))[1] == []
+
+
+@pytest.mark.parametrize("name", ["TOTAL", "total", "Book", "TOTAL USD"])
+def test_ids_of_the_book_totals_are_reserved(name):
+    row = _row(id=name, type="swap", direction="pay", tenor="5Y", index="OIS")
+    trades, issues = pf.parse_blotter(pd.DataFrame([row]))
+    assert trades == [] and any("is reserved for the book's totals" in i.message for i in issues)
+
+
+@pytest.mark.parametrize(
+    "payload, text",
+    [
+        (b"", "the file is empty"),
+        (b"   \n\n", "the file is empty"),
+        (b"foo,bar\n1,2\n", "no blotter columns in the header (foo, bar)"),  # crashed the RATES page
+        (b"\xff\xfe\x00garbage", "not UTF-8 text"),
+        (b"id,type,ID\nA,swap,B\n", "columns id appear more than once"),
+    ],
+)
+def test_unreadable_blotter_files_are_one_clear_error(payload, text):
+    table, issues = pf.read_blotter_csv(payload)
+    assert list(table.columns) == list(pf.COLUMNS) and table.empty
+    assert len(issues) == 1 and issues[0].level == "error" and text in issues[0].message, [str(i) for i in issues]
+    assert pf.parse_blotter(table) == ([], [])
+
+
+def test_a_blotter_file_without_the_required_columns_says_which():
+    table, issues = pf.read_blotter_csv(b"id\nX1\nX2\n")  # one column: used to crash the RATES page
+    assert table.empty and len(issues) == 1 and issues[0].level == "error"
+    assert "missing columns: type, currency, direction, notional" in issues[0].message
+    _, issues = pf.read_blotter_csv(b"id,type,direction,notional,tenor,index\nA,swap,pay,1mm,5Y,OIS\n")
+    assert [i.message.split(" (")[0] for i in issues] == ["missing columns: currency"]
+    _, issues = pf.parse_blotter(pd.DataFrame([_row(type=None, direction="pay")]))
+    assert issues[0].message.startswith("type is missing: give one of swap, basis swap")
+
+
+def test_blotter_files_with_other_delimiters_and_spellings():
+    text = "ID;Type;Currency;Direction;Notional;Tenor;Index;Expiry;Option;Model;Vol\n" \
+           "A1;IRS;usd;rec;10mm;5Y;OIS;;;;\nA2;Swaption;USD;Buy;5mm;10Y;OIS;1Y;Payer;Bachelier;90\n" \
+           "A3;swpa;USD;rec;1mm;5Y;OIS;;;;\n"  # fmt: skip
+    table, issues = pf.read_blotter_csv(text.encode())
+    assert issues == []
+    # recognised spellings become the editor's options, so its select cells show them; others stay as typed
+    assert list(table["type"]) == ["swap", "swaption", "swpa"]
+    assert list(table["direction"]) == ["receive", "long", "receive"]
+    assert list(table["currency"]) == ["USD"] * 3 and table.loc[1, "option"] == "payer"
+    assert table.loc[1, "model"] == "normal" and table.loc[1, "vol"] == "90"
+    trades, more = pf.parse_blotter(table)
+    assert [t.id for t in trades] == ["A1", "A2"] and any("type 'swpa'" in i.message for i in more)
+    tab = "id\ttype\tcurrency\tdirection\tnotional\ttenor\tindex\nT\tswap\tUSD\tpay\t1mm\t2Y\tOIS\n"
+    (trade,), _ = pf.parse_blotter(pf.read_blotter_csv(tab.encode())[0])
+    assert (trade.direction, trade.notional) == ("pay", 1e6)
+
+
+def test_least_squares_hedge_leaves_out_redundant_combinations():
+    """A hedge that is (almost) the average of two others: the exact least
+    squares buys it against them with huge offsetting notionals for no risk;
+    the hedge leaves that mix out and keeps the residual."""
+
+    rng = np.random.default_rng(5)
+    a, b = rng.normal(size=20) * 300, rng.normal(size=20) * 300
+    H = np.column_stack([a, b, 0.5 * (a + b) + rng.normal(size=20) * 1e-4])
+    target = rng.normal(size=20) * 1000
+    exact, *_ = np.linalg.lstsq(H, -target, rcond=None)
+    assert np.max(np.abs(exact)) > 1e3  # the defect: offsetting multiples of thousands of units
+    x = pf.optimise_hedge(target, H)
+    assert np.max(np.abs(x)) < 10.0
+    best, mine = np.linalg.norm(target + H @ exact), np.linalg.norm(target + H @ x)
+    assert best <= mine <= 1.05 * best
+    assert np.array_equal(pf.optimise_hedge(target, np.column_stack([H, np.zeros(20)]))[:3], x)  # dead hedge: 0
+    assert pf.optimise_hedge(target, np.zeros((20, 2))).tolist() == [0.0, 0.0]
+
+
+def test_book_hedge_on_every_tenor_has_sane_notionals():
+    """USD book hedged with 1Y-30Y OIS and Treasuries without costs: the
+    exact least squares sold $358mm 10Y, bought $850mm 15Y and sold $495mm
+    20Y Treasuries against a $10mm bond (bid/ask $445k) to take out 0.02% more
+    risk."""
+
+    market, _, _, risk = _usd()
+    tenors = ["1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "30Y"]
+    bench = {"curve": tenors, "govt": tenors}
+    instruments = pf.hedge_instruments(market, bench, bid_ask_bp=pf.assumed_bid_ask(market, bench))
+    H = pf.unit_ladders(instruments, market, list(risk.risk))
+    result = pf.hedge_book(risk, market, instruments, None, ladders=H)
+    exact, *_ = np.linalg.lstsq(H, -risk.stacked(), rcond=None)
+    assert np.linalg.norm(risk.stacked() + H @ exact) == pytest.approx(result.risk_after, rel=1e-3)
+    gross = float(result.table["notional"].abs().sum())
+    assert gross < 250e6 and float(np.abs(exact).sum()) * 1e6 > 1e9
+    assert result.cost < 20_000.0
+
+
+def test_trades_priced_beyond_the_market_data_say_so():
+    """The SWAP and SWAPTION tabs warn when a trade runs past the curve's
+    last quote or outside the vol cube; the book priced such trades silently
+    (a 60Y swap on a 30Y curve, a 15Y-expiry swaption on a 10Y cube)."""
+
+    market, _, vols, risk = _usd()
+    assert risk.notes == ()  # the example book stays inside its data
+    rows = [
+        _row(id="S60", type="swap", direction="pay", tenor="60Y", index="OIS"),
+        _row(id="FWD", type="swap", direction="pay", tenor="5Y", start="30Y", index="OIS"),
+        _row(id="B75", type="bond", direction="long", maturity="2075-08-15", rate=4.0),
+        _row(id="C40", type="cap", direction="long", tenor="40Y", index="3M", strike=4.0),
+        _row(id="W15", type="swaption", direction="long", expiry="15Y", tenor="10Y", option="payer"),
+        _row(id="IN", type="swap", direction="pay", tenor="30Y", index="OIS"),
+    ]
+    trades, issues = pf.parse_blotter(pd.DataFrame(rows))
+    assert issues == []
+    book = pf.price_book(trades, market, vols, vega=False)
+    notes = "\n".join(book.notes)
+    assert "S60 pays until 2086-10-21, after the last quote of the USD SOFR discount curve (2056-10-25)" in notes
+    assert "FWD pays until" in notes and "B75 pays until 2075-08-15, after the last quote of the US Treasury" in notes
+    assert "C40 has caplets fixing after the last stripped caplet" in notes
+    assert "W15 is outside the swaption cube (10Y x 30Y at most)" in notes
+    assert "IN " not in notes and "not market data" in notes

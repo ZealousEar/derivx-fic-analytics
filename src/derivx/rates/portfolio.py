@@ -76,11 +76,14 @@ quote of every curve, currency per bp), ``H`` the hedges' ladders,
 ``move_bp * ||r||_2`` the largest first-order loss of the residual book on
 any curve move whose bp moves have a Euclidean norm of ``move_bp``, and
 ``cost_j`` half the bid/ask (bp) times the hedge's DV01 to its own quote.
-Without costs it is the least-squares hedge.
+Without costs it is the least-squares hedge, leaving out combinations of
+hedges whose ladders almost cancel (they would be bought with huge
+offsetting notionals for next to no risk; see :func:`least_squares_hedge`).
 """
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import io
 import math
@@ -140,6 +143,9 @@ BP = 1.0  # risk bump, bp
 NOISE = 0.005  # currency per bp: smaller hedge notionals and buckets are rebuild rounding
 DEFAULT_UNIT_NOTIONAL = 1e6
 TOTAL = "TOTAL"
+RESERVED_IDS = (TOTAL, "BOOK")  # the book's total rows and columns; "TOTAL USD" etc. too
+FUTURE_PRICES = (70.0, 110.0)  # 100 - rate for rates of -10% to 30%, the range rates and strikes are checked on
+MAX_VOL = {"normal": (2000.0, "bp"), "black": (300.0, "%"), "shifted black": (300.0, "%")}  # the CAP-FLOOR tab's
 
 DIRECTIONS: Dict[str, Tuple[str, str]] = {  # (positive, negative) side of each type
     "swap": ("receive", "pay"),
@@ -286,17 +292,27 @@ def is_blank(value: object) -> bool:
 
 _SUFFIX = {"K": 1e3, "M": 1e6, "MM": 1e6, "B": 1e9, "BN": 1e9}
 _NUMBER_RE = re.compile(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(K|M|MM|B|BN)?$")
+_GROUPED_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?(?:[eE][+-]?\d+)?(?:K|M|MM|B|BN)?$")
 
 
 def parse_number(value: object, what: str, suffixes: bool = False) -> float:
     """A cell as a float: ``4.25``, ``"4.25%"``, ``"1,000,000"`` and, with
-    ``suffixes``, ``10mm`` / ``2.5bn`` / ``500k``. ``ValueError`` says which
-    column could not be read."""
+    ``suffixes``, ``10mm`` / ``2.5bn`` / ``500k``. A comma is only read as a
+    thousands separator (groups of three digits): ``"1,5mm"`` or ``"3,5"``
+    (a decimal comma) is refused rather than read as 15mm or 35.
+    ``ValueError`` says which column could not be read."""
 
     if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
         number = float(value)
     else:
-        text = str(value).strip().upper().replace(",", "").replace("%", "").replace(" ", "")
+        text = str(value).strip().upper().replace("%", "").replace(" ", "")
+        if "," in text:
+            if not _GROUPED_RE.match(text):
+                raise ValueError(
+                    f"{what} {value!r}: a comma is read only as a thousands separator (1,000,000); write decimals "
+                    "with a dot (1.5mm, 3.5)"
+                )
+            text = text.replace(",", "")
         match = _NUMBER_RE.match(text)
         if not match or (match.group(2) and not suffixes):
             raise ValueError(f"{what} {value!r} is not a number" + (" (e.g. 10mm, 2.5bn)" if suffixes else ""))
@@ -384,6 +400,13 @@ def _parse_field(kind: str, name: str, value: object) -> object:
             raise ValueError(f"bond coupon must be in [0, 100) %, got {number:g}")
         if name in ("rate", "strike") and kind != "bond" and not -10.0 <= number <= 30.0:
             raise ValueError(f"{name} {number:g}% is outside -10% to 30%: rates are in percent (3.5 = 3.5%)")
+        if name == "price" and kind == "future" and not FUTURE_PRICES[0] <= number <= FUTURE_PRICES[1]:
+            raise ValueError(
+                f"futures price {number:g} is outside {FUTURE_PRICES[0]:g} to {FUTURE_PRICES[1]:g} (a rate of -10% "
+                "to 30%): the price is 100 minus the rate in percent (96.20 for 3.80%)"
+            )
+        if name == "price" and kind == "bond" and number <= 0:
+            raise ValueError(f"bond clean price must be positive (per 100 face), got {number:g}")
         return number
     if name == "maturity":
         return _date(value, "maturity")
@@ -430,10 +453,16 @@ def parse_trade(row: Mapping[str, object], number: int = 0) -> Tuple[Optional[Tr
     def issue(level: str, message: str) -> None:
         issues.append(BlotterIssue(level, number, trade_id, message))
 
+    if trade_id and (trade_id.upper() in RESERVED_IDS or trade_id.upper().startswith(TOTAL + " ")):
+        issue("error", f"id {trade_id!r} is reserved for the book's totals: give the trade another id")
+
     raw_type = row.get("type")
     kind = _TYPE_ALIASES.get(" ".join(str(raw_type).strip().lower().split())) if not is_blank(raw_type) else None
     if kind is None:
-        issue("error", f"type {raw_type!r} is not one of {', '.join(TRADE_TYPES)}")
+        if is_blank(raw_type):
+            issue("error", f"type is missing: give one of {', '.join(TRADE_TYPES)}")
+        else:
+            issue("error", f"type {raw_type!r} is not one of {', '.join(TRADE_TYPES)}")
         return None, issues
     currency = "" if is_blank(row.get("currency")) else str(row.get("currency")).strip().upper()
     if currency not in CURRENCIES:
@@ -487,6 +516,13 @@ def parse_trade(row: Mapping[str, object], number: int = 0) -> Tuple[Optional[Tr
         if model != "shifted black" and values.get("shift"):
             issue("warning", f"shift is only used by shifted black, not {model}; ignored")
             fields = [(n, v) for n, v in fields if n != "shift"]
+        if "vol" in values:
+            vol, (top, unit) = float(values["vol"]), MAX_VOL[model]
+            units = "normal vols are in bp (95 = 95bp), Black vols in % (25 = 25%)"
+            if vol > top:
+                issue("error", f"vol {vol:g}{unit} is above {top:g}{unit} for the {model} model: {units}")
+            elif 0.0 < vol < 1.0:
+                issue("warning", f"vol {vol:g}{unit} for the {model} model looks like a decimal: {units}")
     if kind == "basis swap" and currency in CURRENCIES and "index" in values:
         legs = str(values["index"]).split("/")
         a, b = get_index(legs[0]), get_index(legs[1])
@@ -536,23 +572,82 @@ def parse_blotter(table: pd.DataFrame) -> Tuple[List[Trade], List[BlotterIssue]]
     return trades, issues
 
 
+CSV_DELIMITERS = ",;\t|"
+
+
+def _canonical(column: str, value: object) -> object:
+    """A recognised spelling of a categorical cell as the editor's option
+    (``IRS`` -> ``swap``, ``rec`` -> ``receive``, ``Payer`` -> ``payer``,
+    ``usd`` -> ``USD``); anything else is kept as typed for
+    :func:`parse_blotter` to report."""
+
+    if is_blank(value):
+        return None
+    text = " ".join(str(value).strip().split())
+    if column == "type":
+        return _TYPE_ALIASES.get(text.lower(), text)
+    if column == "direction":
+        return _DIRECTION_ALIASES.get(text.lower(), text)
+    if column == "option":
+        return text.lower() if text.lower() in SWAPTION_KINDS else text
+    if column == "model":
+        lower = text.lower().replace("_", " ")
+        lower = {"bachelier": "normal", "lognormal": "black", "shifted": "shifted black"}.get(lower, lower)
+        return lower if lower in MODEL_NAMES else text
+    if column == "currency":
+        return text.upper() if text.upper() in CURRENCIES else text
+    return value
+
+
 def read_blotter_csv(payload: bytes) -> Tuple[pd.DataFrame, List[BlotterIssue]]:
     """Uploaded blotter CSV -> (table of text cells in blotter columns,
-    issues). Cells stay text, so ``10mm`` or ``DEC26`` are read as typed;
-    :func:`parse_blotter` validates them."""
+    issues). The delimiter (comma, semicolon, tab or bar) is read from the
+    header line. Cells stay text, so ``10mm`` or ``DEC26`` are read as typed
+    (recognised spellings of type, direction, option, model and currency
+    become the editor's options); :func:`parse_blotter` validates them. A
+    file that cannot be read, or lacks the type, currency, direction or
+    notional column, is one ``error`` issue and an empty table."""
+
+    def failed(message: str) -> Tuple[pd.DataFrame, List[BlotterIssue]]:
+        return blotter_frame([]), [BlotterIssue("error", 0, "", message)]
 
     try:
-        raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig", dtype=str, keep_default_na=False,
-                          na_values=[""], sep=None, engine="python")  # fmt: skip
-    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
-        return blotter_frame([]), [BlotterIssue("error", 0, "", f"could not read the file ({exc})")]
+        text = bytes(payload).decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return failed(f"could not read the file: it is not UTF-8 text ({exc})")
+    if not text.strip():
+        return failed("the file is empty: it needs a header row with the blotter columns (see the column guide)")
+    header = text.lstrip().splitlines()[0]
+    try:
+        sep = csv.Sniffer().sniff(header, delimiters=CSV_DELIMITERS).delimiter
+    except csv.Error:
+        sep = ","  # one column, or no delimiter in the header
+    try:
+        raw = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, na_values=[""], sep=sep)
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, ValueError, csv.Error) as exc:
+        return failed(f"could not read the file ({exc})")
     raw.columns = [str(c).strip().lower() for c in raw.columns]
+    twice = sorted({c for c in raw.columns if list(raw.columns).count(c) > 1})
+    if twice:
+        return failed(f"columns {', '.join(twice)} appear more than once (column names ignore case)")
+    known = [c for c in raw.columns if c in COLUMNS]
+    if not known:
+        return failed(
+            f"no blotter columns in the header ({', '.join(raw.columns) or 'none'}): it needs type, currency, "
+            "direction, notional and the columns each trade type reads (see the column guide)"
+        )
+    missing = [c for c in ("type", "currency", "direction", "notional") if c not in raw.columns]
+    if missing:
+        return failed(f"missing columns: {', '.join(missing)} (see the column guide)")
     issues = []
     unknown = [c for c in raw.columns if c not in COLUMNS]
     if unknown:
         issues.append(BlotterIssue("warning", 0, "", f"columns {', '.join(unknown)} are not blotter columns; ignored"))
-    out = pd.DataFrame({c: raw[c] if c in raw.columns else None for c in COLUMNS})
-    return out.astype(object).where(out.notna(), None), issues
+    out = pd.DataFrame({c: raw[c] if c in raw.columns else None for c in COLUMNS}, index=raw.index)
+    out = out.astype(object).where(out.notna(), None)
+    for column in ("type", "direction", "option", "model", "currency"):
+        out[column] = [_canonical(column, v) for v in out[column]]
+    return out, issues
 
 
 def blotter_frame(trades: Sequence[Trade]) -> pd.DataFrame:
@@ -1053,7 +1148,7 @@ def _vega_rows(position: Position, trade: Trade, market: Market, vols: VolSet, e
 class BookRisk:
     """Risk of the priced trades on one market (see the module docstring
     for units and signs); ``skipped`` lists trades not priced with the
-    reason."""
+    reason, ``notes`` where trades are priced beyond the market data."""
 
     asof: dt.date
     trades: Tuple[Trade, ...]
@@ -1068,6 +1163,7 @@ class BookRisk:
     skipped: Tuple[Tuple[Trade, str], ...]
     currencies: Tuple[str, ...]
     curve_currency: Dict[str, str]
+    notes: Tuple[str, ...] = ()  # where trades are priced beyond the market data (:func:`extrapolation_notes`)
 
     @property
     def ids(self) -> List[str]:
@@ -1146,6 +1242,97 @@ class BookRisk:
             if row.expiry in table.index and row.bucket in table.columns:
                 table.loc[row.expiry, row.bucket] += row.vega
         return table
+
+
+def _trade_curves(trade: Trade) -> List[str]:
+    """Curves a trade's cash flows are projected or discounted on."""
+
+    index = str(trade.get("index") or "")
+    if trade.type == "bond":
+        return [GOVT_KEY]
+    if trade.type == "basis swap":
+        return [DISCOUNT_KEY] + index.split("/")
+    if trade.type == "future":
+        return ["EURIBOR 3M"] if index == "FUT" else [DISCOUNT_KEY]
+    return [DISCOUNT_KEY] + ([index] if index in INDICES else [])
+
+
+def _curve_name(market: Market, key: str) -> str:
+    if key == DISCOUNT_KEY:
+        conv = market.curve.conventions
+        return f"{conv.name if conv is not None else 'swap'} discount"
+    return "US Treasury" if key == GOVT_KEY else key
+
+
+def _last_date(trade: Trade, position: Position, market: Market) -> dt.date:
+    inst = position.details["instrument"]
+    if trade.type in ("swap", "basis swap"):
+        return inst.termination_date(market.asof)
+    if trade.type == "fra":
+        return inst.dates(market.asof)["maturity"]
+    if trade.type == "future":
+        return inst.period(market.asof)[1]
+    if trade.type == "bond":
+        return inst.maturity
+    if trade.type in ("cap", "floor"):
+        return max(inst.caplets(market)["pay"])
+    return inst.inputs(market).maturity
+
+
+def extrapolation_notes(trades: Sequence[Trade], positions: Sequence[Position], market: Market,
+                        vols: Optional[VolSet] = None) -> List[str]:  # fmt: skip
+    """Where the book is priced beyond its market data, as on the SWAP and
+    SWAPTION tabs: a trade paying after the last quote of a curve it uses
+    (forwards there are flat extrapolations, not market data), a
+    cube-priced swaption outside the cube's expiries or tenors and a cap on
+    stripped vols beyond the last stripped caplet (vols held flat)."""
+
+    vols = vols or VolSet()
+    notes: List[str] = []
+    for trade, position in zip(trades, positions):
+        try:
+            notes += _trade_notes(trade, position, market, vols)
+        except ValueError:  # a priced trade's dates always resolve; never let a note stop the book
+            continue
+    return notes
+
+
+def _trade_notes(trade: Trade, position: Position, market: Market, vols: VolSet) -> List[str]:
+    """Notes of one priced trade (see :func:`extrapolation_notes`)."""
+
+    notes: List[str] = []
+    end = _last_date(trade, position, market)
+    years = (end - market.asof).days / 365.0
+    for key in _trade_curves(trade):
+        curve = market.get_curve(key)
+        last = float(curve.ts[-1])
+        if years > last + 1.0 / 365.0:
+            pillar = (curve.pillar_dates or [None])[-1]
+            notes.append(
+                f"{trade.id} pays until {end}, after the last quote of the {_curve_name(market, key)} curve "
+                f"({pillar or f'{last:.1f}Y'}): forwards there are flat extrapolations, not market data"
+            )
+            break
+    source = position.details.get("vol_source")
+    inst = position.details["instrument"]
+    if source == "cube":
+        cube = vols.cubes.get(cube_key(trade))
+        if cube is not None:
+            expiry = inst.inputs(market).expiry_years
+            outside = expiry > float(_expiry_years([cube.expiries[-1]], market)[0]) + 1e-9 or (
+                parse_tenor(str(trade.get("tenor"))).years > parse_tenor(cube.tenors[-1]).years
+            )
+            if outside:
+                notes.append(f"{trade.id} is outside the swaption cube ({cube.expiries[-1]} x {cube.tenors[-1]} "
+                             "at most): its vol is held flat from the cube's edge")  # fmt: skip
+    elif source == "stripped":
+        stripped = vols.caplets.get(cap_key(trade))
+        curve = (list(getattr(stripped, "curves", ())) or [stripped])[0] if stripped is not None else None
+        live = inst.caplets(market)
+        if curve is not None and len(live) and float(live["expiry"].max()) > float(curve.nodes[-1]) + 1e-9:
+            notes.append(f"{trade.id} has caplets fixing after the last stripped caplet ({curve.nodes[-1]:.1f}Y): "
+                         "their vols are held flat")  # fmt: skip
+    return notes
 
 
 def _currency_of(trade: Trade, market: Market) -> str:
@@ -1229,6 +1416,7 @@ def price_book(
         skipped=tuple(skipped),
         currencies=tuple(_currency_of(t, market) for t in priced),
         curve_currency=curve_currency,
+        notes=tuple(extrapolation_notes(priced, positions, market, vols)),
     )
 
 
@@ -1328,6 +1516,31 @@ def _lasso(G: np.ndarray, b: np.ndarray, penalty: np.ndarray, x0: np.ndarray, to
     return x
 
 
+REDUNDANT = 1e-3  # relative singular value under which a combination of hedges counts as redundant
+
+
+def least_squares_hedge(target: np.ndarray, hedges: np.ndarray, rcond: float = REDUNDANT) -> np.ndarray:
+    """Least-squares hedge multiples ``x`` (min ``||target + hedges @ x||``)
+    that trade no redundant combination of hedges: with every hedge's ladder
+    scaled to unit length, singular directions under ``rcond`` times the
+    largest are left out (truncated SVD). Such a direction is a mix of
+    hedges whose ladders almost cancel (a 15Y bond between 10Y and 20Y
+    quotes, say): it takes out next to no risk and an exact least-squares
+    fit buys it with huge offsetting notionals. Well-conditioned hedges get
+    the exact least-squares (minimum-norm) answer."""
+
+    t = np.asarray(target, dtype=float)
+    H = np.asarray(hedges, dtype=float)
+    scale = np.linalg.norm(H, axis=0)
+    live = scale > 0.0
+    x = np.zeros(H.shape[1])
+    if not live.any():
+        return x
+    y, *_ = np.linalg.lstsq(H[:, live] / scale[live], -t, rcond=rcond)
+    x[live] = y / scale[live]
+    return x
+
+
 def optimise_hedge(
     target: np.ndarray,
     hedges: np.ndarray,
@@ -1340,7 +1553,7 @@ def optimise_hedge(
     + sum_j unit_costs_j |x_j|`` (``hedges`` is buckets x instruments, in
     currency per bp per unit; ``unit_costs`` in currency per unit traded).
     Without costs (or ``move_bp`` None) it is the least-squares hedge
-    (minimum-norm when the hedges are collinear).
+    without redundant combinations of hedges (:func:`least_squares_hedge`).
 
     The problem is convex; it is solved through the lasso ``1/2 ||target +
     hedges @ x||^2 + lam * sum_j cost_j |x_j|`` (coordinate descent), whose
@@ -1360,8 +1573,7 @@ def optimise_hedge(
     if not np.any(t):
         return np.zeros(m)
     if move_bp is None or not np.any(costs):
-        x, *_ = np.linalg.lstsq(H, -t, rcond=None)
-        return x
+        return least_squares_hedge(t, H)
     G, b = H.T @ H, H.T @ t
     state = {"x": np.zeros(m)}
 
@@ -1550,6 +1762,7 @@ __all__ = [
     "book_curves",
     "column_guide",
     "example_blotter",
+    "extrapolation_notes",
     "hedge_book",
     "hedge_instruments",
     "optimise_hedge",

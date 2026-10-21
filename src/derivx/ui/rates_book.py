@@ -152,18 +152,26 @@ def _blotter(currency: str) -> Tuple[pd.DataFrame, str]:
     c1.button(f"LOAD EXAMPLE {currency} BOOK", key="book_load_example", on_click=_load_example, args=(currency,))
     c2.button("CLEAR THE BOOK", key="book_clear", on_click=_clear)
     file = c3.file_uploader("UPLOAD BLOTTER CSV", type=["csv"], key=rates_data.widget_key("book_upload"))
-    if file is not None:
+    if file is None:
+        st.session_state.pop(UPLOAD_SHA_KEY, None)  # an emptied uploader takes the same file again
+    else:
         payload = file.getvalue()
         sha = hashlib.sha256(payload).hexdigest()
-        if st.session_state.get(UPLOAD_SHA_KEY) != sha:
-            st.session_state[UPLOAD_SHA_KEY] = sha
+        seen = st.session_state.get(UPLOAD_SHA_KEY)
+        if seen is None or seen[0] != sha:
             table, issues = pf.read_blotter_csv(payload)
+            failed = [i.message if i.row == 0 else str(i) for i in issues if i.level == "error"]
+            st.session_state[UPLOAD_SHA_KEY] = (sha, failed)
             for issue in issues:
-                (st.error if issue.level == "error" else st.warning)(f"{file.name}: {issue}")
-            if not any(i.level == "error" for i in issues):
+                if issue.level != "error":
+                    st.warning(f"{file.name}: {issue}")
+            if not failed:
                 _replace(table, f"uploaded: {file.name}")
                 state = st.session_state[STATE_KEY]
                 key = f"book_editor_{state['gen']}"
+            seen = st.session_state[UPLOAD_SHA_KEY]
+        if seen[1]:  # stays up while the file that could not be read is in the uploader
+            st.error(f"{file.name} was not loaded: " + "; ".join(seen[1]))
     edited = st.data_editor(_text_table(state["table"]), key=key, num_rows="dynamic", width="stretch",
                             hide_index=True, column_config=_column_config(currency))  # fmt: skip
     st.session_state[CURRENT_KEY] = edited
@@ -392,6 +400,8 @@ def _show_summary(risk: pf.BookRisk) -> pd.DataFrame:
     )
     for trade, reason in risk.skipped:
         st.warning(f"{trade.id} ({trade.type}) not priced: {reason}")
+    if risk.notes:
+        st.warning("Priced beyond the market data: " + "; ".join(risk.notes) + ".")
     return table
 
 
@@ -572,10 +582,10 @@ def _show_hedge(risk: pf.BookRisk, market: Market) -> Tuple[List[Position], pd.D
         st.error(f"Cannot size hedges: {exc}")
         return [], pd.DataFrame(), pd.DataFrame()
     unit = _symbol(risk.currencies[0]) if risk.currencies and not risk.mixed else ""
-    cells = [
-        (f"RESIDUAL RISK ({unit or 'mixed'}/BP)", f"{_num(result.risk_after)} of {_num(result.risk_before)}"),
-        ("SQUARED RISK REMOVED (%)", f"{100 * result.risk_removed:.2f}"),
-        (f"BID/ASK COST ({unit or 'mixed'})", _num(result.cost)),
+    cells = [  # short labels and plain numbers: a card at 1280px holds about 20 characters
+        (f"RESIDUAL RISK ({unit}/BP)" if unit else "RESIDUAL (MIXED/BP)", _num(result.risk_after)),
+        (f"UNHEDGED RISK ({unit}/BP)" if unit else "UNHEDGED (MIXED/BP)", _num(result.risk_before)),
+        (f"BID/ASK COST ({unit or 'MIXED'})", _num(result.cost)),
     ]
     for col, (label, value) in zip(st.columns(3), cells):
         col.metric(label, value)
@@ -598,8 +608,10 @@ def _show_hedge(risk: pf.BookRisk, market: Market) -> Tuple[List[Position], pd.D
         "Par instruments traded today, sized to flatten the book's stacked key-rate ladder (every quote of every "
         "curve): OIS swaps on the discount curve, swaps or tenor basis swaps on a projection curve, par Treasuries "
         "on the Treasury curve; NOTIONAL > 0 receives fixed, receives the spread leg or buys the bond. RESIDUAL RISK "
-        "is the root sum of squares of the ladder left (currency per bp); buckets between hedge tenors cannot be "
-        f"taken out exactly.{rule}"
+        "is the root sum of squares of the ladder left (currency per bp), UNHEDGED RISK the same for the book: "
+        f"{100 * result.risk_removed:.2f}% of the squared risk is removed. Buckets between hedge tenors cannot be "
+        "taken out exactly, and a mix of hedges whose ladders almost cancel (a 15Y bond between the 10Y and 20Y "
+        f"quotes, say) is not traded: it would take out next to no risk with huge offsetting notionals.{rule}"
     )
     rows = result.ladder.copy()
     rows["curve"] = [rates_risk.curve_title(market, k) for k in rows["curve"]]

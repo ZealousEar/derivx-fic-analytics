@@ -289,8 +289,22 @@ def _check_nodes(key: str, curve: Curve, nodes: Sequence[Mapping[str, object]]) 
 def market_from_json(payload: Mapping[str, object]) -> Tuple[Market, Dict[str, str]]:
     """Rebuild a market saved by :func:`curve_set_json` (curves bootstrapped
     again from their quotes and checked against the saved nodes):
-    (market, {curve key: source label})."""
+    (market, {curve key: source label}). A file that is not such a curve
+    set, or is missing parts of one, raises ValueError."""
 
+    if not isinstance(payload, Mapping):
+        kind = type(payload).__name__
+        raise ValueError(f"not a {FORMAT} v{FORMAT_VERSION} file: the JSON is a {kind}, not an object")
+    try:
+        return _market_from_json(payload)
+    except (KeyError, TypeError, AttributeError, IndexError) as exc:
+        raise ValueError(
+            f"not a complete {FORMAT} v{FORMAT_VERSION} file ({type(exc).__name__}: {exc}); rebuild it with "
+            "'derivx curve build'"
+        ) from None
+
+
+def _market_from_json(payload: Mapping[str, object]) -> Tuple[Market, Dict[str, str]]:
     if payload.get("format") != FORMAT or payload.get("version") != FORMAT_VERSION:
         raise ValueError(f"not a {FORMAT} v{FORMAT_VERSION} file (format {payload.get('format')!r}, version "
                          f"{payload.get('version')!r})")  # fmt: skip
@@ -358,4 +372,5 @@ def read_curve_set(path) -> Tuple[Market, Dict[str, str], Dict[str, object]]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path}: not JSON ({exc})") from None
     market, sources = market_from_json(payload)
-    return market, sources, dict(payload.get("manifest") or {})
+    manifest = payload.get("manifest")
+    return market, sources, dict(manifest) if isinstance(manifest, Mapping) else {}

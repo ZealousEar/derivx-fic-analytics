@@ -10,6 +10,7 @@ import json
 import zipfile
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -209,3 +210,132 @@ def test_scenarios_and_research_run_on_the_book_by_default():
     exports = {b.proto.id.rsplit("-", 1)[-1] for b in at.get("download_button")}
     for tab in ("rates_curve", "swap", "swn", "cap", "bond", "book", "scn", "rs_var"):
         assert {f"{tab}_export_zip", f"{tab}_export_manifest"} <= exports, tab
+
+
+# --------------------------------------------------------------------------
+# Review findings (regressions)
+# --------------------------------------------------------------------------
+
+UPLOAD_APP = """
+import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
+from derivx.rates.examples import example_market
+from derivx.ui import rates_book
+
+
+class _File:
+    def __init__(self, name, data):
+        self.name, self._data = name, data
+
+    def getvalue(self):
+        return self._data
+
+
+_real = DeltaGenerator.file_uploader
+
+
+def _fake(self, label, *args, **kwargs):  # AppTest cannot drive a file uploader: the test sets the file
+    if label != "UPLOAD BLOTTER CSV":
+        return _real(self, label, *args, **kwargs)
+    upload = st.session_state.get("fake_upload")
+    return None if upload is None else _File(*upload)
+
+
+DeltaGenerator.file_uploader = _fake
+try:
+    st.session_state["n_positions"] = len(rates_book.render(example_market()))
+finally:
+    DeltaGenerator.file_uploader = _real
+"""
+GOOD = b"id,type,currency,direction,notional,tenor,index\nU1,IRS,usd,rec,10mm,5Y,OIS\nU2,swap,USD,Pay,5mm,2Y,OIS\n"
+
+
+def _upload_app() -> AppTest:
+    at = AppTest.from_string(UPLOAD_APP, default_timeout=600)
+    at.run()
+    _ok(at)
+    return at
+
+
+def _upload(at: AppTest, name, payload) -> None:
+    at.session_state["fake_upload"] = None if name is None else (name, payload)
+    at.run()
+    _ok(at)
+
+
+def test_unreadable_uploads_say_why_and_keep_the_book():
+    at = _upload_app()
+    for name, payload, text in [
+        ("ids.csv", b"id\nX1\nX2\n", "missing columns: type, currency, direction, notional"),  # was a traceback
+        ("other.csv", b"foo,bar\n1,2\n", "no blotter columns in the header (foo, bar)"),  # was a traceback
+        ("empty.csv", b"", "the file is empty"),  # was a traceback (csv.Error)
+    ]:
+        _upload(at, name, payload)
+        errors = [e.value for e in at.error]
+        assert any(e.startswith(f"{name} was not loaded: ") and text in e for e in errors), errors
+        assert at.session_state["n_positions"] == 10  # the example book stays
+        at.run()  # the reason stays up while that file is in the uploader
+        assert any(e.startswith(f"{name} was not loaded") for e in (x.value for x in at.error))
+    _upload(at, None, None)
+    assert not any("was not loaded" in e.value for e in at.error)
+
+
+def test_the_same_file_uploads_again_after_the_book_was_replaced():
+    at = _upload_app()
+    _upload(at, "mine.csv", GOOD)
+    assert at.session_state["n_positions"] == 2
+    table = at.session_state["book_state"]["table"]
+    assert list(table["type"]) == ["swap", "swap"] and list(table["direction"]) == ["receive", "pay"]
+    assert list(table["currency"]) == ["USD", "USD"]  # the editor's select cells show these
+    at.button(key="book_clear").click().run()
+    _ok(at)
+    assert at.session_state["n_positions"] == 0
+    _upload(at, None, None)  # the user removes the file from the uploader ...
+    _upload(at, "mine.csv", GOOD)  # ... and drops the same file again: it used to be ignored
+    assert at.session_state["n_positions"] == 2
+
+
+def test_hedge_cards_fit_their_values():
+    """Metric cards hold about 20 characters at 1280px: the hedge cards used
+    to show '8,995 of 36,...' and 'SQUARED RISK REMOV...'."""
+
+    at = _app()
+    hedge = [m for m in at.metric if any(w in m.label for w in ("RESIDUAL", "UNHEDGED", "BID/ASK"))]
+    assert [m.label for m in hedge] == ["RESIDUAL RISK ($/BP)", "UNHEDGED RISK ($/BP)", "BID/ASK COST ($)"]
+    for metric in at.metric:
+        assert len(metric.label) <= 20 and len(str(metric.value)) <= 14, (metric.label, metric.value)
+    assert any("of the squared risk is removed" in c.value for c in at.caption)
+
+
+MIXED_APP = """
+import streamlit as st
+from derivx.data.rates_history import bundled_store
+from derivx.rates import curve_io
+from derivx.rates.examples import EXAMPLE_ASOF
+from derivx.ui import rates_book
+
+market, _, _ = curve_io.default_market(bundled_store(), EXAMPLE_ASOF, "EUR ESTR")
+st.session_state["n_positions"] = len(rates_book.render(market))
+"""
+
+
+def test_a_book_in_two_currencies_is_totalled_per_currency():
+    """A EUR book with a US Treasury: totals per currency, the mix flagged,
+    and every card still fits (the mixed labels were longer)."""
+
+    table = pf.example_blotter("EUR").astype(object)
+    bond = {c: None for c in pf.COLUMNS} | dict(id="UST", type="bond", currency="USD", direction="long",
+                                                notional="10mm", maturity="2035-08-15", rate=4.25)  # fmt: skip
+    table = pd.concat([table, pd.DataFrame([bond])], ignore_index=True).astype(object)
+    at = AppTest.from_string(MIXED_APP, default_timeout=600)
+    at.session_state["book_state"] = {"table": table, "source": "test book", "example": None, "gen": 3}
+    at.run()
+    _ok(at)
+    assert at.session_state["n_positions"] == 8
+    assert any("more than one currency" in w.value for w in at.warning)
+    summary = next(d.value for d in at.dataframe if "DESCRIPTION" in d.value.columns)
+    assert {"TOTAL EUR", "TOTAL USD"} <= set(summary["ID"])
+    labels = [m.label for m in at.metric]
+    assert {"BOOK PV (€)", "BOOK PV ($)", "RESIDUAL (MIXED/BP)", "UNHEDGED (MIXED/BP)"} <= set(labels)
+    for metric in at.metric:
+        assert len(metric.label) <= 20 and len(str(metric.value)) <= 14, (metric.label, metric.value)
