@@ -35,6 +35,7 @@ from derivx.rates.multicurve import (
 from derivx.rates.quotes import clean_quotes
 from derivx.ui import rates_data, rates_exports
 from derivx.ui.plot_limits import axis_limits, bound_axes
+from derivx.ui.state import data_editor as persistent_editor  # edits survive mode switches (UIE-04)
 from derivx.ui.theme import ACCENT, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
 SWAP_CURVES = ["USD SOFR", "EUR ESTR", "GBP SONIA"]
@@ -444,7 +445,7 @@ def _projection_section(
                 st.error(f"Could not prefill {index}: {exc}")
                 return None
             digest = hashlib.sha1(table.to_csv(index=False).encode()).hexdigest()[:10]
-            edited = st.data_editor(
+            edited = persistent_editor(
                 table, num_rows="dynamic", width="stretch", hide_index=True,
                 key=f"rates_proj_{index.replace(' ', '_')}_{digest}",
                 column_config={
@@ -523,7 +524,7 @@ def render() -> Optional[Market]:
     )
     for note in prefill.notes:
         st.warning(note)
-    edited = st.data_editor(
+    edited = persistent_editor(
         prefill.table,
         num_rows="dynamic",
         width="stretch",

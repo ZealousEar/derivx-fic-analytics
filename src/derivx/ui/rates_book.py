@@ -38,6 +38,7 @@ from derivx.ui import (
     rates_swaption,
 )
 from derivx.ui.plot_limits import axis_limits, bound_axes
+from derivx.ui.state import data_editor as persistent_editor  # edits survive mode switches (UIE-04)
 from derivx.ui.theme import ACCENT, CELL_TEXT, DIVERGING_COLORS, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
 STATE_KEY = "book_state"
@@ -172,7 +173,7 @@ def _blotter(currency: str) -> Tuple[pd.DataFrame, str]:
             seen = st.session_state[UPLOAD_SHA_KEY]
         if seen[1]:  # stays up while the file that could not be read is in the uploader
             st.error(f"{file.name} was not loaded: " + "; ".join(seen[1]))
-    edited = st.data_editor(_text_table(state["table"]), key=key, num_rows="dynamic", width="stretch",
+    edited = persistent_editor(_text_table(state["table"]), key=key, num_rows="dynamic", width="stretch",
                             hide_index=True, column_config=_column_config(currency))  # fmt: skip
     st.session_state[CURRENT_KEY] = edited
     source = str(state["source"]) + (" (edited by you)" if not _same(edited, _loaded(state)) else "")
@@ -546,7 +547,7 @@ def _hedge_inputs(risk: pf.BookRisk, market: Market) -> Optional[Tuple[Dict[str,
         keys = {title: k for k, title in titles.items()}
         table = pd.DataFrame([{"CURVE": titles[k], "TENOR": t, "BID/ASK (BP)": v} for (k, t), v in assumed.items()])
         digest = hashlib.sha1(repr(sorted(assumed)).encode()).hexdigest()[:8]
-        edited = st.data_editor(
+        edited = persistent_editor(
             table,
             hide_index=True,
             width="stretch",
