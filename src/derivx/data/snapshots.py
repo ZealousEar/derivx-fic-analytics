@@ -564,6 +564,16 @@ class SnapshotStore:
     def tickers(self) -> List[str]:
         return sorted(set(self.index()["ticker"].astype(str)))
 
+    def manifest(self, ticker: str, session: object) -> Dict[str, Any]:
+        """The JSON manifest of one stored session (fetch status, limits,
+        compaction counts, run manifest)."""
+
+        path = self.file(manifest_path(relative_path(ticker, _session(session))))
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise SnapshotError(f"{path.name}: no readable manifest in {self.label} ({exc})") from None
+
     def sessions(self, ticker: str) -> List[dt.date]:
         index = self.index()
         picked = index[index["ticker"].astype(str) == _ticker(ticker)]
