@@ -1,9 +1,9 @@
 {
   "manifest_version": 1,
   "kind": "metrics",
-  "created_at_utc": "2026-10-21T18:32:48+00:00",
+  "created_at_utc": "2026-10-21T19:03:42+00:00",
   "code": {
-    "sha": "5b4630aaeb9a54e7e1a379331d5992ef92ebcf46",
+    "sha": "77a10acbf923eb93097024cbcb663835b2cfaad1",
     "dirty": false,
     "package": "derivx"
   },
