@@ -5,8 +5,10 @@
 # .gitignore and .dockerignore keep out of git and out of the image.
 # Per-host settings (port, address) come from the command line or from
 # STREAMLIT_* environment variables, which override this file: the Docker
-# image and render.yaml also set STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type so
-# public viewers see an exception's type, not a traceback with server paths.
+# image and render.yaml set STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type and the
+# Procfile passes --client.showErrorDetails=type, so public viewers see an
+# exception's type, not a traceback with server paths. Local runs keep
+# Streamlit's default (full details).
 
 [server]
 # Cross-site request forgery and CORS protection stay at Streamlit's safe

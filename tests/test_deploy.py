@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -102,8 +103,12 @@ def _request(url: str, method: str = "GET", headers=None, data: bytes = None):
         return err.code, dict(err.headers), err.read()
 
 
-def test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_origins(tmp_path):
-    script = tmp_path / "upload_app.py"
+@pytest.fixture(scope="module")
+def committed_config_server(tmp_path_factory):
+    """A real Streamlit server started from the repository root, so it reads the committed
+    .streamlit/config.toml (no STREAMLIT_* variables): yields ``(base_url, port)``."""
+
+    script = tmp_path_factory.mktemp("app") / "upload_app.py"
     script.write_text('import streamlit as st\nst.file_uploader("chain")\n')
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("STREAMLIT_")}
@@ -125,20 +130,7 @@ def test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_
             assert time.monotonic() < deadline, "Streamlit did not become healthy within 60 s"
             time.sleep(0.25)
         assert body.strip() == b"ok"
-
-        status, headers, _ = _request(f"{base}/_stcore/health", headers={"Origin": "https://evil.example"})
-        assert status == 200
-        allowed = {k.lower(): v for k, v in headers.items()}.get("access-control-allow-origin")
-        assert allowed in (None, ""), f"CORS is off: foreign origin allowed ({allowed})"
-
-        boundary = "derivxboundary"
-        body = (
-            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="chain.csv"\r\n'
-            f"Content-Type: text/csv\r\n\r\nstrike,iv\r\n100,0.2\r\n--{boundary}--\r\n"
-        ).encode()
-        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-        status, _, _ = _request(f"{base}/_stcore/upload_file/session/file", "PUT", headers, body)
-        assert status == 403, f"an upload without an XSRF token got HTTP {status} (403 expected: XSRF is off)"
+        yield base, port
     finally:
         proc.terminate()
         try:
@@ -147,6 +139,50 @@ def test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_
             proc.kill()
             proc.wait(timeout=10)
         proc.stdout.close()
+
+
+def test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_origins(committed_config_server):
+    base, _ = committed_config_server
+    status, headers, _ = _request(f"{base}/_stcore/health", headers={"Origin": "https://evil.example"})
+    assert status == 200
+    allowed = {k.lower(): v for k, v in headers.items()}.get("access-control-allow-origin")
+    assert allowed in (None, ""), f"CORS is off: foreign origin allowed ({allowed})"
+
+    boundary = "derivxboundary"
+    body = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="chain.csv"\r\n'
+        f"Content-Type: text/csv\r\n\r\nstrike,iv\r\n100,0.2\r\n--{boundary}--\r\n"
+    ).encode()
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    status, _, _ = _request(f"{base}/_stcore/upload_file/session/file", "PUT", headers, body)
+    assert status == 403, f"an upload without an XSRF token got HTTP {status} (403 expected: XSRF is off)"
+
+
+def _healthcheck_command() -> List[str]:
+    """The image's HEALTHCHECK, an exec-form CMD array."""
+
+    args = next(a for w, a in _dockerfile() if w == "HEALTHCHECK")
+    return json.loads(args[args.index("CMD") + len("CMD") :].strip())
+
+
+@pytest.mark.skipif(not (ROOT / "Dockerfile").exists(), reason="the image's test stage has no Dockerfile")
+def test_the_image_healthcheck_passes_on_a_healthy_server_even_with_a_proxy_configured(committed_config_server):
+    _, port = committed_config_server
+    cmd = _healthcheck_command()
+    assert cmd[0] == "python" and "/_stcore/health" in " ".join(cmd)
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    dead_proxy = f"http://127.0.0.1:{_free_port()}"  # nothing listens there
+    proxies = {"HTTP_PROXY": dead_proxy, "http_proxy": dead_proxy, "HTTPS_PROXY": dead_proxy, "NO_PROXY": ""}
+    for extra in ({}, proxies):  # a host may pass its outbound proxy into the container
+        run = subprocess.run(
+            [sys.executable, *cmd[1:]], env={**env, **extra, "STREAMLIT_SERVER_PORT": str(port)}, timeout=30
+        )
+        assert run.returncode == 0, f"healthcheck failed on a healthy server (proxy settings: {extra})"
+    # and it is not vacuous: no server on the port -> unhealthy
+    run = subprocess.run(
+        [sys.executable, *cmd[1:]], env={**env, "STREAMLIT_SERVER_PORT": str(_free_port())}, capture_output=True
+    )
+    assert run.returncode != 0
 
 
 # -- deploy files --------------------------------------------------------------
@@ -161,11 +197,33 @@ def test_no_deploy_path_turns_off_xsrf_or_cors():
             assert not pattern.search(text), f"{path.relative_to(ROOT)} disables XSRF/CORS: {pattern.pattern}"
 
 
+def test_the_ci_docker_job_checks_xsrf_and_cors_on_the_running_container():
+    text = (ROOT / ".github" / "workflows" / "ci.yaml").read_text()
+    assert 'test "$code" = 403' in text and "/_stcore/upload_file/" in text
+    assert "Origin: https://evil.example" in text
+    # `! curl ... | grep` passes when curl itself fails (no pipefail; `!` is exempt from `bash -e`), so the
+    # headers are captured first and a match fails the step explicitly (review finding)
+    assert not re.search(r"^\s*!\s*curl", text, re.MULTILINE)
+    assert "headers=$(curl -fsS" in text and "exit 1" in text
+
+
 def test_setup_sh_is_gone_and_the_procfile_runs_streamlit_on_the_host_port():
     assert not (ROOT / "setup.sh").exists()  # it wrote ~/.streamlit/config.toml with dash-only echo escapes
     lines = [line for line in (ROOT / "Procfile").read_text().splitlines() if line.strip()]
     assert len(lines) == 1 and lines[0].startswith("web: streamlit run src/derivx/ui/streamlit_app.py ")
     assert "--server.port=$PORT" in lines[0] and "setup.sh" not in lines[0]
+    # a public host, like the Docker image and Render: viewers see an exception's type, not a traceback
+    # with server paths (review finding: the Procfile alone showed full tracebacks)
+    assert "--client.showErrorDetails=type" in lines[0]
+
+
+def test_every_public_deploy_path_redacts_tracebacks():
+    env = " ".join(a for w, a in _dockerfile() if w == "ENV")
+    assert "STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type" in env
+    assert re.search(r"key: STREAMLIT_CLIENT_SHOW_ERROR_DETAILS\s+value: type\b", (ROOT / "render.yaml").read_text())
+    assert "--client.showErrorDetails=type" in (ROOT / "Procfile").read_text()
+    # the committed config keeps Streamlit's default (full details) for local `streamlit run` and the devcontainer
+    assert "showErrorDetails" not in tomllib.loads(CONFIG.read_text()).get("client", {})
 
 
 def _dockerignore() -> List[str]:
@@ -265,6 +323,9 @@ def test_every_runtime_dependency_is_bounded_and_streamlit_stays_on_1_x():
     assert str(deps["streamlit"].specifier) in ("<2,>=1.59", ">=1.59,<2")
     for name in ("numpy", "pandas", "scipy", "plotly", "streamlit", "yfinance"):
         assert any(s.operator == "<" for s in deps[name].specifier), f"{name} has no upper bound"
+    # Yahoo changes its endpoints and only new yfinance releases follow: the range must admit the
+    # maintained 1.x line (1.0 shipped after 0.2.66; a <0.3 cap froze the app on a 2025 release)
+    assert deps["yfinance"].specifier.contains("1.7.0") and deps["yfinance"].specifier.contains("0.2.66")
     project = _pyproject()["project"]
     assert project["requires-python"] == ">=3.10"
     pythons = {
@@ -289,6 +350,35 @@ def test_the_docker_lock_pins_every_dependency_inside_its_range():
     assert "quantlib" not in pins and "pytest" not in pins
     image_python = re.search(r"ARG PYTHON_VERSION=([\d.]+)", (ROOT / "Dockerfile").read_text()).group(1)
     assert f"--python-version {image_python}" in text
+
+
+def test_package_metadata_uses_an_spdx_license_that_current_setuptools_accepts():
+    """setuptools deprecates the ``license = {text = ...}`` table and License classifiers and stops
+    supporting them after 2027-02-18; every deploy path builds this package (``-e .``) with the newest
+    setuptools, so the old metadata would eventually break all of them (review finding)."""
+
+    pyproject = _pyproject()
+    project = pyproject["project"]
+    assert project["license"] == "MIT" and project["license-files"] == ["LICENSE"]
+    assert (ROOT / "LICENSE").is_file()
+    assert not [c for c in project["classifiers"] if c.startswith("License ::")]
+    backend = {canonicalize_name(Requirement(r).name): Requirement(r) for r in pyproject["build-system"]["requires"]}
+    assert not backend["setuptools"].specifier.contains("76.1.0") and backend["setuptools"].specifier.contains("77.0.3")
+
+
+def test_the_installed_setuptools_reads_the_package_metadata_without_deprecations():
+    setuptools = pytest.importorskip("setuptools")
+    if Version(setuptools.__version__) < Version("77"):
+        pytest.skip(f"setuptools {setuptools.__version__} predates PEP 639 license expressions")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        from setuptools.config.pyprojecttoml import apply_configuration
+        from setuptools.dist import Distribution
+
+        dist = apply_configuration(Distribution(), ROOT / "pyproject.toml")
+    deprecations = [str(w.message).splitlines()[0] for w in caught if "Setuptools" in type(w.message).__name__]
+    assert deprecations == []
+    assert dist.metadata.license_expression == "MIT"
 
 
 def test_dev_extra_pins_the_quantlib_oracle_and_the_linter():

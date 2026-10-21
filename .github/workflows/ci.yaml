@@ -126,9 +126,14 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -F "file=@LICENSE" \
             http://127.0.0.1:8501/_stcore/upload_file/session/file)
           test "$code" = 403
-          # No wildcard CORS header for a foreign origin.
-          ! curl -fsS -D - -o /dev/null -H 'Origin: https://evil.example' \
-            http://127.0.0.1:8501/_stcore/health | grep -qi '^access-control-allow-origin: \*'
+          # No CORS header that admits a foreign origin. The headers are captured first, so a failed
+          # request fails the step (a `! curl | grep` pipeline would pass when curl itself fails).
+          headers=$(curl -fsS -D - -o /dev/null -H 'Origin: https://evil.example' \
+            http://127.0.0.1:8501/_stcore/health)
+          if printf '%s\n' "$headers" | grep -qiE '^access-control-allow-origin: *(\*|https://evil\.example)'; then
+            echo "CORS protection is off: $headers"
+            exit 1
+          fi
       - name: Container log
         if: always()
         run: docker logs derivx || true

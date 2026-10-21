@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# >= 77 for the PEP 639 license expression below: setuptools deprecates the old license table and
+# License classifiers, and stops supporting them after 2027-02-18.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +10,8 @@ version = "0.1.0"
 description = "Derivatives analytics platform (FIC): BS, SVI/SABR, term structure, Black IR, DV01/PV01"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "Farhad" }
 ]
@@ -33,7 +36,6 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent"
 ]
 # Runtime dependencies. requirements.txt repeats this list (tests/test_deploy.py
@@ -51,7 +53,7 @@ dependencies = [
   "pyarrow>=14",
   "plotly>=5.22,<8",
   "streamlit>=1.59,<2",
-  "yfinance>=0.2.66,<0.3"
+  "yfinance>=0.2.66,<2"
 ]
 
 [project.optional-dependencies]
