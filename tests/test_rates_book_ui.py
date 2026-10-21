@@ -346,6 +346,29 @@ def _row(frame: pd.DataFrame, column: str, label: str) -> pd.Series:
     return frame[frame[column] == label].iloc[0]
 
 
+def test_a_euro_book_shows_euro_cards_only():
+    """The euro market carries the US Treasury curve, but a book of euro
+    trades holds no dollars: no dollar hedge cards (they read 0 before). Its
+    totals are in euros, and in dollars only as the converted (IN $) total
+    of the default reporting currency."""
+
+    at = AppTest.from_string(MIXED_APP, default_timeout=600)
+    table = pf.example_blotter("EUR").astype(object)
+    at.session_state["book_state"] = {"table": table, "source": "test book", "example": None, "gen": 3}
+    at.run()
+    _ok(at)
+    labels = [m.label for m in at.metric]
+    assert [x for x in labels if x.startswith(("RESIDUAL", "UNHEDGED", "BID/ASK"))] == [
+        "RESIDUAL RISK (€/BP)", "UNHEDGED RISK (€/BP)", "BID/ASK COST (€)"
+    ]  # fmt: skip
+    assert "BOOK PV (€)" in labels and "BOOK PV (IN $)" in labels
+    assert not [x for x in labels if "$" in x and "IN $" not in x]  # no unconverted dollar amount
+    summary = _frame(at, "DESCRIPTION")
+    assert set(summary[summary["ID"] != "ALL IN USD"]["CCY"]) == {"EUR"} and "TOTAL" in set(summary["ID"])
+    assert any("% in EUR of the squared risk" in c.value for c in at.caption)
+    assert not any("% in USD" in c.value for c in at.caption)  # was "100.00% in USD" of a zero dollar ladder
+
+
 def test_a_book_in_two_currencies_is_totalled_per_currency_and_converted():
     """Review finding (R2, A1): totals added EUR trade P&L to USD bond P&L
     without FX conversion. A EUR book with a US Treasury now shows a total

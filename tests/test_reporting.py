@@ -328,6 +328,23 @@ def test_hedges_are_sized_per_currency():
     assert list(single.by_currency) == ["USD"] and math.isfinite(single.risk_after)  # one currency: one total
 
 
+def test_a_euro_book_is_hedged_in_euros_alone():
+    """The euro market carries the US Treasury curve (for bonds), so a euro
+    swap book has a (zero) dollar ladder: it is not a dollar block of the
+    hedge, and the book's totals are its euro ones."""
+
+    market, risk = _book("EUR")
+    assert set(risk.currencies) == {"EUR"} and risk.curve_currency["govt"] == "USD"
+    instruments = pf.hedge_instruments(market, pf.default_benchmarks(risk, market) | {"govt": ["10Y"]})
+    result = pf.hedge_book(risk, market, instruments, None)
+    assert list(result.by_currency) == ["EUR"]
+    eur = result.ladder[result.ladder["currency"] == "EUR"]
+    assert result.risk_before == pytest.approx(float(np.linalg.norm(eur["book"])), rel=1e-12)
+    assert result.risk_after == pytest.approx(float(np.linalg.norm(result.ladder["residual"])), rel=1e-12)
+    assert 0.0 < result.risk_after < result.risk_before
+    assert (result.table[result.table["curve"] == "govt"]["notional"] == 0.0).all()  # no dollar hedge traded
+
+
 def test_reserved_ids_include_the_converted_total():
     trade, issues = pf.parse_trade({"id": "ALL IN USD", "type": "swap", "currency": "USD", "direction": "pay",
                                     "notional": "1mm", "tenor": "5Y", "index": "OIS"}, 1)  # fmt: skip
