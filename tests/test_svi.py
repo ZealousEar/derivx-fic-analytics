@@ -37,7 +37,27 @@ def test_svi_fit_on_synthetic_slice():
     est = fit_svi_strike_slice(Ks, ivs_noisy, F, T)
     ivs_fit = svi_iv(Ks, est, F, T)
     rmse = float(np.sqrt(np.mean((ivs_fit - ivs) ** 2)))
-    assert rmse < 0.005  # <= 0.5 vol points
+    assert rmse < 0.0005  # within the 5 vol bp quote noise of the true smile (was < 50 bp)
+    assert 0.0002 < est.rmse_bp * 1e-4 < 0.0007  # and the residual is the noise, not a misfit
+
+
+def test_exact_quotes_recover_the_parameters_and_scale_with_T():
+    F, Ks = 100.0, np.linspace(60, 140, 15)
+    true = {"a": 0.02, "b": 0.3, "rho": -0.2, "m": 0.0, "sigma": 0.4}  # total variance at T = 1
+    ivs = svi_iv(Ks, true, F, 1.0)
+    est = fit_svi_strike_slice(Ks, ivs, F, 1.0)
+    for name, value in true.items():
+        assert est.params[name] == pytest.approx(value, abs=1e-6), name
+    assert est.rmse_bp < 1e-4
+    # the same vols read at T = 0.1 / 2 are a total variance 0.1x / 2x as large: a and b scale, the rest do not
+    for T in (0.1, 2.0):
+        scaled = fit_svi_strike_slice(Ks, ivs, F, T).params
+        assert scaled["a"] == pytest.approx(T * true["a"], abs=1e-6) and scaled["b"] == pytest.approx(
+            T * true["b"], abs=1e-6
+        )
+        assert scaled["rho"] == pytest.approx(true["rho"], abs=1e-5) and scaled["sigma"] == pytest.approx(
+            true["sigma"], abs=1e-5
+        )
 
 
 def test_svi_no_arb_basic_sanity():
