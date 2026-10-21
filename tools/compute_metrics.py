@@ -39,6 +39,27 @@ version, packages, inputs, data hash). All files but the manifest are
 deterministic for a given input and code version.
 
     python tools/compute_metrics.py --outdir docs/metrics/spy_2026-10-20
+
+History mode (``--history``, or ``--store DIR`` for a local checkout of the
+data branch): the walk-forward test on the daily snapshots the
+``collect-data`` workflow saves on the ``data-snapshots`` branch
+(:mod:`derivx.data.snapshots`), synced into the download cache
+(``--repo`` / ``--branch``; ``--offline`` reads only the cache), with the
+same liquidity filters and per-trade-date Treasury discounting. It runs
+once the sessions hold :func:`derivx.data.snapshots.origins_needed` origin
+days (9: three per vol-regime tercile) at ``--horizon``; until then the
+summary says how many there are. Outputs: ``walkforward_summary.csv``,
+``walkforward_daily.csv``, ``walkforward_by_regime.csv``,
+``walkforward_slices.csv``, ``sessions.csv`` (the index rows used, with
+each file's SHA-256), ``summary.json``, ``METRICS_SUMMARY.md`` and
+``manifest.json``. Everything but the manifest's run time is a function of
+the store's files and the code version, so a rerun on the same sessions
+reproduces it byte for byte. Sessions after the committed Treasury curves
+(2026-10-19) are discounted at the flat ``--rate`` unless ``--with-cache``
+adds the Treasury curves in the download cache (``derivx pull fred --ids
+ust``); the summary names the curve or rate of every trade date.
+
+    python tools/compute_metrics.py --history --ticker SPY --outdir data/metrics/spy_history
 """
 
 from __future__ import annotations
@@ -47,7 +68,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -88,14 +109,18 @@ def load_inputs(chains: Sequence[Path], chain_dir: Optional[Path]) -> ChainDatas
     return merge_datasets(datasets, source=f"{len(paths)} file(s)")
 
 
-def discounting_for(ds: ChainDataset, mode: str = "curve", rate: float = 0.0) -> Discounting:
+def discounting_for(ds: ChainDataset, mode: str = "curve", rate: float = 0.0, with_cache: bool = False) -> Discounting:
     """The :class:`Discounting` of ``mode`` for the trade dates of ``ds``
-    (Treasury curves from the committed rates snapshot; no network)."""
+    (Treasury curves from the committed rates snapshot, plus those in the
+    download cache with ``with_cache``; no network)."""
 
     if mode == "rate":
         return Discounting.flat(rate)
+    store = rh.bundled_store()
+    if with_cache:
+        store = rh.build_store([rh.bundled_frame()] + rh.cached_frames(), "bundled snapshot + download cache")
     try:
-        return treasury_discounting(rh.bundled_store(), ds.trade_dates, mode=mode, rate=rate)
+        return treasury_discounting(store, ds.trade_dates, mode=mode, rate=rate)
     except ValueError:  # no curve for any trade date: every slice uses the flat rate (and says so)
         return Discounting("parity" if mode == "parity" else "rate", rate)
 
@@ -335,6 +360,227 @@ def report_markdown(summary: Dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------
+# History mode: the walk-forward on the collected daily snapshots
+# --------------------------------------------------------------------------
+
+
+def load_history(
+    ticker: str,
+    store_dir: Optional[Path] = None,
+    repo: Optional[str] = None,
+    branch: Optional[str] = None,
+    offline: bool = False,
+    first: Optional[str] = None,
+    last: Optional[str] = None,
+) -> Tuple[ChainDataset, Dict[str, object], pd.DataFrame]:
+    """(sessions of ``ticker``, provenance, their index rows) from a local
+    checkout ``store_dir`` or the synced copy of ``repo``@``branch``."""
+
+    from derivx.data.snapshots import SnapshotStore, sha256_hex, sync
+
+    if store_dir is not None:
+        store = SnapshotStore(store_dir, f"local checkout {store_dir.name}")
+        info: Dict[str, object] = {"source": "local checkout of the data branch"}
+    else:
+        result = sync(repo, branch, tickers=[ticker], offline=True if offline else None)
+        store = result.store
+        info = {"source": store.label, "url": result.url, "synced_at": result.synced_at, "notices": result.notices}
+        if result.failed:
+            info["sync_failed"] = list(result.failed)
+    index = store.index()
+    rows = index[index["ticker"].astype(str) == ticker.upper()].sort_values("session")
+    if first:
+        rows = rows[rows["session"].astype(str) >= first]
+    if last:
+        rows = rows[rows["session"].astype(str) <= last]
+    if rows.empty:
+        raise ValueError(f"no stored {ticker.upper()} sessions in {store.label} (from {first or '-'} to {last or '-'})")
+    ds = store.load(ticker, list(rows["session"].astype(str)))
+    info.update(
+        {
+            "ticker": ticker.upper(),
+            "sessions": int(len(rows)),
+            "first": str(rows["session"].iloc[0]),
+            "last": str(rows["session"].iloc[-1]),
+            "sessions_sha256": sha256_hex(rows.to_csv(index=False, lineterminator="\n").encode()),
+        }
+    )
+    return ds, info, rows.reset_index(drop=True)
+
+
+def compute_history(
+    ds: ChainDataset,
+    info: Dict[str, object],
+    *,
+    discount: Discounting,
+    min_volume: int = 10,
+    min_mid: float = 0.10,
+    max_spread: Optional[float] = 0.40,
+    horizon: int = 1,
+    window: int = 1,
+    max_days: float = 120.0,
+) -> Dict[str, object]:
+    """The walk-forward summary and tables of a collected history (see
+    the module docs); ``tables`` is empty when too few origin days exist."""
+
+    from derivx.data.calendar import missing_trading_days
+    from derivx.data.snapshots import origins_needed, scorable_origins
+    from derivx.validation.backtest import WalkForwardSettings
+
+    filtered = {}
+    for td, chain in sorted(ds.chains.items()):
+        f = apply_liquidity_filters(chain, min_volume=min_volume, max_spread=max_spread, min_mid=min_mid)
+        if not f.empty:
+            filtered[td] = f
+    settings = WalkForwardSettings(horizon=horizon, window=window, rate=discount.rate, discount=discount,
+                                   max_days=max_days)  # fmt: skip
+    have, need = scorable_origins(ds.trade_dates, horizon), origins_needed(settings.min_regime_days)
+    gaps = [d.date().isoformat() for d in missing_trading_days(ds.trade_dates)]
+    summary: Dict[str, object] = {
+        "mode": "history",
+        "data": ds.provenance(),
+        "collection": info,
+        "coverage": {
+            "sessions": len(ds.chains),
+            "missing_trading_days": gaps,
+            "origin_days": have,
+            "origin_days_needed": need,
+        },  # fmt: skip
+        "filters": {"min_volume": min_volume, "min_mid": min_mid, "max_spread": max_spread},
+        "settings": {**settings.as_dict(), "discounting": discount.describe()},
+    }
+    tables: Dict[str, pd.DataFrame] = {}
+    if have < need:
+        summary["walk_forward"] = {
+            "status": "not run",
+            "reason": f"{len(ds.chains)} session(s) give {have} origin day(s) with the session {horizon} trading "
+            f"day(s) later; the walk-forward needs {need} (three per vol-regime tercile): collect at least "
+            f"{need - have} more trading day(s)",
+        }
+        return {"summary": summary, "tables": tables}
+    result = run_walk_forward(filtered, settings)
+    if result.empty:
+        reasons = sorted(set(result.skipped["reason"].astype(str)))[:3]
+        summary["walk_forward"] = {"status": "no scores", "reason": "; ".join(reasons)}
+        return {"summary": summary, "tables": {"skipped": result.skipped}}
+    summary["walk_forward"] = {
+        "status": "ok",
+        "summary": result.summary.drop(columns=["description"]).to_dict(orient="records"),
+        "by_regime": result.by_regime.to_dict(orient="records"),
+        "target_days": int(result.daily["target"].nunique()),
+    }
+    tables = {
+        "walkforward_summary": result.summary,
+        "walkforward_daily": result.daily,
+        "walkforward_by_regime": result.by_regime,
+        "walkforward_slices": result.slices,
+        "walkforward_skipped": result.skipped,
+    }
+    return {"summary": summary, "tables": tables}
+
+
+def history_markdown(summary: Dict[str, object]) -> str:
+    """The history mode's METRICS_SUMMARY.md (every number from ``summary``)."""
+
+    data, info, cov = summary["data"], summary["collection"], summary["coverage"]
+    synthetic = [s for s in data.get("row_sources") or [] if "synthetic" in str(s).lower()]
+    lines = ["# Walk-forward on collected history", ""]
+    if synthetic:
+        lines += [f"**SYNTHETIC DATA, NOT MARKET DATA**: rows with source {', '.join(map(str, synthetic))}.", ""]
+    gaps = cov["missing_trading_days"]
+    lines += [
+        f"Data: {info.get('source')}; ticker {data['ticker']}; {cov['sessions']} session(s) {info.get('first')} .. "
+        f"{info.get('last')} ({len(gaps)} missing trading day(s){': ' + ', '.join(gaps[:8]) if gaps else ''}); "
+        f"{data['rows']:,} rows; sha256 {data['data_sha256']}; sessions index sha256 {info.get('sessions_sha256')}.",
+        f"Filters: {summary['filters']}. Discounting: {_discount_text(summary['settings'].get('discounting') or {})}.",
+        f"Origin days at the {summary['settings']['horizon']}-day horizon: {cov['origin_days']} (needed: "
+        f"{cov['origin_days_needed']}).",
+        "",
+        "## Walk-forward",
+        "",
+    ]
+    wf = summary["walk_forward"]
+    if wf["status"] != "ok":
+        return "\n".join(lines + [f"{wf['status']}: {wf['reason']}"]) + "\n"
+    lines += [
+        "| predictor | RMSE (vol bp) | benchmark | skill | days won | quote win rate | DM | days |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in wf["summary"]:
+
+        def fmt(key: str, spec: str) -> str:
+            v = r.get(key)
+            return "" if v is None or not np.isfinite(v) else format(v, spec)
+
+        days_won = (
+            f"{round(r['day_win_rate'] * r['day_win_n'])} of {r['day_win_n']}"
+            if r["benchmark"] and r.get("day_win_n")
+            else ""
+        )
+        lines.append(
+            f"| {r['predictor']} | {r['rmse_bp']:.1f} | {r['benchmark']} | {fmt('skill', '+.3f')} | {days_won} | "
+            f"{fmt('win_rate', '.3f')} | {fmt('dm_t', '+.2f')} | {r['n_days']} |"
+        )
+    lines += [
+        "",
+        "Days won: target days on which the forecast's mean squared error is below its benchmark's. The quote win "
+        "rate treats quotes as independent (they are not within a day). DM: Diebold-Mariano statistic on the daily "
+        "squared-error differential (negative favours the forecast). SPY options are American and vols are inverted "
+        "with European Black-76 (see the single-snapshot metrics).",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_history(
+    result: Dict[str, object], sessions: pd.DataFrame, outdir: Path, manifest: Dict[str, object]
+) -> List[Path]:
+    outdir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, table in result["tables"].items():
+        path = outdir / f"{name}.csv"
+        table.to_csv(path, index=False, float_format="%.6g", lineterminator="\n")
+        paths.append(path)
+    path = outdir / "sessions.csv"
+    sessions.to_csv(path, index=False, lineterminator="\n")
+    summary = jsonable(result["summary"])
+    (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (outdir / "METRICS_SUMMARY.md").write_text(history_markdown(summary))
+    (outdir / "manifest.json").write_bytes(manifest_bytes(manifest))
+    return paths + [path, outdir / "summary.json", outdir / "METRICS_SUMMARY.md", outdir / "manifest.json"]
+
+
+def main_history(args: argparse.Namespace, argv: Optional[Sequence[str]]) -> int:
+    from derivx.data.snapshots import SnapshotError
+
+    try:
+        ds, info, sessions = load_history(args.ticker, args.store, args.repo, args.branch, args.offline,
+                                          args.first, args.last)  # fmt: skip
+    except (SnapshotError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Loaded {len(ds.chains)} collected session(s) of {ds.ticker} ({ds.rows:,} rows) from {info['source']}")
+    discount = discounting_for(ds, args.discount, args.rate, with_cache=args.with_cache)
+    try:
+        result = compute_history(ds, info, discount=discount, min_volume=args.min_volume, min_mid=args.min_mid,
+                                 max_spread=args.max_spread, horizon=args.horizon, window=args.window,
+                                 max_days=args.max_days if args.max_days is not None else 120.0)  # fmt: skip
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    manifest = build_manifest(
+        "metrics_history",
+        inputs={"argv": list(argv) if argv is not None else sys.argv[1:], **result["summary"]["filters"]},
+        data={**ds.provenance(), "collection": info, "files": sessions[["path", "sha256"]].to_dict(orient="records")},
+        model=result["summary"]["settings"],
+    )
+    for path in write_history(result, sessions, args.outdir, manifest):
+        print(f"wrote {path}")
+    wf = result["summary"]["walk_forward"]
+    print(f"walk-forward: {wf['status']}" + (f" ({wf['reason']})" if wf.get("reason") else ""))
+    return 0
+
+
 def write_outputs(result: Dict[str, object], outdir: Path, manifest: Dict[str, object]) -> List[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -374,11 +620,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--no-calibration", action="store_true", help="skip the production SVI calibration")
     parser.add_argument("--expiries", nargs="*", help="score only these expiries (YYYY-MM-DD)")
+    hist = parser.add_argument_group("history mode (the walk-forward on the collected daily snapshots)")
+    hist.add_argument("--history", action="store_true", help="read the synced data-snapshots store")
+    hist.add_argument("--store", type=Path, help="a local checkout of the data branch (implies --history)")
+    hist.add_argument("--repo", help="OWNER/NAME (default $DERIVX_SNAPSHOT_REPO or ZealousEar/derivx-fic-analytics)")
+    hist.add_argument("--branch", help="data branch (default $DERIVX_SNAPSHOT_BRANCH or data-snapshots)")
+    hist.add_argument("--offline", action="store_true", help="read only the synced copy in the cache")
+    hist.add_argument("--ticker", default="SPY", help="ticker of the collected history (default SPY)")
+    hist.add_argument("--first", help="first session to use (YYYY-MM-DD)")
+    hist.add_argument("--last", help="last session to use (YYYY-MM-DD)")
+    hist.add_argument("--horizon", type=int, default=1, help="trading days from origin to target (default 1)")
+    hist.add_argument("--window", type=int, default=1, help="snapshots pooled in each SVI fit (default 1)")
+    hist.add_argument("--with-cache", action="store_true",
+                      help="discount with the download cache's Treasury curves too (later trade dates)")  # fmt: skip
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.history or args.store is not None:
+        return main_history(args, argv)
     try:
         ds = load_inputs(args.chain, args.chain_dir)
     except ChainSchemaError as exc:

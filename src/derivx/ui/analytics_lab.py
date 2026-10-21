@@ -66,6 +66,7 @@ from derivx.data.chain_schema import (
 )
 from derivx.data.market_data import apply_liquidity_filters, fetch_option_chain, hygiene_report
 from derivx.data.samples import load_sample_chain, sample_fetch_status
+from derivx.data.snapshots import origins_needed, scorable_origins
 from derivx.data.synthetic import DEFAULT_SEED, SYNTH_TICKER, synthetic_history
 from derivx.models.comparison import (
     MODELS,
@@ -76,7 +77,7 @@ from derivx.models.comparison import (
     pairwise_wins,
     summarise_comparison,
 )
-from derivx.ui import lab_rates, lab_vol
+from derivx.ui import lab_history, lab_rates, lab_vol
 from derivx.ui.lab_common import banner, downloads, fingerprint, legend, stale_notice, stats
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.state import PERSIST
@@ -551,6 +552,8 @@ def _load_controls() -> None:
                         "error",
                         f"Yahoo pull failed ({status.get('status')}): {status.get('reason')}",
                     )
+    st.markdown("**Collected history** (one real chain per trading day, saved by the collect-data workflow)")
+    lab_history.render_market_data_loader(_activate)
     msg = st.session_state.get(K_LOAD_MSG)
     if msg:
         level, text = msg
@@ -978,23 +981,34 @@ def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
 
 HISTORY_HELP = (
     "A walk-forward test needs **genuine daily snapshots**: one chain per trading day, each saved on its own day. "
-    "Yahoo Finance has no history (it serves only the current chain), so the app no longer offers a 'download "
-    "history' button: it used to save today's chain under every past date. Build a history by running "
-    "`python tools/download_spy_chains.py --ticker SPY --outdir data/market/spy` once per trading day after the "
-    "close (it stamps each file with the session and the real fetch time), then upload the files here. The "
-    "SYNTHETIC demo shows the mechanics on generated data that is not market data."
+    "Yahoo Finance has no history (it serves only the current chain), so the app never saves today's chain under "
+    "a past date. **Collected history** reads the snapshots the scheduled `collect-data` GitHub workflow saves "
+    "every trading day after the close on the repository's `data-snapshots` branch (each stamped with its session, "
+    "real fetch time and spot); the test runs once they hold enough origin days. You can also upload files saved "
+    "by `tools/download_spy_chains.py`. The SYNTHETIC demo shows the mechanics on generated data that is not "
+    "market data."
 )
+
+
+def _use_collected(ds: ChainDataset, info: Dict[str, Any]) -> None:
+    st.session_state[K_WF_DATA] = {"dataset": ds, "origin": "collected", "seed": None, "history": info}
+    st.session_state[K_WF_MSG] = (
+        "success",
+        f"Loaded {len(ds.chains)} collected session(s) of {ds.ticker} from {info.get('source')}.",
+    )
 
 
 def _wf_controls() -> None:
     source = st.radio(
         "History",
-        ["Upload daily snapshots", "SYNTHETIC demo history"],
+        [lab_history.SOURCE_LABEL, "Upload daily snapshots", "SYNTHETIC demo history"],
         horizontal=True,
         key="lab_wf_source",
         persist_state=PERSIST,
     )
-    if source == "Upload daily snapshots":
+    if source == lab_history.SOURCE_LABEL:
+        lab_history.render_walkforward_source(_use_collected)
+    elif source == "Upload daily snapshots":
         files = st.file_uploader(
             "Daily snapshot files (CSV, CSV.GZ or parquet; one trade date per file, or several per file)",
             type=UPLOAD_TYPES,
@@ -1106,7 +1120,10 @@ def _render_walkforward_tab() -> None:
     _wf_controls()
     entry = st.session_state.get(K_WF_DATA)
     if not entry:
-        st.info("Upload daily snapshots or generate the SYNTHETIC demo history to run a walk-forward test.")
+        st.info(
+            "Use the collected history once it is long enough, upload daily snapshots, or generate the SYNTHETIC "
+            "demo history to run a walk-forward test."
+        )
         return
     ds: ChainDataset = entry["dataset"]
     prov = ds.provenance()
@@ -1115,12 +1132,20 @@ def _render_walkforward_tab() -> None:
             for w in ds.warnings:
                 st.markdown(f"- {w}")
     gaps = missing_trading_days(ds.trade_dates)
+    collected = entry.get("origin") == "collected"
     _banner(
         prov,
-        label="HISTORY",
-        extra=[f"missing trading days: {', '.join(_day(g) for g in gaps[:6])}{'...' if len(gaps) > 6 else ''}"]
-        if gaps
-        else ["no missing trading days"],
+        label="COLLECTED HISTORY" if collected else "HISTORY",
+        extra=(
+            [f"missing trading days: {', '.join(_day(g) for g in gaps[:6])}{'...' if len(gaps) > 6 else ''}"]
+            if gaps
+            else ["no missing trading days"]
+        )
+        + (
+            [f"from {entry['history'].get('source')}, index sha256 {str(entry['history'].get('index_sha256'))[:12]}"]
+            if collected and entry.get("history")
+            else []
+        ),
     )
     if len(ds.chains) < 2:
         st.warning(
@@ -1179,7 +1204,17 @@ def _render_walkforward_tab() -> None:
     )
     data_key = _key(prov["data_sha256"], filters, discount.describe())
     settings_key = _key(settings.as_dict())
-    run = st.button("Run walk-forward test", key="lab_wf_run", width="stretch")
+    waiting = ""
+    if collected:
+        have, need = scorable_origins(ds.trade_dates, horizon), origins_needed(settings.min_regime_days)
+        if have < need:
+            waiting = (
+                f"{len(ds.chains)} collected session(s) give {have} origin day(s) with the session {horizon} trading "
+                f"day(s) later; the walk-forward on collected history needs {need} (three per vol-regime tercile). "
+                "Pick a shorter horizon or wait for more sessions."
+            )
+            st.warning(waiting)
+    run = st.button("Run walk-forward test", key="lab_wf_run", width="stretch", disabled=bool(waiting))
     prepared = None
     if run:
         try:
@@ -1195,7 +1230,11 @@ def _render_walkforward_tab() -> None:
             "provenance": prov,
             "result": result,
             "manifest": _manifest(
-                "walk_forward", prov, {"filters": filters}, settings.as_dict(), seed=entry.get("seed")
+                "walk_forward",
+                prov,
+                {"filters": filters, **({"collected_history": entry["history"]} if entry.get("history") else {})},
+                settings.as_dict(),
+                seed=entry.get("seed"),
             ),
         }
     stored = st.session_state.get(K_WF)

@@ -320,6 +320,7 @@ def test_walkforward_on_synthetic_history_scores_benchmarks_without_zigzag():
 
 def test_walkforward_uploads_refuse_duplicate_dates_and_explain_single_snapshots():
     at = _lab()
+    at.radio(key="lab_wf_source").set_value("Upload daily snapshots").run()  # the default is Collected history
     data = chain_to_csv(load_sample_chain().single().head(400))
     up = at.file_uploader(key="lab_wf_upload")
     up.set_value([("a.csv", data, "text/csv"), ("b.csv", data, "text/csv")]).run()
@@ -402,6 +403,7 @@ def test_a_file_with_only_the_required_columns_never_crashes_the_lab():
 
 def test_walkforward_files_without_volume_explain_the_filter_instead_of_crashing():
     at = _lab()
+    at.radio(key="lab_wf_source").set_value("Upload daily snapshots").run()
     files = [
         (f"d{i}.csv", chain_to_csv(df.drop(columns=["volume"])), "text/csv")
         for i, df in enumerate(synthetic_history(3).values())
