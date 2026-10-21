@@ -119,11 +119,12 @@ def test_every_analytics_chart_is_zoom_bounded():
     at.button(key="lab_wf_run").click().run()
     assert not at.exception
     charts = _charts(at)
-    assert len(charts) == 3  # calibration smile, walk-forward, model comparison
+    assert len(charts) == 4  # calibration smile, its bucket vegas, walk-forward, model comparison
     for spec, config in charts:
         _assert_bounded(spec, config)
     named = {spec["layout"]["meta"]["chart"]: spec["layout"] for spec, _ in charts}
-    assert set(named) == {"lab_calibration", "lab_walkforward", "lab_model_comparison"}
+    assert set(named) == {"lab_calibration", "lab_bucket_vega", "lab_walkforward", "lab_model_comparison"}
+    # the research tabs' charts (surface, local vol, parameter history, rates) are checked in test_lab_research_ui
     for name in ("lab_calibration", "lab_model_comparison"):
         assert named[name]["xaxis"]["minallowed"] >= 0.0 and named[name]["yaxis"]["minallowed"] >= 0.0
     assert named["lab_walkforward"]["yaxis"]["minallowed"] >= 0.0

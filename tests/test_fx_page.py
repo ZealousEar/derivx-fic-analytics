@@ -23,6 +23,7 @@ from derivx.fx.conventions import forward_points, fx_dates, get_pair, market_del
 from derivx.fx.examples import ILLUSTRATIVE_QUOTES
 from derivx.fx.pricing import FxMarket, fx_delta, gk_price
 from derivx.fx.smile import SmileConventions, TenorQuote, build_smile
+from derivx.fx.smile_risk import quote_vegas
 from derivx.ui.fx_page import apply_editor_changes
 
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
@@ -649,3 +650,21 @@ def test_greeks_caption_states_what_each_rho_holds_fixed():
     at.radio(key="fx_carry").set_value("FORWARD POINTS").run()
     text = next(c.value for c in at.caption if c.value.startswith("For the long position"))
     assert "(the foreign rate is the one implied by the forward points)" in text
+
+
+def test_smile_risk_shows_vega_by_quote_and_by_sabr_parameter():
+    """VM-18: the priced option's vega to each ATM / RR / BF quote (smile
+    rebuilt from the bumped quotes) and to the SABR parameters."""
+
+    at = _fx()
+    table = _frame(at, "POSITION (USD)").set_index("QUOTE")
+    assert list(table.index) == ["ATM", "RR25", "BF25", "RR10", "BF10"]
+    d, m = _market("EURUSD", "3M", EURUSD_SPOT, 0.0375, 0.02)
+    conv = SmileConventions(market_delta_type("EURUSD", d), "DNS", "market")
+    direct = quote_vegas(m, _quote("EURUSD", "3M"), conv, "SABR", 1.12, True).set_index("quote")["vega"]
+    shown = table["PER 1 EUR (USD)"].astype(float)
+    np.testing.assert_allclose(shown.to_numpy(), direct.to_numpy(), atol=2e-6)
+    assert shown["ATM"] > 0 and (table["FITTED"] == "yes").all()
+    params = _frame(at, "SABR PARAMETER")
+    assert list(params["SABR PARAMETER"]) == ["alpha", "rho", "nu"]
+    assert any("SMILE RISK" in m_.value for m_ in at.markdown)
