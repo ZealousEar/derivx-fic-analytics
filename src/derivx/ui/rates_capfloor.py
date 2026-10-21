@@ -34,7 +34,7 @@ from derivx.rates.curves import Market
 from derivx.rates.portfolio import cap_terms
 from derivx.rates.vol_examples import ILLUSTRATIVE, illustrative_cap_atm, illustrative_cap_strikes
 from derivx.risk.scenarios import theta
-from derivx.risk.sensitivities import Position, key_rate_pv01, rate_pv01_gamma
+from derivx.risk.sensitivities import Position, rate_pv01_gamma
 from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
@@ -68,11 +68,8 @@ CAPLET_FORMATS = {
     "STRIKE (%)": st.column_config.NumberColumn(format="%.4f"),
     "FLOOR STRIKE (%)": st.column_config.NumberColumn(format="%.4f"),
     "DF": st.column_config.NumberColumn(format="%.8f"),
-    "PV": st.column_config.NumberColumn(format="%.2f"),
-    "CAP PV": st.column_config.NumberColumn(format="%.2f"),
-    "FLOOR PV": st.column_config.NumberColumn(format="%.2f"),
-    "PV01 (/BP)": st.column_config.NumberColumn(format="%.2f"),
 }
+MONEY_2DP = st.column_config.NumberColumn(format="%.2f")  # PV, CAP PV, FLOOR PV, PV01 columns (named with the currency)
 
 
 def _vol_table(model: str) -> Dict[float, float]:
@@ -101,10 +98,11 @@ def _vol_table(model: str) -> Dict[float, float]:
     return {float(t): float(v) * unit for t, v in zip(expiries, rows[column].astype(float))}
 
 
-def _caplet_view(table: pd.DataFrame, model: str, compounded: bool = False) -> pd.DataFrame:
+def _caplet_view(table: pd.DataFrame, model: str, compounded: bool = False, c: str = "$") -> pd.DataFrame:
     """The caplet table in display units: a compounded rate adds its first
     daily fixing, option (variance) time and effective vol; a collar its
-    floor strike, floor vol and the PVs of both legs."""
+    floor strike, floor vol and the PVs of both legs. Amounts in currency
+    ``c`` (named in the column headers)."""
 
     label, unit, _ = VOL_UNITS[model]
     per = "1BP" if model == "bachelier" else "VOL PT"
@@ -121,8 +119,8 @@ def _caplet_view(table: pd.DataFrame, model: str, compounded: bool = False) -> p
         cols[f"EFF VOL ({label})"] = table["effective_vol"] / unit
     if "floor_strike" in table:
         cols.update({"FLOOR STRIKE (%)": table["floor_strike"] * 100, f"FLOOR VOL ({label})": table["floor_vol"] / unit,
-                     "CAP PV": table["cap_pv"], "FLOOR PV": table["floor_pv"]})  # fmt: skip
-    cols.update({"DF": table["df"], "PV": table["pv"], f"VEGA (/{per})": table["vega"],
+                     f"CAP PV ({c})": table["cap_pv"], f"FLOOR PV ({c})": table["floor_pv"]})  # fmt: skip
+    cols.update({"DF": table["df"], f"PV ({c})": table["pv"], f"VEGA ({c}/{per})": table["vega"],
                  "STATUS": np.where(table["fixed"], "fixed", "live")})  # fmt: skip
     return pd.DataFrame(cols)
 
@@ -132,8 +130,11 @@ def _date_limits(days: List[dt.date]) -> Dict[str, str]:
     return {"min": (min(days) - pad).isoformat(), "max": (max(days) + pad).isoformat()}
 
 
-def _strip_chart(table: pd.DataFrame, strike: float, kind: str, floor_strike: Optional[float] = None) -> go.Figure:
-    """Forward against the strike(s) by (last) fixing date, and each period's PV."""
+def _strip_chart(
+    table: pd.DataFrame, strike: float, kind: str, floor_strike: Optional[float] = None, c: str = "$"
+) -> go.Figure:
+    """Forward against the strike(s) by (last) fixing date, and each period's
+    PV in currency ``c``."""
 
     fixes = list(table["fix"])
     forwards = (table["forward"] * 100).tolist()
@@ -144,7 +145,7 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str, floor_strike: Op
         shared_xaxes=True,
         vertical_spacing=0.1,
         row_heights=[0.55, 0.45],
-        subplot_titles=("FORWARD VS STRIKE (%)", f"{kind.upper()}LET PV"),
+        subplot_titles=("FORWARD VS STRIKE (%)", f"{kind.upper()}LET PV ({c})"),
     )
     fig.add_trace(
         go.Scatter(x=fixes, y=forwards, mode="lines+markers", name="FORWARD", line=dict(color=SERIES[0], width=2)),
@@ -183,7 +184,7 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str, floor_strike: Op
     dark_layout(fig, height=520)
     fig.update_xaxes(title_text="FIXING DATE (LAST FIXING IF COMPOUNDED)", row=2, col=1)
     fig.update_yaxes(title_text="RATE (%)", row=1, col=1)
-    fig.update_yaxes(title_text="PV", row=2, col=1)
+    fig.update_yaxes(title_text=f"PV ({c})", row=2, col=1)
     dates = _date_limits(fixes)
     bound_axes(
         fig,
@@ -193,6 +194,14 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str, floor_strike: Op
         yaxis2=axis_limits([0.0, *pvs], pad=0.1, floor=min(0.0, *pvs)),
     )
     return fig
+
+
+def _ladder_rows(bumps, position: Position) -> List[dict]:
+    """Key-rate PV01 rows (as :func:`derivx.risk.sensitivities.key_rate_pv01`
+    gives them) from the shared bumped curves."""
+
+    values = bumps.key_rate_matrix([position.pv])[:, 0]
+    return [dict(row, pv01=float(v)) for row, v in zip(bumps.rows, values)]
 
 
 def _ladder_chart(rows: List[dict]) -> go.Figure:
@@ -467,10 +476,10 @@ def _smile_chart(surface: CapletVolSurface, expiry: float, forward: float, sourc
     return bound_axes(fig, xaxis=axis_limits(xs, pad=0.05), yaxis=axis_limits(shown, pad=0.12, floor=0.0)), note
 
 
-def _vega_chart(buckets: pd.DataFrame, per: str) -> go.Figure:
+def _vega_chart(buckets: pd.DataFrame, per: str, c: str = "$") -> go.Figure:
     fixes, values = list(buckets["fix"]), buckets["vega"].tolist()
     fig = go.Figure(go.Bar(x=fixes, y=values, name="VEGA", marker=dict(color=SERIES[2])))
-    dark_layout(fig, height=300, xtitle="CAPLET FIXING DATE", ytitle=f"VEGA (PER +{per})", legend=False)
+    dark_layout(fig, height=300, xtitle="CAPLET FIXING DATE", ytitle=f"VEGA ({c} PER +{per})", legend=False)
     return bound_axes(fig, xaxis=_date_limits(fixes), yaxis=axis_limits([0.0, *values], pad=0.12,
                                                                          floor=min(0.0, *values)))  # fmt: skip
 
@@ -656,8 +665,9 @@ def render(market: Market) -> List[Position]:
             ladder = [dict(r, pv01=float(v)) for key in curves for r, v in zip(*ladders[key])]
         else:
             ladders = None
+            bumps = rates_risk.bumps(market, "curve")  # the curve rebuilt once per quote, shared with SWAP and BOOK
             ladder = rates_risk.cached("cap_ladder", (rates_risk.market_key(market), trade),
-                                       lambda: key_rate_pv01(position.pv, market))  # fmt: skip
+                                       lambda: _ladder_rows(bumps, position))  # fmt: skip
         greeks = _greeks(position, market, trade)
         pv01 = greeks["pv01"]
         decay = cf.decay(market)
@@ -667,15 +677,16 @@ def render(market: Market) -> List[Position]:
         return []
 
     per = "1BP" if model == "bachelier" else "VOL PT"
+    c = rates_risk.money(market).strip()
     cells = [
-        ("PV", f"{pv:,.2f}"),
+        (f"PV ({c})", f"{pv:,.2f}"),
         ("PREMIUM (BP RUNNING)", f"{premium_bp:,.2f}"),
         ("PREMIUM (% UPFRONT)", f"{pv / notional * 100:.4f}"),
         ("ATM STRIKE (%)", f"{atm * 100:.4f}"),
-        (f"VEGA (/{per})", f"{vega:,.2f}"),
-        ("PV01 (/BP)", f"{pv01:,.2f}"),
-        ("GAMMA (/BP²)", f"{greeks['gamma']:,.4f}"),
-        ("THETA (1 BUS. DAY)", f"{greeks['theta']:,.2f}"),
+        (f"VEGA ({c}/{per})", f"{vega:,.2f}"),
+        (f"PV01 ({c}/BP)", f"{pv01:,.2f}"),
+        (f"GAMMA ({c}/BP²)", f"{greeks['gamma']:,.4f}"),
+        (f"THETA ({c}, 1 BUS. DAY)", f"{greeks['theta']:,.2f}"),
     ]
     for start in range(0, len(cells), 3):  # three to a row: wider rows wrap next to the sidebar
         for col, (label, value) in zip(st.columns(3), cells[start : start + 3]):
@@ -691,7 +702,7 @@ def render(market: Market) -> List[Position]:
     )  # fmt: skip
     st.caption(
         f"{cf.label}, {len(table)} {kind}lets. PV, vega and PV01 are P&L to the holder in "
-        f"currency for the notional; PV01 is {shift_text}. Running premium is "
+        f"{c} for the notional; PV01 is {shift_text}. Running premium is "
         f"PV over the strip annuity (sum of notional x accrual x DF).{legs} Cap - floor - payer swap at "
         f"{'the cap strike' if collar else 'the strike'} = {parity['residual']:.2e}."
     )
@@ -738,14 +749,15 @@ def render(market: Market) -> List[Position]:
         st.warning(f"The {kind} pays after the curve's last quote ({pillars[-1]}); forwards beyond it are held flat.")
 
     st.markdown(f"### / {kind.upper()}LETS")
-    st.plotly_chart(_strip_chart(table, strike, kind, floor_strike), width="stretch", config=PLOTLY_2D_CONFIG,
+    st.plotly_chart(_strip_chart(table, strike, kind, floor_strike, c), width="stretch", config=PLOTLY_2D_CONFIG,
                     key="cap_strip_chart")  # fmt: skip
-    view = _caplet_view(table, model, compounded)
+    view = _caplet_view(table, model, compounded, c)
     two_dp = st.column_config.NumberColumn(format="%.2f")
     formats = {
         **CAPLET_FORMATS,
-        **{c: two_dp for c in view.columns if c.startswith(("VOL (", "VEGA (", "EFF VOL (", "FLOOR VOL ("))},
-    }
+        **{col: two_dp for col in view.columns
+           if col.startswith(("VOL (", "VEGA (", "EFF VOL (", "FLOOR VOL (", "PV (", "CAP PV (", "FLOOR PV ("))},
+    }  # fmt: skip
     st.dataframe(view, width="stretch", hide_index=True, column_config=formats)
     st.download_button(
         "DOWNLOAD CAPLETS CSV",
@@ -757,8 +769,8 @@ def render(market: Market) -> List[Position]:
     )
     buckets = vega_by_expiry(cf, market)
     if len(buckets):
-        st.markdown(f"### / VEGA BY CAPLET EXPIRY (PER +{per})")
-        st.plotly_chart(_vega_chart(buckets, per), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_vega_chart")
+        st.markdown(f"### / VEGA BY CAPLET EXPIRY ({c} PER +{per})")
+        st.plotly_chart(_vega_chart(buckets, per, c), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_vega_chart")
         st.caption(
             f"Each live {kind}let's vega: P&L for +{'1bp of normal vol' if model == 'bachelier' else '1 vol point'} "
             f"on that caplet's vol alone. They sum to the vega {vega:,.2f}."
@@ -767,7 +779,9 @@ def render(market: Market) -> List[Position]:
     st.markdown("### / KEY-RATE PV01" + (" BY CURVE" if ladders is not None else ""))
     if ladders is None:
         st.plotly_chart(_ladder_chart(ladder), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_ladder_chart")
-        ladder_view = pd.DataFrame({"QUOTE": [r["label"] for r in ladder], "PV01 (/BP)": [r["pv01"] for r in ladder]})
+        ladder_view = pd.DataFrame(
+            {"QUOTE": [r["label"] for r in ladder], f"PV01 ({c}/BP)": [r["pv01"] for r in ladder]}
+        )
     else:
         for key in ladders:
             rows, values = ladders[key]
@@ -780,10 +794,10 @@ def render(market: Market) -> List[Position]:
             {
                 "CURVE": [rates_risk.curve_title(market, key) for key in ladders for _ in ladders[key][0]],
                 "QUOTE": [r["label"] for r in ladder],
-                "PV01 (/BP)": [r["pv01"] for r in ladder],
+                f"PV01 ({c}/BP)": [r["pv01"] for r in ladder],
             }
         )
-    st.dataframe(ladder_view, width="stretch", hide_index=True, column_config=CAPLET_FORMATS)
+    st.dataframe(ladder_view, width="stretch", hide_index=True, column_config={f"PV01 ({c}/BP)": MONEY_2DP})
     st.download_button(
         "DOWNLOAD KEY-RATE PV01 CSV",
         ladder_view.to_csv(index=False),
