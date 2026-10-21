@@ -112,6 +112,18 @@ def test_enforcement_skips_free_starts_only_when_the_free_optimum_is_clearly_arb
     assert quick.rmse_bp == pytest.approx(full.rmse_bp, abs=1e-3)  # the same constrained optimum
 
 
+def test_the_slsqp_constraint_grid_stays_under_the_multi_threaded_blas_size():
+    """From about 210 constraint rows SciPy's SLSQP runs its subproblems on
+    multi-threaded BLAS, 2-10x slower on this small problem (the 396-point
+    grid used before doubled a whole-sample calibration's wall time)."""
+
+    rng = np.random.default_rng(11)
+    for _ in range(50):
+        xs = [np.array([1e-3, 0.1, rng.uniform(-0.9, 0.9), rng.uniform(-1, 1), rng.uniform(1e-3, 1)]) for _ in "ab"]
+        grid = svi._constraint_grid(xs, (rng.uniform(-3, -0.1), rng.uniform(0.1, 2)))
+        assert len(grid) <= 136 and np.all(np.diff(grid) > 0)
+
+
 def test_calibrate_chain_reports_progress(spy):
     seen = []
     result = _calibrate(spy, ["2026-11-20", "2026-12-18"], cv_folds=0, progress=lambda *a: seen.append(a))
