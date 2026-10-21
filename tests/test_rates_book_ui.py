@@ -399,16 +399,30 @@ def test_a_book_in_two_currencies_is_totalled_per_currency_and_converted():
 
     grid = _frame(at, "SCENARIO")
     assert {"EU1 (EUR)", "UST (USD)", "TOTAL EUR", "TOTAL USD", "ALL IN USD"} <= set(grid.columns)
-    rates = grid[~grid["SCENARIO"].str.startswith("FX ")]
+    from derivx.risk import scenarios as sc
+
+    # historical episodes replay FX too: EURUSD moves by the ECB reference rates of the episode's dates
+    replays = {name: dict(sc.historical(name).fx) for name in sc.historical_episodes()}
+    assert set(replays) <= set(grid["SCENARIO"]) and all(fx["EURUSD"] != 0.0 for fx in replays.values())
+    rates = grid[~grid["SCENARIO"].str.startswith("FX ") & ~grid["SCENARIO"].isin(list(replays))]
     np.testing.assert_allclose(rates["ALL IN USD"], rates["TOTAL USD"] + rates["TOTAL EUR"] * eurusd, rtol=1e-10)
+    for name, fx in replays.items():
+        row = _row(grid, "SCENARIO", name)
+        moved = (eur["PV"] + row["TOTAL EUR"]) * eurusd * fx["EURUSD"] / 100.0  # the euro book's translation
+        assert row["ALL IN USD"] == pytest.approx(row["TOTAL USD"] + row["TOTAL EUR"] * eurusd + moved, rel=1e-9)
     up = _row(grid, "SCENARIO", "FX EURUSD +10%")
     assert up["TOTAL EUR"] == 0.0 and up["TOTAL USD"] == 0.0  # FX moves no local value
     assert up["ALL IN USD"] == pytest.approx(eur["PV"] * eurusd * 0.10, rel=1e-10)  # the euro book's translation
     assert _row(grid, "SCENARIO", "FX EURUSD -10%")["ALL IN USD"] == pytest.approx(-up["ALL IN USD"], rel=1e-10)
 
     var = _frame(at, "HIST VAR")
-    assert list(var["ID"])[-3:] == ["TOTAL USD", "TOTAL EUR", "ALL IN USD"]
+    assert list(var["ID"])[-5:] == ["TOTAL USD", "TOTAL EUR", "ALL IN USD", "ALL IN USD (FX HELD)",
+                                    "ALL IN USD (FX ONLY)"]  # fmt: skip
     assert _metric(at, "HIST VAR 1D (IN $)") == f"{round(_row(var, 'ID', 'ALL IN USD')['HIST VAR']) + 0.0:,.0f}"
+    # the converted VaR moves with FX: it differs from the FX-held one, and FX alone is a risk
+    with_fx, held = _row(var, "ID", "ALL IN USD"), _row(var, "ID", "ALL IN USD (FX HELD)")
+    assert with_fx["HIST VAR"] != held["HIST VAR"] and _row(var, "ID", "ALL IN USD (FX ONLY)")["HIST VAR"] > 0.0
+    assert any("FX spots move with the ECB reference rates" in c.value for c in at.caption)
 
     labels = [m.label for m in at.metric]
     assert {"RESIDUAL RISK (€/BP)", "UNHEDGED RISK (€/BP)", "RESIDUAL RISK ($/BP)", "UNHEDGED RISK ($/BP)"} <= set(

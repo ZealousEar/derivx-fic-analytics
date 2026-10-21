@@ -1,6 +1,6 @@
 {
  "description": "Committed rates history sample for offline use and tests (values as published, in the stated units). Rebuild with: python tools/build_rates_snapshot.py",
- "built_at": "2026-10-20T21:07:30+00:00",
+ "built_at": "2026-10-21T23:07:15+00:00",
  "files": [
   {
    "dataset": "UST_PAR",
@@ -233,6 +233,53 @@
    "first": "2026-01-02",
    "last": "2026-10-19",
    "sha256": "5e34ba69b2be5a34382a9313a450c77991eee22cbf4dafd2dc27e8d7413e2f70"
+  },
+  {
+   "dataset": "FX_ECB",
+   "source": "ECB",
+   "unit": "fx",
+   "measure": "fx_per_eur",
+   "series": {
+    "EXR.D.USD.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "USD"
+    },
+    "EXR.D.GBP.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "GBP"
+    },
+    "EXR.D.JPY.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "JPY"
+    },
+    "EXR.D.CHF.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "CHF"
+    },
+    "EXR.D.CAD.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "CAD"
+    },
+    "EXR.D.AUD.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "AUD"
+    },
+    "EXR.D.NZD.EUR.SP00.A": {
+     "tenor": null,
+     "currency": "NZD"
+    }
+   },
+   "sampling": "month ends since 2008, episode windows (+/-4 days) and every TARGET business day from 2015-01-01 (ECB reference rates, set at 14:15 CET), values as published: units of each currency per 1 EUR; indicative reference rates, not dealable",
+   "urls": [
+    "https://data-api.ecb.europa.eu/service/data/EXR/D.USD+GBP+JPY+CHF+CAD+AUD+NZD.EUR.SP00.A?format=csvdata&detail=dataonly&startPeriod=2008-01-01"
+   ],
+   "fetched_at": "2026-10-21T23:07:17+00:00",
+   "attribution": "Source: ECB Data Portal",
+   "file": "fx_ecb.csv",
+   "rows": 3116,
+   "first": "2008-01-31",
+   "last": "2026-10-21",
+   "sha256": "7c4c89cb408bb3dd4baef8e1f1f0ca17ff505eb6295ab56be203b204a806b262"
   }
  ]
 }

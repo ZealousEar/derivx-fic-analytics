@@ -13,6 +13,11 @@ Datasets (``DATASETS``) are curves of one kind from one publisher:
   continuously compounded)
 * ``FIXINGS``      - SOFR, EFFR, OBFR (NY Fed), ESTR (ECB), SONIA (BoE via
   FRED) and the SOFR averages/index
+* ``FX_ECB``       - ECB euro foreign exchange reference rates (EXR, daily):
+  units of USD, GBP, JPY, CHF, CAD, AUD and NZD per 1 EUR; the committed
+  sample holds every TARGET business day from 2015-01-02, month ends since
+  2008 and the episode windows (:meth:`HistoryStore.fx_table`, crosses by
+  :func:`fx_cross`)
 * ``USER_SWAP:<CCY>`` - swap-curve history uploaded by the user
 
 Rows of higher priority win where they overlap (same dataset, measure, date
@@ -121,9 +126,46 @@ DATASETS: Dict[str, Dataset] = {
         "NY Fed (SOFR, EFFR, OBFR), ECB (ESTR), Bank of England via FRED (SONIA)",
     ),
 }
+FX_DATASET = "FX_ECB"
+FX_MEASURE = "fx_per_eur"
+FX_CORE = ("USD", "GBP", "JPY", "CHF")  # a day of the FX history counts when it has all of these
+DATASETS[FX_DATASET] = Dataset(
+    FX_DATASET,
+    "ECB euro foreign exchange reference rates",
+    "EUR",
+    "fx",
+    FX_MEASURE,
+    "ECB Data Portal (EXR, daily reference rates set at 14:15 CET)",
+    FX_CORE,
+    "units of each currency per 1 EUR on TARGET business days; reference rates for information, not dealable "
+    "quotes; crosses derived through EUR",
+)
 CURRENCY_FIXING = {"USD": "SOFR", "EUR": "ESTR", "GBP": "SONIA"}  # the overnight rate each OIS curve compounds
 FIXING_NAMES = {"SOFR": "SOFR", "EFFR": "EFFR", "OBFR": "OBFR", "ESTR": "ESTR", "ECBESTRVOLWGTTRMDMNRT": "ESTR",
                 "IUDSOIA": "SONIA"}  # fmt: skip
+
+
+def fx_currency(series: str) -> str:
+    """The currency of an ECB exchange-rate series (``EXR.D.USD.EUR.SP00.A``
+    -> ``USD``); other names are returned as they are."""
+
+    parts = str(series).split(".")
+    return parts[2] if len(parts) == 6 and parts[0] == "EXR" else str(series)
+
+
+def fx_cross(table: pd.DataFrame, base: str, quote: str) -> pd.Series:
+    """Cross rate ``quote`` per 1 ``base`` on every date of an FX table in
+    units per 1 EUR (:meth:`HistoryStore.fx_table`): ``per_eur[quote] /
+    per_eur[base]`` (GBPUSD = USD per EUR / GBP per EUR; USDJPY = JPY per
+    EUR / USD per EUR). The ECB's own rounding (four or five significant
+    decimals) carries into the cross."""
+
+    missing = [c for c in (base, quote) if c not in table.columns]
+    if missing:
+        raise ValueError(f"the FX history has no {', '.join(missing)} rate")
+    out = table[quote] / table[base]
+    out.name = f"{base}{quote}"
+    return out
 
 
 def user_dataset(currency: str) -> str:
@@ -238,6 +280,8 @@ class HistoryStore:
         fixings = frame["dataset"] == "FIXINGS"
         frame["item"] = frame["tenor"].astype(object)
         frame.loc[fixings, "item"] = [FIXING_NAMES.get(s, s) for s in frame.loc[fixings, "series"]]
+        fx = frame["dataset"] == FX_DATASET  # one value per currency and date
+        frame.loc[fx, "item"] = [fx_currency(s) for s in frame.loc[fx, "series"]]
         self.frame = frame.drop_duplicates(["dataset", "measure", "asof", "item"], keep="last").reset_index(drop=True)
         self.label = label
         self._rows: Dict[str, pd.DataFrame] = {k: g for k, g in self.frame.groupby("dataset", sort=False)}
@@ -246,6 +290,7 @@ class HistoryStore:
         self._dates: Dict[Tuple[str, str], List[dt.date]] = {}
         self._moves: Dict[tuple, CurveMove] = {}
         self._par: Dict[Tuple[str, dt.date], Dict[str, float]] = {}
+        self._fx: Optional[pd.DataFrame] = None
         self._fingerprint: Optional[str] = None
 
     @property
@@ -278,13 +323,18 @@ class HistoryStore:
         """Decimal values: one row per date, one column per tenor (shortest
         first); NaN where a tenor is missing."""
 
-        measure = measure or dataset_info(dataset).measure
+        info = dataset_info(dataset)
+        measure = measure or info.measure
         key = (dataset, measure)
         if key not in self._wide:
             rows = self.rows(dataset)
             rows = rows[rows["measure"] == measure]
             if rows.empty:
                 self._wide[key] = pd.DataFrame()
+            elif info.kind == "fx":  # one column per currency (units per 1 EUR), not per tenor
+                table = rows.pivot_table(index="asof", columns="item", values="value_decimal", aggfunc="last")
+                order = [c for c in rs.ECB_FX_CURRENCIES if c in table.columns]
+                self._wide[key] = table[order + sorted(set(table.columns) - set(order))].sort_index()
             else:
                 table = rows.pivot_table(index="asof", columns="tenor", values="value_decimal", aggfunc="last")
                 order = sorted(table.columns, key=lambda t: parse_tenor(t).years)
@@ -355,6 +405,36 @@ class HistoryStore:
         rows = rows[rows["asof"] == day]
         pairs = sorted({f"{s}, {o}" if o and o != s else s for s, o in zip(rows["source"], rows["origin"])})
         return "; ".join(pairs)
+
+    # -- FX reference rates ---------------------------------------------------
+
+    def fx_table(self) -> pd.DataFrame:
+        """The ECB reference rates (``FX_ECB``): one row per date with every
+        currency of :data:`FX_CORE`, one column per currency, units of it
+        per 1 EUR, plus ``EUR`` = 1. Empty when the store holds none."""
+
+        if self._fx is None:
+            table = self.complete(FX_DATASET) if self.has(FX_DATASET) else pd.DataFrame()
+            if not table.empty:
+                table = table.copy()
+                table.insert(0, "EUR", 1.0)
+                table.index.name = "date"
+                table.columns.name = None
+            self._fx = table
+        return self._fx
+
+    def fx_on(self, day: dt.date) -> Optional[Tuple[dt.date, Dict[str, float]]]:
+        """(date, ``{currency: units per 1 EUR}``) of the latest reference
+        rates on or before ``day``; None when the store has none that early."""
+
+        table = self.fx_table()
+        if table.empty:
+            return None
+        i = bisect.bisect_right(list(table.index), day)
+        if not i:
+            return None
+        row = table.iloc[i - 1]
+        return table.index[i - 1], {c: float(v) for c, v in row.items() if np.isfinite(v)}
 
     # -- curves on a date ----------------------------------------------------
 
@@ -544,6 +624,7 @@ def live_requests(today: dt.date) -> Dict[str, Callable[..., rs.Fetched]]:
             rs.ECB_SPOT_TENORS, measure="spot", start=recent, **kw
         ),
         "SONIA (BoE via FRED)": lambda **kw: rs.fred_series(["IUDSOIA"], recent, **kw),
+        "ECB FX reference rates": lambda **kw: rs.ecb_fx(start=recent, **kw),
     }
 
 

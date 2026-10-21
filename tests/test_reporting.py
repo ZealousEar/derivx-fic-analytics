@@ -68,15 +68,34 @@ def _book(ccy: str, with_bond: bool = False):
 def test_ecb_spots_take_the_latest_day_on_or_before_the_valuation_date():
     rates = bundled_ecb_rates()
     days = sorted(rates.history)
-    on = rp.ecb_spots(rates, days[1])
-    assert on.asof == days[1] and on.quote("EURUSD") == rates.history[days[1]]["USD"]
-    assert on.quote("EURGBP") == rates.history[days[1]]["GBP"]
-    between = rp.ecb_spots(rates, days[1] - dt.timedelta(days=1))  # a weekend: the Friday before
-    assert between.asof == max(d for d in days if d < days[1])
-    early = rp.ecb_spots(rates, dt.date(2020, 3, 18))  # before the snapshot: its first day, dated so
+    assert (days[0], days[-1], len(days)) == (dt.date(2008, 1, 31), dt.date(2026, 10, 21), 3116)
+    on = rp.ecb_spots(rates, dt.date(2026, 10, 19))
+    assert on.asof == dt.date(2026, 10, 19) and on.quote("EURUSD") == 1.1225
+    assert on.quote("EURGBP") == 0.84205 and on.quote("GBPUSD") == pytest.approx(1.1225 / 0.84205, rel=1e-15)
+    between = rp.ecb_spots(rates, dt.date(2026, 10, 18))  # a Sunday: the Friday before
+    assert between.asof == dt.date(2026, 10, 16) and between.quote("EURUSD") == 1.1253
+    episode = rp.ecb_spots(rates, dt.date(2020, 3, 18))  # any day of the daily history since 2015
+    assert episode.asof == dt.date(2020, 3, 18) and episode.quote("EURUSD") == 1.0934
+    early = rp.ecb_spots(rates, dt.date(2007, 6, 1))  # before the history: its first day, dated so
     assert early.asof == days[0]
-    assert rp.Reporting("USD", early).stale_days(dt.date(2020, 3, 18)) == (days[0] - dt.date(2020, 3, 18)).days
+    assert rp.Reporting("USD", early).stale_days(dt.date(2007, 6, 1)) == (days[0] - dt.date(2007, 6, 1)).days
     assert "ECB" in on.source and "bundled" in on.source
+
+
+def test_store_spots_convert_on_any_valuation_date_of_the_fx_history():
+    from derivx.data import rates_history as rh
+
+    store = rh.bundled_store()
+    for day, eurusd, eurgbp in ((dt.date(2026, 10, 19), 1.1225, 0.84205), (dt.date(2020, 3, 17), 1.0982, 0.90823)):
+        spots = rp.store_spots(store, day)
+        assert spots.asof == day and spots.quote("EURUSD") == eurusd and spots.quote("EURGBP") == eurgbp
+        assert spots.source == "ECB euro reference rates (bundled snapshot)"
+    assert rp.store_spots(store).asof == dt.date(2026, 10, 21)  # the latest day held
+    assert rp.store_spots(store, dt.date(2026, 12, 25)).asof == dt.date(2026, 10, 21)  # after it: stale, dated so
+    assert rp.default_reporting(dt.date(2020, 3, 18), "EUR").fx.quote("EURUSD") == 1.0934
+    empty = rh.build_store([], "empty")
+    with pytest.raises(ValueError, match="no ECB reference rates"):
+        rp.store_spots(empty, dt.date(2026, 10, 19))
 
 
 def test_spot_conversions_are_consistent_crosses():

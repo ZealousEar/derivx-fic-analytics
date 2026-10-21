@@ -7,6 +7,7 @@
     derivx pull ecb-estr --start 2026-01-01
     derivx pull ecb-yc --curve AAA --measure par --tenors 2Y,10Y,30Y --last 20
     derivx pull boe-ois --archive daily --start 2022-09-01 --end 2022-10-31
+    derivx pull ecb-fx --start 2015-01-01   # ECB euro reference rates (FX history)
     derivx pull latest                 # every fast live source, as the app's LIVE mode
     derivx pull fred --ids DGS10 --offline --out dgs10.csv
 
@@ -37,13 +38,16 @@ source failed, 2 bad arguments, 3 some blotter rows or trades were left out
 Currencies: every trade's numbers are in its currency (US Treasuries in
 USD, the rest in the swap curve's). ``risk`` and ``scenario`` total each
 currency and add the whole book converted into ``--report-ccy`` (default
-USD; ``ALL IN USD``) at the ECB euro reference rates of the bundled snapshot
-(the latest day on or before the valuation date) or at ``--fx`` rates,
-printing the rates used. ``--conventions all`` (with ``--asof``) prices each
-currency's trades on that currency's market (USD SOFR, EUR ESTR, GBP SONIA;
-Treasuries on the US Treasury curve), so one blotter can hold all three.
+USD; ``ALL IN USD``) at the ECB euro reference rates of the latest day on
+or before the valuation date (the bundled daily history since 2015 plus any
+``pull ecb-fx`` download) or at ``--fx`` rates, printing the rates used.
+``--conventions all`` (with ``--asof``) prices each currency's trades on
+that currency's market (USD SOFR, EUR ESTR, GBP SONIA; Treasuries on the
+US Treasury curve), so one blotter can hold all three.
 Hedges and key-rate ladders stay per currency. FX spots are held unless a
-shock moves them (``fx:EURUSD=+10``, ``--fx-move``).
+shock moves them (``fx:EURUSD=+10``, ``--fx-move``, and historical or window
+replays, which move them by the ECB reference rates of their own dates
+unless ``--hold-fx``).
 
 Each subcommand registers itself with :func:`command`.
 """
@@ -177,6 +181,8 @@ def _fetch(args: argparse.Namespace) -> rs.Fetched:
         return rs.ecb_yield_curve(args.tenors, args.curve, args.measure, args.start, args.end, args.last, **common)
     if source == "boe-ois":
         return rs.boe_ois_curve(args.archive, args.start, args.end, **common)
+    if source == "ecb-fx":
+        return rs.ecb_fx(args.currencies, args.start, args.end, args.last, **common)
     raise ValueError(f"unknown source {source!r}")
 
 
@@ -253,6 +259,12 @@ def _register_pull(parser: argparse.ArgumentParser) -> None:
     yc.add_argument("--last", type=int)
     yc.add_argument("--start", type=_date)
     yc.add_argument("--end", type=_date)
+    fxr = add("ecb-fx", "ECB euro foreign exchange reference rates (EXR, daily; FX history for conversions and VaR)")
+    fxr.add_argument("--currencies", type=_list, default=list(rs.ECB_FX_CURRENCIES),
+                     help="currencies per 1 EUR (default USD,GBP,JPY,CHF,CAD,AUD,NZD)")  # fmt: skip
+    fxr.add_argument("--last", type=int)
+    fxr.add_argument("--start", type=_date)
+    fxr.add_argument("--end", type=_date)
     boe = add("boe-ois", "Bank of England fitted UK OIS (SONIA) spot curve")
     boe.add_argument("--archive", choices=sorted(rs.BOE_ARCHIVES), default="latest")
     boe.add_argument("--start", type=_date)
@@ -341,8 +353,9 @@ def _market_options(parser: argparse.ArgumentParser, curve_file: bool = True) ->
     rep.add_argument("--report-ccy", default="USD", choices=["USD", "EUR", "GBP"],
                      help="convert book totals into this currency (totals stay per currency too)")  # fmt: skip
     rep.add_argument("--fx", type=_fx_quotes,
-                     help="FX spots EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP); default: the bundled ECB "
-                     "euro reference rates of the latest day on or before the valuation date")  # fmt: skip
+                     help="FX spots EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP); default: the ECB euro "
+                     "reference rates of the latest day on or before the valuation date (the bundled daily history "
+                     "since 2015 plus 'derivx pull ecb-fx' downloads)")  # fmt: skip
 
 
 @dataclass
@@ -393,14 +406,14 @@ def _reporting(args: argparse.Namespace, asof: dt.date):
 
     if args.fx is not None:
         return Reporting(args.report_ccy, entered_spots(args.fx, None, "FX rates given with --fx"))
-    return default_reporting(asof, args.report_ccy)
+    return default_reporting(asof, args.report_ccy, store=_store(getattr(args, "cache", None)))
 
 
 def _print_fx(reporting, currencies, asof: dt.date) -> None:
     if not reporting.needs_conversion(currencies):
         return
     print(f"FX: {reporting.label} converts at {reporting.describe(currencies)}; FX spots held unless a shock moves "
-          "them")  # fmt: skip
+          "them (fx: shocks, --fx-move, and historical replays by the ECB rates of their dates)")  # fmt: skip
     if reporting.fx.asof is not None and reporting.fx.asof != asof:
         print(f"  note: the FX spots are of {reporting.fx.asof}, not of the valuation date {asof} (pass --fx for "
               "rates of that date)")  # fmt: skip
@@ -755,8 +768,10 @@ def _shock_years(text: str) -> float:
         return parse_tenor(text).years
 
 
-def parse_shock(spec: str, market, store) -> List[object]:
-    """One ``--shock`` spec -> shocks (see ``derivx scenario --help``)."""
+def parse_shock(spec: str, market, store, fx: bool = True) -> List[object]:
+    """One ``--shock`` spec -> shocks (see ``derivx scenario --help``);
+    historical shocks move FX by the ECB reference rates of their dates
+    unless ``fx`` is False."""
 
     from derivx.risk import scenarios as sc
 
@@ -791,10 +806,10 @@ def parse_shock(spec: str, market, store) -> List[object]:
             names = {n.lower(): n for n in sc.historical_episodes()}
             if wanted not in names:
                 raise ValueError(f"unknown episode {parts[0]!r}; one of: {'; '.join(sc.historical_episodes())}")
-            return [sc.historical(names[wanted], float(parts[1]) if len(parts) > 1 else 1.0, store=store)]
+            return [sc.historical(names[wanted], float(parts[1]) if len(parts) > 1 else 1.0, store=store, fx=fx)]
         if kind == "window":
             start, end = dt.date.fromisoformat(parts[0]), dt.date.fromisoformat(parts[1])
-            return [sc.history_window(start, end, float(parts[2]) if len(parts) > 2 else 1.0, store=store)]
+            return [sc.history_window(start, end, float(parts[2]) if len(parts) > 2 else 1.0, store=store, fx=fx)]
         if kind == "basis":
             return [sc.ibor_ois_basis(float(parts[0]))]
         if kind == "tenorbasis":
@@ -802,7 +817,7 @@ def parse_shock(spec: str, market, store) -> List[object]:
         if kind == "fx":
             return [sc.fx_spot(_fx_moves(rest))]
         if kind == "library":
-            shocks = sc.standard_library(store)
+            shocks = sc.standard_library(store, fx=fx)
             if market.is_multi_curve:
                 shocks += [sc.ibor_ois_basis(10.0), sc.tenor_basis(5.0)]
             return shocks + sc.pca_library(store, end=market.asof)
@@ -818,8 +833,9 @@ SHOCK_HELP = """shock specs (bp unless stated; tenors as years or 2Y/10Y):
   fly:BODY:BODY_BP[:WING_BP[:LEFT:RIGHT]]   butterfly (wings 2Y and 10Y by default)
   keyrate:2Y=+10,10Y=-5               key-rate moves, linear in between, flat beyond
   pca:FACTOR[:N_SIGMA[:DAYS]]         PC1 level / PC2 slope / PC3 curvature of daily US Treasury changes
-  historical:NAME[:SCALE]             a named episode, e.g. historical:2022-hiking-cycle
-  window:START:END[:SCALE]            the curve changes between two dates of the history store
+  historical:NAME[:SCALE]             a named episode, e.g. historical:2022-hiking-cycle (FX spots move by the
+                                      ECB reference rates of the same dates; --hold-fx holds them)
+  window:START:END[:SCALE]            the curve and FX changes between two dates of the history store
   basis:BP / tenorbasis:BP            IBOR-OIS basis / tenor basis spreads (multi-curve markets)
   fx:EURUSD=+10[,GBPUSD=-5]           FX spots only, % moves (moves only totals converted to --report-ccy)
   library                             the app's scenario library (parallel, twists, fly, episodes, PCA)
@@ -844,7 +860,7 @@ def _scenario(args: argparse.Namespace) -> int:
             print(f"  note{where}: {note}")
     store = _store(args.cache)
     parse_on = next((b.market for b in books if b.market.is_multi_curve), books[0].market)
-    shocks = [s for spec in args.shock for s in parse_shock(spec, parse_on, store)]
+    shocks = [s for spec in args.shock for s in parse_shock(spec, parse_on, store, fx=not args.hold_fx)]
     if not shocks:
         raise ValueError("give at least one --shock (see derivx scenario --help)")
     settings: Dict[str, object] = {"horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
@@ -1011,6 +1027,9 @@ def _register_scenario(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--horizon", type=int, default=0, help="calendar days to roll the market forward first")
     parser.add_argument("--vol-normal", type=float, default=0.0, help="normal vol shock (bp)")
     parser.add_argument("--vol-lognormal", type=float, default=0.0, help="lognormal vol shock (vol points)")
+    parser.add_argument("--hold-fx", action="store_true",
+                        help="hold FX spots in historical and window replays (by default they move by the ECB "
+                        "reference rates of the same dates)")  # fmt: skip
     parser.add_argument("--fx-move", type=_fx_moves,
                         help="FX moves added to every shock, e.g. EURUSD=+10,GBPUSD=-5 (%%; only converted totals "
                         "move; added to an fx: shock's own move of the same pair; named in each scenario)")  # fmt: skip

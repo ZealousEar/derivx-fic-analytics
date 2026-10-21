@@ -13,7 +13,10 @@ Currencies: factor risk and VaR are per position in its own currency (US
 Treasuries in USD, the rest in the swap curve's), totalled per currency
 and, when the positions hold a currency other than the sidebar's REPORTING
 CURRENCY, for the whole book converted at the stated FX spots (``ALL IN
-<R>``). FX spots are held: the VaR has no FX risk (no FX history).
+<R>``). In the VaR the converted book also moves with FX: each scenario
+day's ECB reference-rate change (the store's ``FX_ECB`` history, the same
+dates as the curve changes) moves today's spots, with the FX-held and
+FX-only VaR shown next to it; FX IN VAR = HELD holds the spots.
 """
 
 from __future__ import annotations
@@ -55,6 +58,7 @@ WEIGHT_HELP = (
     "maturity. PCA: neutral to PC1 (spread) or PC1 and PC2 (fly) of the history's daily changes."
 )
 CARRY_KINDS = ("TREASURY PAR BONDS", "SWAPS (RECEIVE FIXED)")
+FX_CHOICES = ("HISTORICAL MOVES", "HELD")
 FLAG_LABELS = {
     "real": "REAL: the curve's own market",
     "upload": "YOUR UPLOAD",
@@ -102,7 +106,7 @@ def _cached(name: str, key: tuple, compute):
 def _datasets(store: rh.HistoryStore) -> List[str]:
     """Curve histories in the store, US Treasuries first."""
 
-    keys = [k for k in store.datasets() if k != "FIXINGS" and len(store.dates(k)) > 1]
+    keys = [k for k in store.datasets() if rh.dataset_info(k).kind not in ("fixings", "fx") and len(store.dates(k)) > 1]
     return sorted(keys, key=lambda k: (k != var_mod.ANCHOR, k))
 
 
@@ -941,18 +945,29 @@ def _histogram(pnl: np.ndarray, var: float, es: float, c: str, label: str) -> go
     )
 
 
-def _scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tuple[tuple, var_mod.VarScenarios]:
-    """(cache key, scenarios): keyed on the market and the store's content."""
+def _scenarios(
+    market: Market, store: rh.HistoryStore, lookback: int, fx: bool = True
+) -> Tuple[tuple, var_mod.VarScenarios]:
+    """(cache key, scenarios): keyed on the market, the store's content and
+    whether FX moves."""
 
-    key = (rates_risk.market_key(market), store.fingerprint, lookback)
-    return key, _cached("var_scen", key, lambda: var_mod.build_scenarios(market, store, lookback))
+    key = (rates_risk.market_key(market), store.fingerprint, lookback, fx)
+    return key, _cached("var_scen", key, lambda: var_mod.build_scenarios(market, store, lookback, fx=fx))
 
 
-def var_scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tuple[tuple, var_mod.VarScenarios]:
+def var_scenarios(
+    market: Market, store: rh.HistoryStore, lookback: int, fx: bool = True
+) -> Tuple[tuple, var_mod.VarScenarios]:
     """The VaR scenarios of this tab (cached on the market and the store's
     content), for the BOOK tab: (cache key, scenarios)."""
 
-    return _scenarios(market, store, lookback)
+    return _scenarios(market, store, lookback, fx)
+
+
+def fx_label(key: str) -> str:
+    """Display name of a VaR source row (curves, and the FX spots)."""
+
+    return "FX SPOTS (ECB REFERENCE RATES)" if key == var_mod.FX_KEY else key
 
 
 def _render_var(
@@ -964,15 +979,22 @@ def _render_var(
             "Rates tabs and pick them under RISK SCOPE."
         )
         return
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     lookback = c1.radio("LOOKBACK (DAILY CHANGES)", var_mod.LOOKBACKS, index=1, horizontal=True, key="rs_var_lookback")
     confidence = c2.radio(
         "CONFIDENCE", var_mod.CONFIDENCES, index=2, horizontal=True, key="rs_var_conf",
         format_func=lambda a: f"{100 * a:g}%",
     )  # fmt: skip
+    fx_choice = c3.radio(
+        "FX IN VAR", FX_CHOICES, horizontal=True, key="rs_var_fx",
+        help="HISTORICAL MOVES: each scenario day's ECB reference-rate change moves today's FX spots, so the book "
+        "converted to the reporting currency (ALL IN) carries FX risk; local P&L never moves with FX. HELD: spots "
+        "held at today's.",
+    )  # fmt: skip
+    move_fx = fx_choice == FX_CHOICES[0]
     try:
         key, risk = rates_scenarios.book_risk(positions, market)
-        scen_key, scen = _scenarios(market, store, int(lookback))
+        scen_key, scen = _scenarios(market, store, int(lookback), move_fx)
     except ValueError as exc:
         st.warning(f"No VaR for this valuation date: {exc}")
         return
@@ -992,10 +1014,16 @@ def _render_var(
             "them: the VaR is per currency only (TOTAL rows below). Enter rates under REPORTING CURRENCY."
         )
 
+    converting = rep is not None and rep.needs_conversion(currencies)
+    fx = scen.fx if converting else None
+    base = _cached("var_base", key, lambda: [float(p.pv(market)) for p in positions]) if fx is not None else None
+    if converting and move_fx and scen.fx is None:
+        st.warning(f"{scen.fx_note}: the converted VaR holds the spots.")
+
     def measures():
         pnl = var_mod.sensitivity_pnl(scen, risk)
         delta = var_mod.sensitivity_pnl(scen, risk, gamma=False)
-        return pnl, delta, var_mod.var_table(pnl, names, float(confidence), delta, currencies, rep)
+        return pnl, delta, var_mod.var_table(pnl, names, float(confidence), delta, currencies, rep, fx, base)
 
     try:
         pnl, delta, table = _cached("var_measures", (key, scen_key, float(confidence), rep), measures)
@@ -1006,7 +1034,8 @@ def _render_var(
     full_store = st.session_state.setdefault("_rs_var_full", {})
     sources = scen.sources_table()
     sources["flag"] = sources["flag"].map(FLAG_LABELS).fillna(sources["flag"])
-    sources["curve"] = [rates_risk.curve_title(market, k) for k in sources["curve"]]
+    sources["curve"] = [fx_label(k) if k == var_mod.FX_KEY else rates_risk.curve_title(market, k)
+                        for k in sources["curve"]]  # fmt: skip
     st.dataframe(sources.rename(columns=str.upper), hide_index=True, width="stretch")
     if st.button(f"RUN FULL REVALUATION ({scen.n} SCENARIOS)", key="rs_var_full"):
         bar = st.progress(0.0, text="Revaluing the book on every scenario day...")
@@ -1030,14 +1059,21 @@ def _render_var(
     m[0].metric(f"HIST VAR {level} ({c})", "per currency" if total is None else _num(total["var"], 0))
     m[1].metric(f"HIST ES {level} ({c})", "per currency" if total is None else _num(total["es"], 0))
     m[2].metric(f"DELTA-NORMAL VAR ({c})", "per currency" if total is None else _num(total["dn_var"], 0))
-    columns = var_mod.book_columns(full, names, currencies, rep) if full is not None else None
+    columns = var_mod.book_columns(full, names, currencies, rep, fx, base) if full is not None else None
     full_var, full_es = (var_mod.var_es(columns[headline][0], float(confidence))
                          if columns is not None and headline is not None else (None, None))  # fmt: skip
     m[3].metric(f"FULL-REVAL VAR ({c})", "not run" if full_var is None else _num(full_var, 0))
     m[4].metric(f"FULL-REVAL ES ({c})", "not run" if full_es is None else _num(full_es, 0))
     m[5].metric("SCENARIO DAYS", f"{scen.n:,}")
+    if fx is not None and headline is not None:
+        held = rows.loc[f"{headline} {var_mod.FX_HELD}"]
+        only = rows.loc[f"{headline} {var_mod.FX_ONLY}"]
+        f1, f2, f3 = st.columns(3)
+        f1.metric(f"VAR FX HELD ({c})", _num(held["var"], 0))
+        f2.metric(f"FX-ONLY VAR ({c})", _num(only["var"], 0))
+        f3.metric(f"FX ADD-ON ({c})", _num(total["var"] - held["var"], 0))
     shown_pnl, label = (full, "FULL REVALUATION") if full is not None else (pnl, "DELTA + GAMMA")
-    book_columns = var_mod.book_columns(shown_pnl, names, currencies, rep)
+    book_columns = var_mod.book_columns(shown_pnl, names, currencies, rep, fx, base)
     book_label = headline if headline is not None else next(k for k in book_columns if k.startswith("TOTAL"))
     book, book_ccy = book_columns[book_label]
     book_unit = c if headline is not None else rates_fx.symbol(book_ccy).strip()
@@ -1053,7 +1089,7 @@ def _render_var(
     }  # fmt: skip
     shown = table.rename(columns=labels)
     if full is not None:
-        full_table = var_mod.var_table(full, names, float(confidence), None, currencies, rep)
+        full_table = var_mod.var_table(full, names, float(confidence), None, currencies, rep, fx, base)
         shown[f"FULL-REVAL VAR{u}"] = full_table["var"].to_numpy()
         shown[f"FULL-REVAL ES{u}"] = full_table["es"].to_numpy()
     st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[2:]})
@@ -1071,8 +1107,10 @@ def _render_var(
         "Download risk report CSV (key-rate PV01, gamma, vega and vega buckets, VaR)", _csv(report),
         file_name="risk_report.csv", key="rs_var_report_csv",
     )  # fmt: skip
-    worst = var_mod.worst_days(scen, book, 10)
+    worst = var_mod.worst_days(scen, book, 10, currencies if fx is not None else None,
+                               rep.currency if rep is not None else None)  # fmt: skip
     names_by_column = {"pnl": f"BOOK P&L ({book_unit})", "date": "DATE", "from": "FROM"}
+    names_by_column.update({col: col.upper() for col in worst.columns if col.endswith("move (%)")})
     for curve_key in scen.bumps:
         title = rates_risk.curve_title(market, curve_key)
         names_by_column[f"{curve_key} max move (bp)"] = f"{title}: LARGEST QUOTE MOVE (BP)"
@@ -1080,8 +1118,10 @@ def _render_var(
     worst = worst.rename(columns=names_by_column)
     st.markdown("#### / WORST DAYS")
     one_dp = st.column_config.NumberColumn(format="%.1f")
+    two_dp = st.column_config.NumberColumn(format="%+.2f")
     worst_format = {col: (MONEY if col.startswith("BOOK P&L") else one_dp) for col in worst.columns if "(BP)" in col
                     or col.startswith("BOOK P&L")}  # fmt: skip
+    worst_format.update({col: two_dp for col in worst.columns if col.endswith("MOVE (%)")})
     st.dataframe(worst, hide_index=True, width="stretch", column_config=worst_format)
     mixed = len(set(currencies)) > 1 or (rep is not None and rep.needs_conversion(currencies))
     scenario_frame = pd.DataFrame({(f"{n} ({ccy})" if mixed else n): values
@@ -1095,10 +1135,13 @@ def _render_var(
         {"positions": [{"name": p.name, "kind": p.kind, "currency": ccy, "details": repr(p.details)}
                        for p, ccy in zip(positions, currencies)],
          "reporting": rates_fx.record(rep, currencies),
-         "lookback_days": int(lookback), "confidence": float(confidence), "full_revaluation": full is not None},
+         "lookback_days": int(lookback), "confidence": float(confidence), "full_revaluation": full is not None,
+         "fx_in_var": fx_choice},
         {"scenarios": "historical daily quote moves of each curve's own history or a flagged proxy, applied to "
          "today's curves", "pnl": label, "vols": "held", "var": "ceil(n (1 - confidence))-th largest loss",
-         "es": "Acerbi-Tasche", "delta_normal": "z x sd of first-order P&L, mean zero"},
+         "es": "Acerbi-Tasche", "delta_normal": "z x sd of first-order P&L, mean zero",
+         "fx": (scen.fx_note + "; converted P&L (V + p) S (1 + x) - V S") if fx is not None
+         else "spots held at today's"},
         key="rs_var_export", store=store,
     )  # fmt: skip
     st.caption(
@@ -1110,8 +1153,18 @@ def _render_var(
         "confidence))-th largest loss; ES = average loss beyond it (Acerbi-Tasche). Delta-normal: z x sd of the "
         "first-order P&L, mean taken as zero. Vols are held (no free vol history); no carry over the day. Losses "
         "are positive numbers, in each row's currency (CCY): a TOTAL row adds the P&L of one currency's positions "
-        "per scenario." + rates_fx.conversion_note(currencies, rep, market.asof) + " FX spots are held: no FX risk "
-        "(the store has no FX history). The risk report CSV holds the key-rate PV01s and gammas, each option's vega "
+        "per scenario."
+        + rates_fx.conversion_note(currencies, rep, market.asof)
+        + " "
+        + (
+            f"{scen.fx_note}: {rep.label} = each position's value after the day, converted at today's spot moved by "
+            f"that day's ECB change, minus today's converted value; {rep.label} {var_mod.FX_HELD} holds the spots, "
+            f"{rep.label} {var_mod.FX_ONLY} moves only FX (today's values), and the delta-normal check treats the FX "
+            "returns as risk factors too. Local P&L and the TOTAL rows do not move with FX."
+            if fx is not None and rep is not None
+            else "FX spots are held at today's (FX IN VAR = HELD, or nothing to convert)."
+        )
+        + " The risk report CSV holds the key-rate PV01s and gammas, each option's vega "
         "and its vega by bucket (swaptions by option expiry x swap tenor: the SABR cube's ATM points for book "
         "swaptions priced on the cube, the vega split between the nearest grid points otherwise; caps by caplet "
         "expiry) and the VaR table."

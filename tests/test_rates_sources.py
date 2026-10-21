@@ -210,7 +210,9 @@ def test_parse_ecb():
     with pytest.raises(ValueError, match="missing"):
         rs.parse_ecb_csv("KEY,VALUE\nx,1\n")
     with pytest.raises(ValueError, match="unsupported ECB"):
-        rs.parse_ecb_csv("KEY,TIME_PERIOD,OBS_VALUE\nEXR.D.USD.EUR.SP00.A,2026-01-02,1.1\n")
+        rs.parse_ecb_csv("KEY,TIME_PERIOD,OBS_VALUE\nICP.M.U2.N.000000.4.ANR,2026-01-02,1.1\n")
+    with pytest.raises(ValueError, match="unsupported ECB exchange-rate series"):  # monthly averages, not daily
+        rs.parse_ecb_csv("KEY,TIME_PERIOD,OBS_VALUE\nEXR.M.USD.EUR.SP00.A,2026-01-02,1.1\n")
 
 
 def test_parse_boe_latest_archive():

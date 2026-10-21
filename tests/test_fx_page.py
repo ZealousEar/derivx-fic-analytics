@@ -29,7 +29,7 @@ from derivx.ui.fx_page import apply_editor_changes
 APP = Path(__file__).resolve().parents[1] / "src" / "derivx" / "ui" / "streamlit_app.py"
 FIXTURE = Path(__file__).parent / "fixtures" / "ecb_exr_2026-10-20.csv"
 TODAY = dt.date.today()
-EURUSD_SPOT = 1.1215  # the bundled ECB snapshot
+EURUSD_SPOT = 1.1234  # the latest day of the bundled ECB history (2026-10-21)
 NOTIONAL = 1_000_000.0
 
 
@@ -131,7 +131,7 @@ def test_pair_precision_and_pip_steps():
     assert not at.exception
     jpy = at.number_input(key="fx_spot_USDJPY")
     assert (jpy.proto.format, jpy.proto.step) == ("%.3f", 0.01)
-    assert jpy.value == pytest.approx(round(177.34 / 1.1215, 3))
+    assert jpy.value == pytest.approx(round(177.36 / 1.1234, 3))
     assert _cell(at, "SPOT") == f"{jpy.value:.3f}" and " USD</span>" in _hero(at)  # USDJPY premium in USD
     assert "PREMIUM-ADJUSTED" in _frame(at, "DELTA TYPE").iloc[2]["DELTA TYPE"]
     hedge = [t for t in _frame(at, "DELTA TYPE")["DELTA TYPE"] if "hedge" in t]
@@ -427,7 +427,7 @@ def test_edited_spot_is_flagged_against_its_reference():
     at = _fx()
     assert not any("EDITED" in c.value for c in at.sidebar.caption)
     at.number_input(key="fx_spot_EURUSD").set_value(1.1300).run()
-    assert any(c.value.startswith("EDITED. Reference: 1.12150 = ECB") for c in at.sidebar.caption)
+    assert any(c.value.startswith("EDITED. Reference: 1.12340 = ECB") for c in at.sidebar.caption)
 
 
 def test_widgets_shared_by_every_pair_keep_their_labels_and_options():

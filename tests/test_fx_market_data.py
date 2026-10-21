@@ -51,11 +51,28 @@ def test_malformed_responses_raise_a_clear_error(text, message):
         parse_ecb_csv(text)
 
 
-def test_bundled_snapshot_is_the_offline_fallback():
+def test_bundled_history_is_the_offline_fallback():
     rates = bundled_ecb_rates()
-    assert rates.origin == "bundled" and rates.asof == dt.date(2026, 10, 20)
+    assert rates.origin == "bundled" and rates.asof == dt.date(2026, 10, 21)
     assert "bundled snapshot" in rates.description
-    assert rates.cross("USDCAD") == pytest.approx(1.5758 / 1.1215)
+    assert rates.cross("USDCAD") == pytest.approx(1.5779 / 1.1234)
+    assert rates.history[dt.date(2026, 10, 20)]["CAD"] == 1.5758  # every day of the history, as published
+    assert len(rates.history) == 3116 and min(rates.history) == dt.date(2008, 1, 31)
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("", "has no rows"),
+        ("date,x\n2026-10-20,1\n", "no EXR"),
+        ("date,EXR.D.USD.EUR.SP00.A\n2026-13-01,1.1\n", "bad date or value"),
+        ("date,EXR.D.USD.EUR.SP00.A\n2026-10-20,-1\n", "not positive"),
+        ("date,EXR.D.USD.EUR.SP00.A\n2026-10-20,1.1\n", "no date"),
+    ],
+)
+def test_a_malformed_history_file_raises_a_clear_error(text, message):
+    with pytest.raises(FxDataError, match=message):
+        market_data.parse_history_csv(text)
 
 
 class _Response(io.BytesIO):

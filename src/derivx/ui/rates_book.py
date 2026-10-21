@@ -514,7 +514,9 @@ def _show_var(risk: pf.BookRisk, market: Market, store, rep: Optional[Reporting]
         _, scen = rates_research.var_scenarios(market, store, VAR_LOOKBACK)
         pnl = var_mod.sensitivity_pnl(scen, risk.risk)
         delta = var_mod.sensitivity_pnl(scen, risk.risk, gamma=False)
-        table = var_mod.var_table(pnl, risk.ids, VAR_CONFIDENCE, delta, list(risk.currencies), rep)
+        fx = scen.fx if rep is not None and rep.needs_conversion(list(risk.currencies)) else None
+        table = var_mod.var_table(pnl, risk.ids, VAR_CONFIDENCE, delta, list(risk.currencies), rep, fx,
+                                  [float(v) for v in risk.pv])  # fmt: skip
     except ValueError as exc:
         st.warning(f"No VaR on {market.asof}: {exc}")
         return pd.DataFrame()
@@ -540,7 +542,9 @@ def _show_var(risk: pf.BookRisk, market: Market, store, rep: Optional[Reporting]
         f"One-day 99% value at risk of the book from {scen.n} daily changes ({scen.previous[0]} to {scen.dates[-1]}) "
         "of each curve's own history or a flagged proxy, applied to today's quotes: P&L = key-rate PV01 x move + "
         "1/2 diagonal gamma x move^2 (the book's ladders above). Losses are positive, in each row's currency (CCY); "
-        "a book's VaR is not the sum of the trades'. Vols and FX spots held (no FX risk)."
+        "a book's VaR is not the sum of the trades'. Vols held. "
+        + (f"{scen.fx_note}: {rep.label} moves with FX ({rep.label} {var_mod.FX_HELD} and {var_mod.FX_ONLY} in VAR BY "
+           "TRADE); local P&L does not." if fx is not None and rep is not None else "FX spots held.")
         + rates_fx.conversion_note(risk.currencies, rep, market.asof)
         + " Lookback, confidence, full revaluation and the history used per curve: RESEARCH > VAR with RISK SCOPE = "
         "BOOK."

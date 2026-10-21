@@ -17,8 +17,11 @@ FX spots (:class:`FxSpots`)
     ``per_eur[R] / per_eur[c]``. Pairs are quoted in market convention
     (:data:`PAIRS`: EURUSD, GBPUSD, EURGBP = units of the second currency per
     1 unit of the first). The spots come from the ECB euro reference rates
-    (:func:`ecb_spots`: the bundled snapshot or a live fetch, indicative
-    reference rates, not dealable quotes) or from rates the user enters
+    of the valuation date (:func:`store_spots`: the ``FX_ECB`` history of
+    the rates history store, every TARGET business day since 2015 in the
+    committed sample plus whatever the download cache adds; :func:`ecb_spots`
+    for an :class:`~derivx.fx.market_data.EcbRates`; indicative reference
+    rates, not dealable quotes) or from rates the user enters
     (:func:`entered_spots`); every converted total states the rates used and
     their as-of date (:meth:`Reporting.describe`).
 
@@ -35,8 +38,11 @@ FX shocks
     with ``S_c`` today's spot: the first term is the local P&L at today's
     spot, the second the FX translation of the position's value at the
     horizon (zero for c = R). Without an FX shock, spots are held: no FX
-    forward drift, FX carry or cross-currency basis over a horizon, and no
-    FX risk in the value at risk (there is no FX history in the store).
+    forward drift, FX carry or cross-currency basis over a horizon. A
+    historical replay (:func:`derivx.risk.scenarios.historical`) moves the
+    spots by the ECB reference-rate changes of its own dates, and the value
+    at risk (:mod:`derivx.risk.var`) by those of each scenario day, unless
+    asked to hold them.
 """
 
 from __future__ import annotations
@@ -172,6 +178,30 @@ def ecb_spots(rates, on: Optional[dt.date] = None) -> FxSpots:
                    f"ECB euro reference rates ({origin})")  # fmt: skip
 
 
+def store_spots(store, on: Optional[dt.date] = None) -> FxSpots:
+    """FX spots from the ECB reference rates of a rates history store
+    (:meth:`~derivx.data.rates_history.HistoryStore.fx_table`): the latest
+    day on or before ``on`` (default: the latest day held); if the store
+    holds no day that early, its first day (later than ``on``: say so
+    where it is used, see :meth:`Reporting.stale_days`). The source names
+    where that day's rows came from (bundled snapshot or a download)."""
+
+    table = store.fx_table()
+    if table.empty or any(c not in table.columns for c in CURRENCIES if c != "EUR"):
+        raise ValueError("the history store holds no ECB reference rates with both a USD and a GBP rate")
+    days = list(table.index)
+    if on is None:
+        day = days[-1]
+    else:
+        earlier = [d for d in days if d <= on]
+        day = earlier[-1] if earlier else days[0]
+    origins = sorted({str(o) for o in store.rows("FX_ECB").loc[lambda f: f["asof"] == day, "origin"]})
+    origin = "bundled snapshot" if origins == ["bundled snapshot"] else (", ".join(origins) or "history store")
+    row = table.loc[day]
+    return FxSpots(tuple((c, float(row[c])) for c in CURRENCIES if c != "EUR"), day,
+                   f"ECB euro reference rates ({origin})")  # fmt: skip
+
+
 def entered_spots(quotes: Mapping[str, float], asof: Optional[dt.date] = None,
                   source: str = "FX rates entered by you") -> FxSpots:  # fmt: skip
     """FX spots from market quotes ``{"EURUSD": 1.16, "GBPUSD": 1.34}``
@@ -248,13 +278,16 @@ class Reporting:
         return 0 if self.fx.asof is None else abs((valuation - self.fx.asof).days)
 
 
-def default_reporting(on: Optional[dt.date] = None, currency: str = DEFAULT_REPORTING) -> Reporting:
-    """Reporting in ``currency`` at the bundled ECB reference rates of the
-    latest day on or before ``on`` (no network)."""
+def default_reporting(on: Optional[dt.date] = None, currency: str = DEFAULT_REPORTING, store=None) -> Reporting:
+    """Reporting in ``currency`` at the ECB reference rates of the latest
+    day on or before ``on`` in ``store`` (default: the committed history
+    sample; no network)."""
 
-    from derivx.fx.market_data import bundled_ecb_rates
+    if store is None:
+        from derivx.data.rates_history import bundled_store
 
-    return Reporting(currency, ecb_spots(bundled_ecb_rates(), on))
+        store = bundled_store()
+    return Reporting(currency, store_spots(store, on))
 
 
 # --------------------------------------------------------------------------
@@ -471,6 +504,7 @@ __all__ = [
     "ecb_spots",
     "entered_spots",
     "explain_fx",
+    "store_spots",
     "fx_moves",
     "fx_translation",
     "market_currency",

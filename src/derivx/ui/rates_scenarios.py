@@ -77,6 +77,7 @@ FLAG_LABELS = {
     "upload": "YOUR UPLOAD",
     "proxy": "PROXY: another market's moves (spreads held)",
     "cross-currency proxy": "CROSS-CURRENCY PROXY",
+    "held": "HELD: not moved",
 }
 KEY_TENORS = ("3M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y")
 BP_LIMIT = 500.0
@@ -235,14 +236,30 @@ def _profile_inputs(kind: str, c2, c3, store: rh.HistoryStore, market: Market) -
     if kind == "Historical":
         name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
         scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
-        return historical(name, scale, store=store)
+        return historical(name, scale, store=store, fx=not _hold_fx())
     dates = store.dates("UST_PAR")[::-1]
     end_default = 0
     start_default = next((i for i, d in enumerate(dates) if (dates[0] - d).days >= 28), len(dates) - 1)
     start = c2.selectbox("WINDOW START", dates, index=start_default, key="scn_win_start")
     end = c3.selectbox("WINDOW END", dates, index=end_default, key="scn_win_end")
     scale = st.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_win_scale")
-    return history_window(start, end, scale, store=store)
+    return history_window(start, end, scale, store=store, fx=not _hold_fx())
+
+
+def _hold_fx() -> bool:
+    """HOLD FX SPOTS: a historical replay moves EURUSD and GBPUSD by the ECB
+    reference rates of its own dates unless this is ticked."""
+
+    return bool(
+        st.checkbox(
+            "HOLD FX SPOTS",
+            value=False,
+            key="scn_hold_fx",
+            help="Unticked, the replay moves EURUSD and GBPUSD by the ECB reference rates of the same dates as the "
+            "curve changes (the FX SPOTS row of the sources table), which moves the converted totals (ALL IN) only; "
+            "local P&L never moves with FX. Ticked, the spots stay at today's.",
+        )  # fmt: skip
+    )
 
 
 def history_store(market: Market) -> rh.HistoryStore:
@@ -275,7 +292,9 @@ def _pca_inputs(c2, c3, store: rh.HistoryStore, market: Market) -> Shock:
         "SIZE (STANDARD DEVIATIONS)", min_value=-10.0, max_value=10.0, value=2.0, step=0.5, key="scn_pca_sigma"
     )
     a, b, c = st.columns(3)
-    datasets = [k for k in store.datasets() if k != "FIXINGS" and len(store.dates(k)) > 1]
+    datasets = [
+        k for k in store.datasets() if rh.dataset_info(k).kind not in ("fixings", "fx") and len(store.dates(k)) > 1
+    ]
     datasets.sort(key=lambda k: (k != "UST_PAR", k))
     dataset = a.selectbox(
         "FROM THE DAILY CHANGES OF", datasets, format_func=lambda k: rh.dataset_info(k).title, key="scn_pca_dataset"
@@ -357,7 +376,7 @@ def _sources_table(shock: Shock, market: Market) -> None:
     if table.empty:
         return
     currency = market.curve.conventions.currency if market.curve.conventions else None
-    shown = table[(table["curve"] == "TREASURY") | (table["currency"] == currency)]
+    shown = table[table["curve"].isin(["TREASURY", "FX SPOTS"]) | (table["currency"] == currency)]
     shown = shown.assign(flag=shown["flag"].map(FLAG_LABELS).fillna(shown["flag"]))
     shown.columns = [c.upper() for c in shown.columns]
     st.dataframe(shown, hide_index=True, width="stretch")
@@ -365,7 +384,9 @@ def _sources_table(shock: Shock, market: Market) -> None:
         "Each curve's quotes move by its data's change at the same tenor (linear in between, flat beyond). REAL "
         "swap/OIS history: ICE USD swap rates (FRED, to 2016-10-28), the Bank of England OIS curve (GBP, par OIS "
         "rates derived from its spot curve) or your upload. Otherwise a flagged proxy moves the swap curve by "
-        "government yield changes, which holds swap spreads unchanged."
+        "government yield changes, which holds swap spreads unchanged. FX SPOTS: EURUSD and GBPUSD move by the ECB "
+        "reference rates of the same dates (they change only the totals converted to the reporting currency), unless "
+        "HOLD FX SPOTS is ticked or the FX history does not cover the window."
     )
 
 
@@ -464,9 +485,15 @@ def _shock_inputs(
         normal_vol_bp=float(normal),
         lognormal_vol_pts=float(lognormal),
         horizon_days=int(horizon),
-        fx=fx,
     )
-    fx_text = ("; FX " + ", ".join(f"{p} {m:+g}%" for p, m in shock.fx)) if shock.fx else ""
+    replayed = bool(shock.fx)  # a historical replay's own FX moves (its description states them)
+    merged = dict(shock.fx)
+    for pair, pct in fx:  # FX SHOCK inputs add to them
+        merged[pair] = merged.get(pair, 0.0) + pct
+    shock = replace(shock, fx=tuple(merged.items()))
+    shown = fx if replayed else shock.fx
+    fx_text = ("; FX " + ("shock added: " if replayed else "") + ", ".join(f"{p} {m:+g}%" for p, m in shown)
+               if shown else "")  # fmt: skip
     st.caption(f"{shock.name}: {shock.description}{fx_text}.")
     if kind in ("Historical", "History window", "PCA factor"):
         _sources_table(shock, market)

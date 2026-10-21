@@ -51,6 +51,7 @@ DATASET_URLS: Dict[str, Sequence[str]] = {
     "GBP_OIS_BOE": (rs.BOE_URL,),
     "EUR_AAA_ECB": (rs.ECB_URL,),
     "FIXINGS": (rs.NYFED_URL, rs.ECB_URL, rs.FRED_CSV_URL),
+    "FX_ECB": (rs.ECB_URL,),
 }
 
 
