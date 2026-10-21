@@ -50,3 +50,26 @@ def test_results_zip_is_deterministic_and_holds_manifest_and_csvs():
         assert sorted(zf.namelist()) == ["manifest.json", "metrics.csv", "params.csv"]
         assert json.loads(zf.read("manifest.json"))["kind"] == "x"
         assert zf.read("params.csv").decode().splitlines() == ["a", "1.0", "2.0"]
+
+
+def test_outside_a_checkout_the_commit_comes_from_the_image_environment(monkeypatch):
+    from derivx.validation import manifest
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")  # the Docker image has neither git nor .git
+
+    monkeypatch.setattr(manifest.subprocess, "run", no_git)
+    try:
+        for value, expected in [
+            ("0A1751437A7BC779B670DD3ACCBFBFE0A0AEEB2C", "0a1751437a7bc779b670dd3accbfbfe0a0aeeb2c"),
+            ("unknown", "unknown"),  # the Dockerfile default when no GIT_SHA build arg is given
+            ("abc; rm -rf /", "unknown"),  # anything but a commit id is not recorded
+        ]:
+            monkeypatch.setenv(manifest.GIT_SHA_ENV, value)
+            manifest.git_revision.cache_clear()
+            assert manifest.git_revision() == {"sha": expected, "dirty": None}
+        monkeypatch.delenv(manifest.GIT_SHA_ENV)
+        manifest.git_revision.cache_clear()
+        assert manifest.git_revision() == {"sha": "unknown", "dirty": None}
+    finally:
+        manifest.git_revision.cache_clear()

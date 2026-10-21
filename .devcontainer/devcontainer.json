@@ -1,6 +1,6 @@
 {
-  "name": "Python 3",
-  // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+  "name": "DerivX (Python 3.11)",
+  // Same Python as the Docker image and CI's reference job.
   "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
   "customizations": {
     "codespaces": {
@@ -13,18 +13,23 @@
       "settings": {},
       "extensions": [
         "ms-python.python",
-        "ms-python.vscode-pylance"
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff"
       ]
     }
   },
-  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
+  // Runtime, test, lint and notebook dependencies from pyproject.toml.
+  "updateContentCommand": "python -m pip install --user --upgrade pip && python -m pip install --user -e '.[dev,notebooks]'",
+  // Streamlit runs with its default XSRF and CORS protection (.streamlit/config.toml).
   "postAttachCommand": {
-    "server": "streamlit run src/derivx/ui/streamlit_app.py --server.enableCORS false --server.enableXsrfProtection false"
+    "server": "streamlit run src/derivx/ui/streamlit_app.py"
   },
   "portsAttributes": {
     "8501": {
       "label": "Application",
-      "onAutoForward": "openPreview"
+      // A browser tab, not the editor's preview pane: the embedded preview can
+      // block the cookie that Streamlit's XSRF check needs for file uploads.
+      "onAutoForward": "openBrowser"
     }
   },
   "forwardPorts": [

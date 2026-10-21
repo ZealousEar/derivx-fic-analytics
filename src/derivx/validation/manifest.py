@@ -13,7 +13,9 @@ import datetime as dt
 import io
 import json
 import math
+import os
 import platform
+import re
 import subprocess
 import sys
 import zipfile
@@ -29,11 +31,17 @@ PACKAGES = ("derivx", "numpy", "scipy", "pandas", "streamlit", "plotly", "yfinan
 MANIFEST_VERSION = 1
 
 
+GIT_SHA_ENV = "DERIVX_GIT_SHA"  # set by the Docker image (build arg GIT_SHA), which has no .git
+
+
 @lru_cache(maxsize=1)
 def git_revision() -> Dict[str, object]:
-    """Commit of the checkout this package runs from: ``{"sha", "dirty"}``
-    (sha 'unknown' outside a git checkout, e.g. an installed wheel or a
-    Docker image without .git; dirty None when unknown)."""
+    """Commit of the checkout this package runs from: ``{"sha", "dirty"}``.
+
+    Outside a git checkout (an installed wheel, or the Docker image, which
+    has no .git) the sha comes from the ``DERIVX_GIT_SHA`` environment
+    variable when it holds a 40-hex commit id (``dirty`` is then None:
+    unknown), else it is 'unknown'."""
 
     here = Path(__file__).resolve().parent
     try:
@@ -49,7 +57,8 @@ def git_revision() -> Dict[str, object]:
         ).stdout.strip()
         return {"sha": sha or "unknown", "dirty": bool(dirty)}
     except (OSError, subprocess.SubprocessError):
-        return {"sha": "unknown", "dirty": None}
+        env_sha = os.environ.get(GIT_SHA_ENV, "").strip().lower()
+        return {"sha": env_sha if re.fullmatch(r"[0-9a-f]{40}", env_sha) else "unknown", "dirty": None}
 
 
 @lru_cache(maxsize=1)
