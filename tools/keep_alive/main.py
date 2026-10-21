@@ -13,8 +13,10 @@ awake. This script therefore drives headless Chrome:
    serves the app in an iframe at ``/~/+/``) shows ``STREAMLIT_APP_MARKER``
    (default ``NAVIGATION``, the app's sidebar heading);
 4. exit 0 only then. A "not found" page exits 1 at once; a sign-in wall, an
-   app error page or anything else that does not become the app within the
-   timeout exits 1 too, so the workflow run fails when the app is down.
+   app error page, a Streamlit exception element (an uncaught error in the
+   script, redacted or not) or anything else that does not become the app
+   within the timeout exits 1 too, so the workflow run fails when the app is
+   down.
 
 Environment: ``STREAMLIT_APP_URL``, ``STREAMLIT_APP_MARKER``,
 ``STREAMLIT_WAKE_TIMEOUT`` (seconds to wait for the app to render, default
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import enum
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -36,15 +39,21 @@ DEFAULT_URL = "https://derivx.streamlit.app/"
 DEFAULT_MARKER = "NAVIGATION"
 WAKE_BUTTON_TEXT = "Yes, get this app back up"
 WAKE_BUTTON_XPATH = f"//button[contains(., '{WAKE_BUTTON_TEXT}')]"
+# Streamlit draws every uncaught script exception in this element, whatever
+# client.showErrorDetails is set to (the app itself never calls st.exception).
+EXCEPTION_SELECTOR = '[data-testid="stException"]'
 
 # Page texts of Streamlit Community Cloud, matched case-insensitively.
 NOT_FOUND_TEXTS = ("you do not have access to this app or it does not exist",)
 APP_ERROR_TEXTS = (
     "error running app",
-    "this app has encountered an error",
+    "this app has encountered an error",  # Streamlit's redacted exception (showErrorDetails "type"/"none")
     "traceback (most recent call last)",
     "error installing requirements",
 )
+# Streamlit's full exception element (showErrorDetails "full"/"stacktrace") prints a line that is just
+# "Traceback:" above the frames, not Python's "Traceback (most recent call last):".
+TRACEBACK_LINE = re.compile(r"^\s*traceback:\s*$", re.IGNORECASE | re.MULTILINE)
 BOOTING_TEXTS = ("your app is in the oven", "spinning up", "please wait")
 SIGN_IN_TEXTS = ("sign in to continue", "please sign in")
 
@@ -66,16 +75,18 @@ FATAL = (State.NOT_FOUND,)  # waiting will not change this; a sign-in wall may b
 
 @dataclass(frozen=True)
 class Snapshot:
-    """The browser's current URL and the visible text of the page and of each
-    of its iframes."""
+    """The browser's current URL, the visible text of the page and of each of
+    its iframes, and how many Streamlit exception elements they hold."""
 
     url: str
     texts: Tuple[str, ...]
+    exceptions: int = 0
 
 
 def classify(snap: Snapshot, marker: str = DEFAULT_MARKER) -> State:
-    """State of the app from one snapshot. An error page or traceback wins
-    over the marker (a crashed script can still draw its sidebar)."""
+    """State of the app from one snapshot. An error page, a Streamlit
+    exception element or a traceback wins over the marker (a crashed script
+    can still draw its sidebar)."""
 
     text = "\n".join(snap.texts)
     low = text.lower()
@@ -83,7 +94,7 @@ def classify(snap: Snapshot, marker: str = DEFAULT_MARKER) -> State:
         return State.NOT_FOUND
     if WAKE_BUTTON_TEXT.lower() in low:
         return State.ASLEEP
-    if any(t in low for t in APP_ERROR_TEXTS):
+    if snap.exceptions > 0 or any(t in low for t in APP_ERROR_TEXTS) or TRACEBACK_LINE.search(text):
         return State.APP_ERROR
     if marker and marker in text:
         return State.UP
@@ -179,20 +190,31 @@ class SeleniumPage:
         except WebDriverException:
             return ""
 
+    def _exception_count(self) -> int:
+        from selenium.common.exceptions import WebDriverException
+        from selenium.webdriver.common.by import By
+
+        try:
+            return len(self.driver.find_elements(By.CSS_SELECTOR, EXCEPTION_SELECTOR))
+        except WebDriverException:
+            return 0
+
     def snapshot(self) -> Snapshot:
         from selenium.common.exceptions import WebDriverException
         from selenium.webdriver.common.by import By
 
         texts = [self._body_text()]
+        exceptions = self._exception_count()
         for i in range(len(self.driver.find_elements(By.TAG_NAME, "iframe"))):
             try:
                 self.driver.switch_to.frame(self.driver.find_elements(By.TAG_NAME, "iframe")[i])
                 texts.append(self._body_text())
+                exceptions += self._exception_count()
             except (WebDriverException, IndexError):
                 pass
             finally:
                 self.driver.switch_to.default_content()
-        return Snapshot(self.driver.current_url, tuple(texts))
+        return Snapshot(self.driver.current_url, tuple(texts), exceptions)
 
     def click_wake(self) -> bool:
         from selenium.common.exceptions import WebDriverException

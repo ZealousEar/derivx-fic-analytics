@@ -51,6 +51,26 @@ ASLEEP = Snapshot(
 BOOTING = Snapshot(APP_URL, ("Your app is in the oven",))
 CRASHED = Snapshot(APP_URL, ("", "/ NAVIGATION\n[ EQUITY ]\nValueError: boom\nTraceback (most recent call last):"))
 CLOUD_ERROR = Snapshot(APP_URL, ("Oh no.\n\nError running app. If this keeps happening, please contact support.",))
+# What Chromium shows (Streamlit 1.66) for a script that draws its sidebar and then raises, with
+# client.showErrorDetails "full": Streamlit prints "Traceback:", not Python's header (review finding).
+CRASHED_FULL_TEXT = (
+    "Skip to main content\n/ NAVIGATION\n\nhello\n\nValueError: boom\nTraceback:\n"
+    'File "/mount/src/app/streamlit_app.py", line 4, in <module>\n    raise ValueError("boom")\nCopy'
+)
+CRASHED_FULL = Snapshot(APP_URL, ("", CRASHED_FULL_TEXT), exceptions=1)
+CRASHED_FULL_TEXT_ONLY = Snapshot(APP_URL, ("", CRASHED_FULL_TEXT))  # text alone is enough
+# ... and with "type" / "none" (Community Cloud's redaction)
+CRASHED_REDACTED = Snapshot(
+    APP_URL,
+    (
+        "",
+        "/ NAVIGATION\n\nhello\n\nValueError: This app has encountered an error. The original error message is "
+        "redacted to prevent data leaks.",
+    ),
+    exceptions=1,
+)
+# an exception element whose text the snapshot did not catch still counts
+CRASHED_ELEMENT_ONLY = Snapshot(APP_URL, ("", APP.texts[1]), exceptions=1)
 
 
 @pytest.mark.parametrize(
@@ -64,10 +84,86 @@ CLOUD_ERROR = Snapshot(APP_URL, ("Oh no.\n\nError running app. If this keeps hap
         (BOOTING, State.BOOTING),
         (CRASHED, State.APP_ERROR),  # a traceback wins over the sidebar heading
         (CLOUD_ERROR, State.APP_ERROR),
+        (CRASHED_FULL, State.APP_ERROR),
+        (CRASHED_FULL_TEXT_ONLY, State.APP_ERROR),
+        (CRASHED_REDACTED, State.APP_ERROR),
+        (CRASHED_ELEMENT_ONLY, State.APP_ERROR),
     ],
 )
 def test_classify_real_page_texts(snap, state):
     assert classify(snap) is state
+
+
+def test_a_word_traceback_inside_a_sentence_is_not_an_error():
+    snap = Snapshot(APP_URL, ("", APP.texts[1] + "\nThe traceback: none, all quotes valid"))
+    assert classify(snap) is State.UP
+
+
+@pytest.mark.parametrize("crashed", [CRASHED_FULL, CRASHED_REDACTED, CRASHED_ELEMENT_ONLY])
+def test_an_app_that_renders_its_sidebar_and_then_crashes_fails(crashed):
+    result, clock = _check(FakePage([crashed]), timeout=30.0)
+    assert (result.status, result.state) == (1, State.APP_ERROR) and clock.now == 30.0
+
+
+def _fake_selenium(monkeypatch):
+    """Just the selenium names SeleniumPage imports (selenium is not a test dependency)."""
+
+    import types
+
+    class WebDriverException(Exception):
+        pass
+
+    by = types.SimpleNamespace(TAG_NAME="tag name", CSS_SELECTOR="css selector", XPATH="xpath")
+    modules = {
+        "selenium": types.ModuleType("selenium"),
+        "selenium.common": types.ModuleType("selenium.common"),
+        "selenium.common.exceptions": types.ModuleType("selenium.common.exceptions"),
+        "selenium.webdriver": types.ModuleType("selenium.webdriver"),
+        "selenium.webdriver.common": types.ModuleType("selenium.webdriver.common"),
+        "selenium.webdriver.common.by": types.ModuleType("selenium.webdriver.common.by"),
+    }
+    modules["selenium.common.exceptions"].WebDriverException = WebDriverException
+    modules["selenium.webdriver.common.by"].By = by
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_the_selenium_page_counts_streamlit_exception_elements_in_every_frame(monkeypatch):
+    _fake_selenium(monkeypatch)
+
+    class Element:
+        text = "body"
+
+    class Switch:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def frame(self, element):
+            self.driver.frame = element
+
+        def default_content(self):
+            self.driver.frame = None
+
+    class Driver:
+        current_url = APP_URL
+
+        def __init__(self):
+            self.frame = None
+            self.switch_to = Switch(self)
+
+        def find_element(self, by, value):
+            return Element()
+
+        def find_elements(self, by, value):
+            if value == "iframe":
+                return ["app-frame"] if self.frame is None else []
+            assert value == keep_alive.EXCEPTION_SELECTOR
+            return [Element(), Element()] if self.frame == "app-frame" else []
+
+    page = keep_alive.SeleniumPage.__new__(keep_alive.SeleniumPage)  # no browser: a fake driver
+    page.driver = Driver()
+    snap = page.snapshot()
+    assert snap.exceptions == 2 and snap.texts == ("body", "body") and page.driver.frame is None
 
 
 def test_the_marker_is_configurable():
