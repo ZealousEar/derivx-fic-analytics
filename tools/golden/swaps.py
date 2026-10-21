@@ -19,6 +19,7 @@ interpolation can be checked. Cases cover EUR ESTR with negative rates, GBP
 SONIA, linear-zero and monotone-convex curves, odd and weekend dates, tenors
 beyond the last quote, and seasoned swaps valued on weekends and holidays.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -70,15 +71,30 @@ def ql_swap(swap: VanillaSwap, asof: dt.date, handle: ql.YieldTermStructureHandl
         if fixed_dates != float_dates or swap.fixed_day_count != "ACT/360" or swap.float_day_count != "ACT/360":
             raise ValueError("the QuantLib OIS copy needs one schedule and ACT/360 legs (SOFR)")
         out = ql.OvernightIndexedSwap(
-            kind, swap.notional, _schedule(fixed_dates), swap.fixed_rate, DAY_COUNTS[swap.fixed_day_count],
-            ql.Sofr(handle), swap.spread, swap.payment_lag, ql.Following, cal,
+            kind,
+            swap.notional,
+            _schedule(fixed_dates),
+            swap.fixed_rate,
+            DAY_COUNTS[swap.fixed_day_count],
+            ql.Sofr(handle),
+            swap.spread,
+            swap.payment_lag,
+            ql.Following,
+            cal,
         )
     else:
         if swap.payment_lag:
             raise ValueError("ql.VanillaSwap has no payment lag")
         out = ql.VanillaSwap(
-            kind, swap.notional, _schedule(fixed_dates), swap.fixed_rate, DAY_COUNTS[swap.fixed_day_count],
-            _schedule(float_dates), term_index(swap, handle), swap.spread, DAY_COUNTS[swap.float_day_count],
+            kind,
+            swap.notional,
+            _schedule(fixed_dates),
+            swap.fixed_rate,
+            DAY_COUNTS[swap.fixed_day_count],
+            _schedule(float_dates),
+            term_index(swap, handle),
+            swap.spread,
+            DAY_COUNTS[swap.float_day_count],
         )
     out.setPricingEngine(ql.DiscountingSwapEngine(handle))
     return out
@@ -86,8 +102,15 @@ def ql_swap(swap: VanillaSwap, asof: dt.date, handle: ql.YieldTermStructureHandl
 
 def term_index(swap: VanillaSwap, handle: ql.YieldTermStructureHandle) -> ql.IborIndex:
     return ql.IborIndex(
-        "TERM", ql.Period(swap.float_months, ql.Months), swap.fixing_lag, ql.USDCurrency(), CALENDARS[swap.calendar],
-        ql.ModifiedFollowing, False, DAY_COUNTS[swap.float_day_count], handle,
+        "TERM",
+        ql.Period(swap.float_months, ql.Months),
+        swap.fixing_lag,
+        ql.USDCurrency(),
+        CALENDARS[swap.calendar],
+        ql.ModifiedFollowing,
+        False,
+        DAY_COUNTS[swap.float_day_count],
+        handle,
     )
 
 
@@ -133,12 +156,23 @@ def ql_values(swap: VanillaSwap, asof: dt.date, handle: ql.YieldTermStructureHan
 
 
 def _case(
-    kind: str, tenor: str, forward_start: Optional[str], receive: bool, rate: float, spread: float,
+    kind: str,
+    tenor: str,
+    forward_start: Optional[str],
+    receive: bool,
+    rate: float,
+    spread: float,
     valuation: dt.date = EXAMPLE_ASOF,
 ) -> Dict[str, object]:
     case = {
-        "kind": kind, "tenor": tenor, "forward_start": forward_start, "receive_fixed": receive, "notional": NOTIONAL,
-        "fixed_rate": rate, "spread": spread, "trade_date": EXAMPLE_ASOF.isoformat(),
+        "kind": kind,
+        "tenor": tenor,
+        "forward_start": forward_start,
+        "receive_fixed": receive,
+        "notional": NOTIONAL,
+        "fixed_rate": rate,
+        "spread": spread,
+        "trade_date": EXAMPLE_ASOF.isoformat(),
         "valuation_date": valuation.isoformat(),
     }
     swap = case_swap(case)
@@ -164,14 +198,27 @@ def _make_ois_case(tenor: str, rate: float, payment_lag: Optional[int]) -> Dict[
     set_evaluation_date(EXAMPLE_ASOF)
     handle = ql_curve(example_curve())
     extra = {} if payment_lag is None else {"paymentLag": payment_lag}
-    out = ql.MakeOIS(ql.Period(tenor), ql.Sofr(handle), rate, nominal=NOTIONAL, receiveFixed=True,
-                     pricingEngine=ql.DiscountingSwapEngine(handle), **extra)
+    out = ql.MakeOIS(
+        ql.Period(tenor),
+        ql.Sofr(handle),
+        rate,
+        nominal=NOTIONAL,
+        receiveFixed=True,
+        pricingEngine=ql.DiscountingSwapEngine(handle),
+        **extra,
+    )
     schedule = [pyd(d).isoformat() for d in out.fixedSchedule().dates()]
     pays = [pyd(cf.date()).isoformat() for cf in out.fixedLeg()]
     return {
-        "tenor": tenor, "fixed_rate": rate, "payment_lag": payment_lag, "notional": NOTIONAL,
-        "schedule": schedule, "fixed_pay_dates": pays,
-        "npv": out.NPV(), "fair_rate": out.fairRate(), "fixed_leg_bps": out.fixedLegBPS(),
+        "tenor": tenor,
+        "fixed_rate": rate,
+        "payment_lag": payment_lag,
+        "notional": NOTIONAL,
+        "schedule": schedule,
+        "fixed_pay_dates": pays,
+        "npv": out.NPV(),
+        "fair_rate": out.fairRate(),
+        "fixed_leg_bps": out.fixedLegBPS(),
     }
 
 
@@ -188,10 +235,22 @@ def spec(conv: str, kind: str, tenor: Optional[str], rate: float, **terms: objec
     """
 
     out = {
-        "conv": conv, "kind": kind, "tenor": tenor, "fixed_rate": rate, "interp": "loglinear", "shift": 0.0,
-        "trade_date": EXAMPLE_ASOF.isoformat(), "valuation_date": None, "valuation_shift": 0.0,
-        "forward_start": None, "start": None, "maturity": None, "receive_fixed": True, "spread": 0.0,
-        "notional": NOTIONAL, "overrides": {},
+        "conv": conv,
+        "kind": kind,
+        "tenor": tenor,
+        "fixed_rate": rate,
+        "interp": "loglinear",
+        "shift": 0.0,
+        "trade_date": EXAMPLE_ASOF.isoformat(),
+        "valuation_date": None,
+        "valuation_shift": 0.0,
+        "forward_start": None,
+        "start": None,
+        "maturity": None,
+        "receive_fixed": True,
+        "spread": 0.0,
+        "notional": NOTIONAL,
+        "overrides": {},
     }
     out.update(terms)
     out["valuation_date"] = out["valuation_date"] or out["trade_date"]
@@ -221,22 +280,39 @@ def spec_swap(case: Dict[str, object]) -> VanillaSwap:
     fields = dict(case["overrides"])
     fields.update({k: dt.date.fromisoformat(case[k]) for k in ("start", "maturity") if case[k]})
     return VanillaSwap.from_conventions(
-        case["conv"], case["tenor"], case["fixed_rate"], notional=case["notional"],
-        receive_fixed=case["receive_fixed"], kind=case["kind"], forward_start=case["forward_start"],
-        spread=case["spread"], trade_date=dt.date.fromisoformat(case["trade_date"]), **fields,
+        case["conv"],
+        case["tenor"],
+        case["fixed_rate"],
+        notional=case["notional"],
+        receive_fixed=case["receive_fixed"],
+        kind=case["kind"],
+        forward_start=case["forward_start"],
+        spread=case["spread"],
+        trade_date=dt.date.fromisoformat(case["trade_date"]),
+        **fields,
     )
 
 
 def _legs_from_preset(case: Dict[str, object]) -> Dict[str, object]:
     conv = CONVENTIONS[case["conv"]]
     if case["kind"] == "OIS":
-        legs = dict(fixed_months=conv.ois_fixed_months, fixed_day_count=conv.ois_day_count,
-                    float_months=conv.ois_fixed_months, float_day_count=conv.ois_day_count,
-                    payment_lag=conv.payment_lag, fixing_days=0)
+        legs = dict(
+            fixed_months=conv.ois_fixed_months,
+            fixed_day_count=conv.ois_day_count,
+            float_months=conv.ois_fixed_months,
+            float_day_count=conv.ois_day_count,
+            payment_lag=conv.payment_lag,
+            fixing_days=0,
+        )
     else:  # term index fixed spot-lag days before the period (2 USD/EUR, 0 GBP)
-        legs = dict(fixed_months=conv.irs_fixed_months, fixed_day_count=conv.irs_fixed_day_count,
-                    float_months=conv.irs_float_months, float_day_count=conv.irs_float_day_count,
-                    payment_lag=0, fixing_days=conv.spot_lag)
+        legs = dict(
+            fixed_months=conv.irs_fixed_months,
+            fixed_day_count=conv.irs_fixed_day_count,
+            float_months=conv.irs_float_months,
+            float_day_count=conv.irs_float_day_count,
+            payment_lag=0,
+            fixing_days=conv.spot_lag,
+        )
     legs.update(case["overrides"])
     return legs
 
@@ -257,8 +333,9 @@ def ql_dates(case: Dict[str, object]) -> tuple:
         if end - start <= months * 31:
             out.append(ql.Schedule(ql.DateVector([cal.adjust(start, bdc), cal.adjust(end, bdc)])))
         else:
-            out.append(ql.Schedule(start, end, ql.Period(months, ql.Months), cal, bdc, bdc,
-                                   ql.DateGeneration.Backward, False))
+            out.append(
+                ql.Schedule(start, end, ql.Period(months, ql.Months), cal, bdc, bdc, ql.DateGeneration.Backward, False)
+            )
     return out[0], out[1]
 
 
@@ -300,21 +377,49 @@ def reference(case: Dict[str, object]) -> Dict[str, object]:
             index.addFixing(day, (growth - 1.0) / float_dc.yearFraction(day, nxt))
             day = nxt
         swap = ql.OvernightIndexedSwap(
-            side, [case["notional"]] * n_fixed, fixed_schedule, case["fixed_rate"], fixed_dc,
-            [case["notional"]] * n_float, float_schedule, index, case["spread"], legs["payment_lag"], ql.Following, cal,
+            side,
+            [case["notional"]] * n_fixed,
+            fixed_schedule,
+            case["fixed_rate"],
+            fixed_dc,
+            [case["notional"]] * n_float,
+            float_schedule,
+            index,
+            case["spread"],
+            legs["payment_lag"],
+            ql.Following,
+            cal,
         )
         float_leg = swap.overnightLeg()
     else:
-        index = ql.IborIndex(f"{conv.name} TERM", ql.Period(legs["float_months"], ql.Months), legs["fixing_days"],
-                             ql.USDCurrency(), cal, ql.ModifiedFollowing, False, float_dc, handle)
+        index = ql.IborIndex(
+            f"{conv.name} TERM",
+            ql.Period(legs["float_months"], ql.Months),
+            legs["fixing_days"],
+            ql.USDCurrency(),
+            cal,
+            ql.ModifiedFollowing,
+            False,
+            float_dc,
+            handle,
+        )
         dates = float_schedule.dates()
         for s, e in zip(dates[:-1], dates[1:]):
             fixing = index.fixingDate(s)
             if fixing < qd(valuation):
                 rate = (fixings.df(pyd(s)) / fixings.df(pyd(e)) - 1.0) / float_dc.yearFraction(s, e)
                 index.addFixing(fixing, rate)
-        swap = ql.VanillaSwap(side, case["notional"], fixed_schedule, case["fixed_rate"], fixed_dc, float_schedule,
-                              index, case["spread"], float_dc)
+        swap = ql.VanillaSwap(
+            side,
+            case["notional"],
+            fixed_schedule,
+            case["fixed_rate"],
+            fixed_dc,
+            float_schedule,
+            index,
+            case["spread"],
+            float_dc,
+        )
         float_leg = swap.floatingLeg()
     swap.setPricingEngine(ql.DiscountingSwapEngine(handle))
     live = lambda leg: [[pyd(cf.date()).isoformat(), cf.amount()] for cf in leg if pyd(cf.date()) > valuation]  # noqa: E731
@@ -339,27 +444,74 @@ def independent_specs() -> List[Dict[str, object]]:
     return [
         # USD SOFR: other interpolations, month-end spot, weekend start, leap day, long tenors, stubs.
         spec("USD SOFR", "OIS", "10Y", 0.0371, interp="monotone_convex", trade_date="2027-02-24"),
-        spec("USD SOFR", "IRS", "7Y", 0.0365, interp="linear_zero", forward_start="18M", receive_fixed=False,
-             spread=0.0011),
+        spec(
+            "USD SOFR",
+            "IRS",
+            "7Y",
+            0.0365,
+            interp="linear_zero",
+            forward_start="18M",
+            receive_fixed=False,
+            spread=0.0011,
+        ),
         spec("USD SOFR", "OIS", None, 0.0362, start="2027-01-30", maturity="2032-02-29"),
         spec("USD SOFR", "OIS", "50Y", 0.0368),
         spec("USD SOFR", "OIS", "40Y", 0.0371, interp="monotone_convex", forward_start="10Y", receive_fixed=False),
         spec("USD SOFR", "IRS", "13M", 0.0372, spread=-0.0007),
         spec("USD SOFR", "OIS", "2W", 0.0391),
-        spec("USD SOFR", "OIS", "6Y", 0.0358, interp="linear_zero",
-             overrides={"fixed_months": 3, "fixed_day_count": "30E/360"}),
-        spec("USD SOFR", "OIS", "5Y", 0.0372, interp="linear_zero", valuation_date="2027-03-06",
-             valuation_shift=0.0025, spread=0.001),
-        spec("USD SOFR", "IRS", "5Y", 0.0372, interp="monotone_convex", valuation_date="2027-11-25",
-             valuation_shift=-0.003),
-        spec("USD SOFR", "OIS", "3Y", 0.0351, forward_start="2Y", valuation_date="2027-07-03", valuation_shift=0.001,
-             receive_fixed=False),
+        spec(
+            "USD SOFR",
+            "OIS",
+            "6Y",
+            0.0358,
+            interp="linear_zero",
+            overrides={"fixed_months": 3, "fixed_day_count": "30E/360"},
+        ),
+        spec(
+            "USD SOFR",
+            "OIS",
+            "5Y",
+            0.0372,
+            interp="linear_zero",
+            valuation_date="2027-03-06",
+            valuation_shift=0.0025,
+            spread=0.001,
+        ),
+        spec(
+            "USD SOFR",
+            "IRS",
+            "5Y",
+            0.0372,
+            interp="monotone_convex",
+            valuation_date="2027-11-25",
+            valuation_shift=-0.003,
+        ),
+        spec(
+            "USD SOFR",
+            "OIS",
+            "3Y",
+            0.0351,
+            forward_start="2Y",
+            valuation_date="2027-07-03",
+            valuation_shift=0.001,
+            receive_fixed=False,
+        ),
         # EUR ESTR with negative rates.
         spec("EUR ESTR", "OIS", "5Y", -0.0080, **eur),
-        spec("EUR ESTR", "IRS", "10Y", -0.0065, interp="monotone_convex", forward_start="2Y", receive_fixed=False,
-             **eur),
-        spec("EUR ESTR", "OIS", "4Y", -0.0090, interp="linear_zero", valuation_date="2027-03-29",
-             valuation_shift=0.002, spread=-0.0005, **eur),
+        spec(
+            "EUR ESTR", "IRS", "10Y", -0.0065, interp="monotone_convex", forward_start="2Y", receive_fixed=False, **eur
+        ),
+        spec(
+            "EUR ESTR",
+            "OIS",
+            "4Y",
+            -0.0090,
+            interp="linear_zero",
+            valuation_date="2027-03-29",
+            valuation_shift=0.002,
+            spread=-0.0005,
+            **eur,
+        ),
         spec("EUR ESTR", "IRS", None, -0.0070, start="2027-05-31", maturity="2034-05-31", **eur),
         # GBP SONIA: spot lag 0, ACT/365F, term index fixed on the period start.
         spec("GBP SONIA", "OIS", "5Y", 0.0361, interp="linear_zero"),
@@ -367,8 +519,15 @@ def independent_specs() -> List[Dict[str, object]]:
         spec("GBP SONIA", "IRS", "20Y", 0.0384, interp="monotone_convex", forward_start="5Y", receive_fixed=False),
         spec("GBP SONIA", "IRS", "5Y", 0.0368, valuation_date="2027-04-16", valuation_shift=0.004, spread=0.0009),
         spec("GBP SONIA", "IRS", "3Y", 0.0371, valuation_date="2027-08-31", valuation_shift=-0.002),
-        spec("GBP SONIA", "OIS", "3Y", 0.0371, interp="monotone_convex", valuation_date="2027-12-27",
-             valuation_shift=0.0015),
+        spec(
+            "GBP SONIA",
+            "OIS",
+            "3Y",
+            0.0371,
+            interp="monotone_convex",
+            valuation_date="2027-12-27",
+            valuation_shift=0.0015,
+        ),
     ]
 
 

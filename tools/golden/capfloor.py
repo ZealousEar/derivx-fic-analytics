@@ -47,8 +47,11 @@ NOTIONAL = 10_000_000.0
 
 # Independent-schedule cases: (valuation date, curve preset, interpolation, shift added to every example quote,
 # model, kind, tenor, forward start or explicit start, index months, strike offset from ATM).
-SATURDAY, MONTH_END, LEAP, YEAR_END = dt.date(2026, 10, 24), dt.date(2027, 1, 29), dt.date(2028, 2, 28), dt.date(
-    2026, 12, 29
+SATURDAY, MONTH_END, LEAP, YEAR_END = (
+    dt.date(2026, 10, 24),
+    dt.date(2027, 1, 29),
+    dt.date(2028, 2, 28),
+    dt.date(2026, 12, 29),
 )
 FOLLOWING_IS_NOT_MF = dt.date(2026, 10, 28)  # USD spot + 1Y = Sat 2027-10-30: Following -> Nov 1, MF -> Oct 29
 INDEPENDENT = [
@@ -64,8 +67,18 @@ INDEPENDENT = [
     (SATURDAY, "EUR ESTR", "monotone_convex", -0.045, "shifted_black", "cap", "10Y", "3M", 3, 0.002),
     (LEAP, "EUR ESTR", "linear_zero", -0.045, "bachelier", "cap", "20Y", "5Y", 12, 0.0),
     (YEAR_END, "EUR ESTR", "loglinear", 0.0, "black", "floor", "5Y", "6M", 6, 0.0),
-    (EXAMPLE_ASOF, "EUR ESTR", "monotone_convex", -0.045, "shifted_black", "floor", "4Y", dt.date(2025, 11, 28), 6,
-     0.0),
+    (
+        EXAMPLE_ASOF,
+        "EUR ESTR",
+        "monotone_convex",
+        -0.045,
+        "shifted_black",
+        "floor",
+        "4Y",
+        dt.date(2025, 11, 28),
+        6,
+        0.0,
+    ),
     (EXAMPLE_ASOF, "GBP SONIA", "loglinear", 0.0, "black", "cap", "5Y", None, 3, 0.0),
     (SATURDAY, "GBP SONIA", "linear_zero", 0.0, "bachelier", "floor", "3Y", "2Y", 3, 0.004),
     (MONTH_END, "GBP SONIA", "monotone_convex", 0.0, "shifted_black", "cap", "13M", None, 1, 0.0),
@@ -98,8 +111,15 @@ def _engine(curve: ql.YieldTermStructureHandle, model: str, vol: float, shift: f
 
 def _index(cf: CapFloor, handle: ql.YieldTermStructureHandle) -> ql.IborIndex:
     return ql.IborIndex(
-        "DERIVX-TERM", ql.Period(cf.index_months, ql.Months), cf.fixing_lag, ql.USDCurrency(),
-        CALENDARS[cf.calendar], BDC[cf.bdc], False, DAY_COUNTS[cf.day_count], handle,
+        "DERIVX-TERM",
+        ql.Period(cf.index_months, ql.Months),
+        cf.fixing_lag,
+        ql.USDCurrency(),
+        CALENDARS[cf.calendar],
+        BDC[cf.bdc],
+        False,
+        DAY_COUNTS[cf.day_count],
+        handle,
     )
 
 
@@ -156,8 +176,14 @@ def _ql_cap(cf: CapFloor, index: ql.IborIndex, asof: dt.date) -> Tuple[ql.CapFlo
     if cf.start is not None:
         effective = qd(cf.start)
         schedule = ql.Schedule(
-            effective, effective + tenor, ql.Period(cf.index_months, ql.Months), cal, bdc, bdc,
-            ql.DateGeneration.Backward, False,
+            effective,
+            effective + tenor,
+            ql.Period(cf.index_months, ql.Months),
+            cal,
+            bdc,
+            bdc,
+            ql.DateGeneration.Backward,
+            False,
         )
         leg = list(ql.IborLeg([cf.notional], schedule, index, DAY_COUNTS[cf.day_count], bdc, [cf.fixing_lag]))
         make = ql.Cap if cf.is_cap else ql.Floor
@@ -297,8 +323,12 @@ def _independent_cases() -> List[Dict[str, object]]:
         fixings = FIXINGS if start is not None else None
         market = independent_market(asof, preset, interpolation, quote_shift, fixings)
         terms = dict(
-            forward_start=None if start else begin, start=start, index_months=months,
-            day_count=conv.irs_float_day_count, calendar=conv.calendar, fixing_lag=conv.spot_lag,
+            forward_start=None if start else begin,
+            start=start,
+            index_months=months,
+            day_count=conv.irs_float_day_count,
+            calendar=conv.calendar,
+            fixing_lag=conv.spot_lag,
             exclude_first=True if start else None,
         )
         atm = CapFloor(NOTIONAL, kind, 0.0, tenor, 0.01, **terms).atm_strike(market)

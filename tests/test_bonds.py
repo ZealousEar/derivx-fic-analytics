@@ -200,7 +200,14 @@ def test_random_bonds_match_live_quantlib():
             ref_cx = ql.BondFunctions.convexity(qb, rate, s)
             assert bond.convexity(y, settle, convention) == pytest.approx(ref_cx, rel=1e-9), bond
             ref_y = ql.BondFunctions.bondYield(
-                qb, ql.BondPrice(price, ql.BondPrice.Clean), dc, ql.Compounded, freqs[bond.frequency], s, 1e-15, 1000,
+                qb,
+                ql.BondPrice(price, ql.BondPrice.Clean),
+                dc,
+                ql.Compounded,
+                freqs[bond.frequency],
+                s,
+                1e-15,
+                1000,
                 0.05,
             )
             assert bond.yield_from_price(price, settle, convention=convention) == pytest.approx(ref_y, abs=1e-10)
@@ -235,8 +242,14 @@ def test_other_conventions_match_live_quantlib():
             regular = [d for d in FixedRateBond(0.0, maturity, frequency=frequency).coupon_dates(dated) if d > dated]
             first = regular[1] if len(regular) > 2 and rng.random() < 0.5 else None
         bond = FixedRateBond(
-            round(rng.uniform(0.0, 0.12), 5), maturity, dated, first, frequency=frequency,
-            day_count=rng.choice(day_counts), calendar=calendar, settle_lag=rng.randint(0, 2),
+            round(rng.uniform(0.0, 0.12), 5),
+            maturity,
+            dated,
+            first,
+            frequency=frequency,
+            day_count=rng.choice(day_counts),
+            calendar=calendar,
+            settle_lag=rng.randint(0, 2),
             payment_bdc=rng.choice(("F", "MF", "P")),
         )
         if not bond.cal.is_business_day(maturity) or (dated is not None and len(bond.coupon_dates()) < 3):
@@ -275,8 +288,9 @@ def test_other_conventions_match_live_quantlib():
 def test_end_of_month_schedules():
     aug = FixedRateBond(0.0375, D("2028-08-31"))
     assert aug.end_of_month
-    assert aug.coupon_dates(SPOT) == [D(d) for d in ("2026-02-28", "2026-08-31", "2027-02-28", "2027-08-31",
-                                                     "2028-02-29", "2028-08-31")]
+    assert aug.coupon_dates(SPOT) == [
+        D(d) for d in ("2026-02-28", "2026-08-31", "2027-02-28", "2027-08-31", "2028-02-29", "2028-08-31")
+    ]
     assert aug.coupons(SPOT)[0].pay == D("2027-03-01")  # Sunday Feb 28 pays Monday
     feb = FixedRateBond(0.04, D("2031-02-28"), dated=D("2026-02-28"))
     assert feb.coupon_dates()[:4] == [D("2026-02-28"), D("2026-08-31"), D("2027-02-28"), D("2027-08-31")]
@@ -662,8 +676,9 @@ def test_bond_tab_default_inputs():
         for name in axes:
             lo, hi = layout[name]["minallowed"], layout[name]["maxallowed"]
             assert math.isfinite(lo) and math.isfinite(hi) and lo < hi and layout[name]["range"] == [lo, hi]
-    widget_keys = [w.key for kind in ("radio", "selectbox", "number_input", "text_input", "date_input") for w in
-                   getattr(at, kind)]
+    widget_keys = [
+        w.key for kind in ("radio", "selectbox", "number_input", "text_input", "date_input") for w in getattr(at, kind)
+    ]
     assert widget_keys and all(key.startswith("bond_") for key in widget_keys)
     for tenor in (2, 5, 30):
         at.selectbox(key="bond_tenor").set_value(tenor).run()

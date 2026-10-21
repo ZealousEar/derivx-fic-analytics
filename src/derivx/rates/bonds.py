@@ -615,4 +615,3 @@ def bill_money_market_yield(price: float, days: int, face: float = 100.0) -> flo
 
     _check_bill(days, price)
     return (face / price - 1.0) * 360.0 / days
-

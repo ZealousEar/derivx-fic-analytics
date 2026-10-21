@@ -138,9 +138,7 @@ def _profile_inputs(kind: str, c2, c3) -> Shock:
     if kind == "Parallel":
         return parallel(_bp(c2, "SHIFT (BP)", 25.0, "scn_par_bp"))
     if kind == "Twist":
-        pivot = c2.number_input(
-            "PIVOT (YRS)", min_value=0.25, max_value=30.0, value=5.0, step=0.25, key="scn_tw_pivot"
-        )
+        pivot = c2.number_input("PIVOT (YRS)", min_value=0.25, max_value=30.0, value=5.0, step=0.25, key="scn_tw_pivot")
         a, b, c, d = st.columns(4)
         short_bp = _bp(a, "SHORT END (BP)", -25.0, "scn_tw_short")
         long_bp = _bp(b, "LONG END (BP)", 25.0, "scn_tw_long")
@@ -380,9 +378,7 @@ def _show_curves(market: Market, shock: Shock) -> None:
     st.markdown("#### / BASE VS SHOCKED CURVE")
     available = [w for w in ("curve", "govt") if _has_quotes(getattr(market, w))]
     c1, c2 = st.columns(2)
-    which = c1.radio(
-        "CURVE", available, format_func=CURVE_LABELS.get, horizontal=True, key="scn_chart_curve"
-    )
+    which = c1.radio("CURVE", available, format_func=CURVE_LABELS.get, horizontal=True, key="scn_chart_curve")
     view = c2.radio("SHOW", ["PAR QUOTES", "ZERO RATES"], horizontal=True, key="scn_chart_view")
     base = getattr(market, which)
     bumps = shock.quote_bumps(base) if getattr(shock, which) else np.zeros(len(base.quotes))

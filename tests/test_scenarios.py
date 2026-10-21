@@ -76,10 +76,13 @@ def _pinned_ois(market, tenor="10Y", rate=None, notional=1e6, receive=True):
     conv = market.curve.conventions
     cal = conv.cal
     spot = cal.add_business_days(cal.adjust(market.asof, "F"), conv.spot_lag)
-    dates = make_schedule(spot, add_months(spot, parse_tenor(tenor).months), conv.ois_fixed_months, cal,
-                          conv.bdc, conv.bdc)
-    periods = [(s, e, cal.add_business_days(e, conv.payment_lag), year_fraction(s, e, conv.ois_day_count))
-               for s, e in zip(dates[:-1], dates[1:])]
+    dates = make_schedule(
+        spot, add_months(spot, parse_tenor(tenor).months), conv.ois_fixed_months, cal, conv.bdc, conv.bdc
+    )
+    periods = [
+        (s, e, cal.add_business_days(e, conv.payment_lag), year_fraction(s, e, conv.ois_day_count))
+        for s, e in zip(dates[:-1], dates[1:])
+    ]
     if rate is None:
         dfs = [market.curve.df(p) for _, _, p, _ in periods]
         floating = sum((market.compounded_growth(s, e) - 1.0) * d for (s, e, _, _), d in zip(periods, dfs))
@@ -134,8 +137,9 @@ def test_twist_is_exactly_zero_at_the_pivot(market, pivot, ends):
 
 def test_twist_with_anchors_and_steepener_on_the_curve(market):
     steepener = twist(5.0, -12.5, 12.5, short_years=2.0, long_years=10.0)
-    np.testing.assert_array_equal(steepener.bp_at([0.1, 2.0, 3.5, 5.0, 7.5, 10.0, 30.0]),
-                                  [-12.5, -12.5, -6.25, 0.0, 6.25, 12.5, 12.5])
+    np.testing.assert_array_equal(
+        steepener.bp_at([0.1, 2.0, 3.5, 5.0, 7.5, 10.0, 30.0]), [-12.5, -12.5, -6.25, 0.0, 6.25, 12.5, 12.5]
+    )
     bumps = dict(zip(market.curve.labels, twist(5.0, -25.0, 25.0).quote_bumps(market.curve)))
     assert bumps["5Y OIS"] == 0.0 and bumps["10Y OIS"] - bumps["2Y OIS"] > 0  # 2s10s steepens
     assert bumps["30Y OIS"] == 25.0 and bumps["10Y OIS"] == pytest.approx(25.0 * 5 / 25)
@@ -228,8 +232,15 @@ def test_standard_library():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("shock", [twist(5.0, -40.0, 60.0), historical("2020 dash for cash"),
-                                   key_rates({"2Y": 0, "5Y": 30, "10Y": 0}), parallel(-150.0, horizon_days=45)])
+@pytest.mark.parametrize(
+    "shock",
+    [
+        twist(5.0, -40.0, 60.0),
+        historical("2020 dash for cash"),
+        key_rates({"2Y": 0, "5Y": 30, "10Y": 0}),
+        parallel(-150.0, horizon_days=45),
+    ],
+)
 def test_shocked_curves_reprice_their_shocked_quotes(market, shock):
     moved = shocked_market(market, shock)
     assert moved.asof == horizon_date(market, shock.horizon_days)
@@ -237,8 +248,9 @@ def test_shocked_curves_reprice_their_shocked_quotes(market, shock):
     for which in ("curve", "govt"):
         base, curve = getattr(market, which), getattr(moved, which)
         bumps = shock.quote_bumps(base)
-        np.testing.assert_allclose([q.rate for q in curve.quotes], [q.rate + b * 1e-4 for q, b in
-                                                                     zip(base.quotes, bumps)], rtol=0, atol=1e-15)
+        np.testing.assert_allclose(
+            [q.rate for q in curve.quotes], [q.rate + b * 1e-4 for q, b in zip(base.quotes, bumps)], rtol=0, atol=1e-15
+        )
         assert max(abs(r["error_bp"]) for r in curve.repricing()) < 1e-8
     today = shocked_market(market, shock, at_horizon=False)
     assert today.asof == market.asof
@@ -284,6 +296,7 @@ def test_gamma_is_half_the_diagonal_key_rate_gammas(market):
     shock = twist(5.0, -30.0, 20.0, govt=False)
     row = run_scenario([pos], market, shock)[0]
     bumps, base = shock.quote_bumps(market.curve), pos.pv(market)
+
     def second_difference(i):
         up, down = (pos.pv(bumped_market(market, "curve", {i: bp})) for bp in (1.0, -1.0))
         return up + down - 2.0 * base
@@ -297,8 +310,13 @@ def test_gamma_is_half_the_diagonal_key_rate_gammas(market):
 
 @pytest.mark.parametrize("bp", [100.0, -100.0])
 def test_delta_gamma_explain_a_100bp_move_on_linear_instruments(market, bp):
-    positions = [_quote_position(market, 11), _quote_position(market, 9), _quote_position(market, 3),
-                 _quote_position(market, 11, "govt"), _pinned_ois(market, "7Y", rate=0.03)]
+    positions = [
+        _quote_position(market, 11),
+        _quote_position(market, 9),
+        _quote_position(market, 3),
+        _quote_position(market, 11, "govt"),
+        _pinned_ois(market, "7Y", rate=0.03),
+    ]
     for row in run_scenario(positions, market, parallel(bp)):
         explained = row["delta"] + row["gamma"] + row["cross_gamma"]
         assert abs(row["pnl"] - explained) < 0.01 * abs(row["pnl"]), row
@@ -310,8 +328,16 @@ def test_delta_gamma_explain_a_100bp_move_on_linear_instruments(market, bp):
     assert abs(ten["pnl"] - ten["delta"] - ten["gamma"]) > 0.02 * abs(ten["pnl"])
 
 
-@pytest.mark.parametrize("shock", [parallel(2.0), twist(5.0, -3.0, 4.0), butterfly(-1.0, 2.0, 7.0),
-                                   key_rates({"1Y": 0.0, "3Y": -2.5, "10Y": 1.0}), historical("2023 SVB", 0.02)])
+@pytest.mark.parametrize(
+    "shock",
+    [
+        parallel(2.0),
+        twist(5.0, -3.0, 4.0),
+        butterfly(-1.0, 2.0, 7.0),
+        key_rates({"1Y": 0.0, "3Y": -2.5, "10Y": 1.0}),
+        historical("2023 SVB", 0.02),
+    ],
+)
 def test_residual_is_small_for_small_shocks(market, shock):
     positions = [_quote_position(market, i) for i in (5, 9, 11, 14)] + [_quote_position(market, 9, "govt")]
     rows = run_scenario(positions, market, shock)
@@ -324,8 +350,9 @@ def test_residual_is_small_for_small_shocks(market, shock):
 
 
 def test_vol_shocks_are_explained_by_vega(market):
-    vol = Position("vol", lambda m: 1e4 * (m.vol_shift_normal / 1e-4) + 3e3 * (m.vol_shift_lognormal / 0.01),
-                   vol_model="normal")
+    vol = Position(
+        "vol", lambda m: 1e4 * (m.vol_shift_normal / 1e-4) + 3e3 * (m.vol_shift_lognormal / 0.01), vol_model="normal"
+    )
     black = Position("black", vol.pv, vol_model="lognormal")
     rows = run_scenario([vol, black], market, Shock("vols", normal_vol_bp=5.0, lognormal_vol_pts=-2.0))
     assert _row(rows, "vol")["vol"] == pytest.approx(5e4, rel=1e-10)
@@ -340,7 +367,8 @@ def test_carry_of_a_receiver_over_30_days_has_the_expected_sign():
         rec, pay = _pinned_ois(m, "10Y"), _pinned_ois(m, "10Y", receive=False)
         rec.name, pay.name = "rec", "pay"
         assert Instrument(m.curve.quotes[9], m.asof, m.curve.conventions).npv(m.curve) * 1e6 == pytest.approx(
-            rec.pv(m), abs=1e-6)
+            rec.pv(m), abs=1e-6
+        )
         rows = run_scenario([rec, pay], m, Shock("carry", horizon_days=30))
         r, p = _row(rows, "rec"), _row(rows, "pay")
         # Rising curve: receive more fixed than overnight pays and roll down the curve.
@@ -522,19 +550,33 @@ def test_twisted_curve_and_pnl_match_quantlib(market):
         for q in quotes:
             quote = ql.QuoteHandle(ql.SimpleQuote(q.rate))
             if q.kind == "DEPO":
-                helpers.append(ql.DepositRateHelper(quote, ql.Period(q.tenor), 2, cal, ql.ModifiedFollowing, False,
-                                                    ql.Actual360()))
+                helpers.append(
+                    ql.DepositRateHelper(quote, ql.Period(q.tenor), 2, cal, ql.ModifiedFollowing, False, ql.Actual360())
+                )
             else:
-                helpers.append(ql.OISRateHelper(2, ql.Period(q.tenor), quote, index, ql.YieldTermStructureHandle(),
-                                                False, 2, ql.Following, ql.Annual, cal))
+                helpers.append(
+                    ql.OISRateHelper(
+                        2,
+                        ql.Period(q.tenor),
+                        quote,
+                        index,
+                        ql.YieldTermStructureHandle(),
+                        False,
+                        2,
+                        ql.Following,
+                        ql.Annual,
+                        cal,
+                    )
+                )
         curve = ql.PiecewiseLogLinearDiscount(qd(market.asof), helpers, ql.Actual365Fixed())
         curve.enableExtrapolation()
         return ql.YieldTermStructureHandle(curve)
 
     def ql_swap_npv(handle, rate, periods):
         schedule = ql.Schedule(ql.DateVector([qd(periods[0][0])] + [qd(e) for _, e, _, _ in periods]))
-        swap = ql.OvernightIndexedSwap(ql.Swap.Receiver, 1e6, schedule, rate, ql.Actual360(), ql.Sofr(handle), 0.0,
-                                       2, ql.Following, cal)
+        swap = ql.OvernightIndexedSwap(
+            ql.Swap.Receiver, 1e6, schedule, rate, ql.Actual360(), ql.Sofr(handle), 0.0, 2, ql.Following, cal
+        )
         swap.setPricingEngine(ql.DiscountingSwapEngine(handle))
         return swap.NPV()
 
@@ -582,13 +624,38 @@ def test_horizon_scenarios_match_quantlib_on_other_presets(preset, interp, asof,
         for q in quotes:
             quote = ql.QuoteHandle(ql.SimpleQuote(q.rate))
             if q.kind == "DEPO":
-                helpers.append(ql.DepositRateHelper(quote, ql.Period(q.tenor), conv.spot_lag, cal, ql.ModifiedFollowing,
-                                                    False, DAY_COUNTS[conv.depo_day_count]))
+                helpers.append(
+                    ql.DepositRateHelper(
+                        quote,
+                        ql.Period(q.tenor),
+                        conv.spot_lag,
+                        cal,
+                        ql.ModifiedFollowing,
+                        False,
+                        DAY_COUNTS[conv.depo_day_count],
+                    )
+                )
             else:  # derivx OIS quotes never roll to month ends (QuantLib's default does from a month-end spot)
-                helpers.append(ql.OISRateHelper(conv.spot_lag, ql.Period(q.tenor), quote, index,
-                                                ql.YieldTermStructureHandle(), False, conv.payment_lag, ql.Following,
-                                                ql.Annual, cal, ql.Period(0, ql.Days), 0.0, ql.Pillar.LastRelevantDate,
-                                                ql.Date(), ql.RateAveraging.Compound, False))
+                helpers.append(
+                    ql.OISRateHelper(
+                        conv.spot_lag,
+                        ql.Period(q.tenor),
+                        quote,
+                        index,
+                        ql.YieldTermStructureHandle(),
+                        False,
+                        conv.payment_lag,
+                        ql.Following,
+                        ql.Annual,
+                        cal,
+                        ql.Period(0, ql.Days),
+                        0.0,
+                        ql.Pillar.LastRelevantDate,
+                        ql.Date(),
+                        ql.RateAveraging.Compound,
+                        False,
+                    )
+                )
         build = ql.PiecewiseLogLinearDiscount if interp == "loglinear" else ql.PiecewiseLinearZero
         curve = build(qd(day), helpers, ql.Actual365Fixed(), ql.IterativeBootstrap(1e-15))
         curve.enableExtrapolation()
@@ -597,8 +664,18 @@ def test_horizon_scenarios_match_quantlib_on_other_presets(preset, interp, asof,
     def ql_swap(handle, trade):
         dates = ql.Schedule(ql.DateVector([qd(d) for d in trade.schedule_dates(asof)[0]]))
         side = ql.Swap.Receiver if trade.receive_fixed else ql.Swap.Payer
-        out = ql.OvernightIndexedSwap(side, trade.notional, dates, trade.fixed_rate, dc, make_index(handle), 0.0,
-                                      conv.payment_lag, ql.Following, cal)
+        out = ql.OvernightIndexedSwap(
+            side,
+            trade.notional,
+            dates,
+            trade.fixed_rate,
+            dc,
+            make_index(handle),
+            0.0,
+            conv.payment_lag,
+            ql.Following,
+            cal,
+        )
         out.setPricingEngine(ql.DiscountingSwapEngine(handle))
         return out
 
@@ -608,14 +685,25 @@ def test_horizon_scenarios_match_quantlib_on_other_presets(preset, interp, asof,
     ]
     market = Market(curve=bootstrap(asof, quotes, preset, interp))
     trades = [
-        swaps.VanillaSwap.from_conventions(preset, tenor, level + 0.006, notional=1e7, receive_fixed=receive,
-                                           kind="OIS", forward_start=forward, trade_date=asof)
+        swaps.VanillaSwap.from_conventions(
+            preset,
+            tenor,
+            level + 0.006,
+            notional=1e7,
+            receive_fixed=receive,
+            kind="OIS",
+            forward_start=forward,
+            trade_date=asof,
+        )
         for tenor, forward, receive in (("18M", None, True), ("5Y", "1Y", False), ("30Y", None, True))
     ]
     positions = [swaps.swap_position(t) for t in trades]
     stub_end = trades[0].schedule_dates(asof)[0][1]  # the 18M swap's 6M front stub, paid payment_lag days later
-    shocks = [twist(5.0, -40.0, 25.0, horizon_days=(stub_end - asof).days + 1),
-              parallel(-60.0, horizon_days=400), historical("2023 SVB")]
+    shocks = [
+        twist(5.0, -40.0, 25.0, horizon_days=(stub_end - asof).days + 1),
+        parallel(-60.0, horizon_days=400),
+        historical("2023 SVB"),
+    ]
     paid = []
     for shock in shocks:
         rows = run_scenario(positions, market, shock)
@@ -638,8 +726,12 @@ def test_horizon_scenarios_match_quantlib_on_other_presets(preset, interp, asof,
         for row, trade, npv in zip(rows, trades, npv0):
             swap = ql_swap(moved, trade)
             sign = 1.0 if trade.receive_fixed else -1.0
-            cash = sum(s * cf.amount() for leg, s in ((swap.fixedLeg(), sign), (swap.overnightLeg(), -sign))
-                       for cf in leg if asof < pyd(cf.date()) <= horizon)
+            cash = sum(
+                s * cf.amount()
+                for leg, s in ((swap.fixedLeg(), sign), (swap.overnightLeg(), -sign))
+                for cf in leg
+                if asof < pyd(cf.date()) <= horizon
+            )
             assert row["shocked_pv"] == pytest.approx(swap.NPV(), rel=1e-12, abs=1e-6), (shock.name, trade.label)
             assert row["cash"] == pytest.approx(cash, rel=1e-12, abs=1e-6), (shock.name, trade.label)
             assert row["pnl"] == pytest.approx(swap.NPV() + cash - npv, rel=1e-10, abs=1e-6), (shock.name, trade.label)

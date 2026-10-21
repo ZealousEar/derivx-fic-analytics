@@ -1,5 +1,6 @@
 """Vanilla swaps: QuantLib golden values, pricing identities, risk, hedging,
 seasoned valuation and the Streamlit tab."""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -83,9 +84,16 @@ def _spec_swap(spec: dict) -> VanillaSwap:
     fields = dict(spec["overrides"])
     fields.update({k: dt.date.fromisoformat(spec[k]) for k in ("start", "maturity") if spec[k]})
     return VanillaSwap.from_conventions(
-        spec["conv"], spec["tenor"], spec["fixed_rate"], notional=spec["notional"],
-        receive_fixed=spec["receive_fixed"], kind=spec["kind"], forward_start=spec["forward_start"],
-        spread=spec["spread"], trade_date=dt.date.fromisoformat(spec["trade_date"]), **fields,
+        spec["conv"],
+        spec["tenor"],
+        spec["fixed_rate"],
+        notional=spec["notional"],
+        receive_fixed=spec["receive_fixed"],
+        kind=spec["kind"],
+        forward_start=spec["forward_start"],
+        spread=spec["spread"],
+        trade_date=dt.date.fromisoformat(spec["trade_date"]),
+        **fields,
     )
 
 
@@ -263,8 +271,9 @@ def test_random_presets_match_live_quantlib():
             spread=float(rng.uniform(-0.002, 0.002)),
             notional=float(rng.uniform(1e5, 1e9)),
         )
-        spec = gs.spec(conv, ("OIS", "IRS")[i % 4 >= 2], f"{int(rng.integers(1, 481))}M",
-                       float(rng.uniform(-0.01, 0.06)), **terms)
+        spec = gs.spec(
+            conv, ("OIS", "IRS")[i % 4 >= 2], f"{int(rng.integers(1, 481))}M", float(rng.uniform(-0.01, 0.06)), **terms
+        )
         _check_case(gs.reference(spec), _spec_swap(spec), _spec_market(spec))
 
 
@@ -285,8 +294,9 @@ SHAPES = [
 @pytest.mark.parametrize("kind,tenor,fwd", SHAPES)
 def test_par_swap_is_worth_zero(kind, tenor, fwd):
     market = _market()
-    swap = VanillaSwap.from_conventions("USD SOFR", tenor, 0.0, NOTIONAL, kind=kind, forward_start=fwd,
-                                        spread=0.0012, trade_date=EXAMPLE_ASOF)
+    swap = VanillaSwap.from_conventions(
+        "USD SOFR", tenor, 0.0, NOTIONAL, kind=kind, forward_start=fwd, spread=0.0012, trade_date=EXAMPLE_ASOF
+    )
     at_par = replace(swap, fixed_rate=swap.par_rate(market))
     assert abs(at_par.pv(market)) < 1e-9 * NOTIONAL
     assert at_par.pv_fixed(market) == pytest.approx(-at_par.pv_float(market), rel=1e-12)
@@ -295,8 +305,9 @@ def test_par_swap_is_worth_zero(kind, tenor, fwd):
 @pytest.mark.parametrize("kind,tenor,fwd", SHAPES)
 def test_payer_is_minus_receiver_and_pv_is_rate_gap_times_annuity(kind, tenor, fwd):
     market = _market()
-    rec = VanillaSwap.from_conventions("USD SOFR", tenor, 0.0415, NOTIONAL, kind=kind, forward_start=fwd,
-                                       spread=-0.0005, trade_date=EXAMPLE_ASOF)
+    rec = VanillaSwap.from_conventions(
+        "USD SOFR", tenor, 0.0415, NOTIONAL, kind=kind, forward_start=fwd, spread=-0.0005, trade_date=EXAMPLE_ASOF
+    )
     pay = replace(rec, receive_fixed=False)
     assert pay.pv(market) == pytest.approx(-rec.pv(market), rel=1e-13)
     np.testing.assert_allclose(pay.cashflows(market)["amount"], -rec.cashflows(market)["amount"], rtol=1e-13)
@@ -311,8 +322,13 @@ def test_par_rates_reprice_the_curve_quotes():
     for quote in market.curve.quotes:
         if quote.kind == "OIS":
             assert par_swap_rate(market, quote.tenor) == pytest.approx(quote.rate, abs=1e-14)
-    irs_quotes = [CurveQuote("DEPO", "3M", 0.041), CurveQuote("IRS", "2Y", 0.0385), CurveQuote("IRS", "5Y", 0.038),
-                  CurveQuote("IRS", "10Y", 0.0392), CurveQuote("IRS", "30Y", 0.0401)]
+    irs_quotes = [
+        CurveQuote("DEPO", "3M", 0.041),
+        CurveQuote("IRS", "2Y", 0.0385),
+        CurveQuote("IRS", "5Y", 0.038),
+        CurveQuote("IRS", "10Y", 0.0392),
+        CurveQuote("IRS", "30Y", 0.0401),
+    ]
     irs = Market(curve=bootstrap(EXAMPLE_ASOF, irs_quotes, "USD SOFR"))
     for quote in irs_quotes[1:]:
         assert par_swap_rate(irs, quote.tenor, kind="IRS") == pytest.approx(quote.rate, abs=1e-14)
@@ -389,8 +405,12 @@ def test_spot_irs_first_period_fixes_on_the_trade_date(conv):
     swap's first rate is not a past fixing: a par IRS on an IRS-built curve
     has PV01 = -annuity and loads only on its own quote."""
 
-    quotes = [CurveQuote("DEPO", "6M", 0.045), CurveQuote("IRS", "2Y", 0.041), CurveQuote("IRS", "5Y", 0.039),
-              CurveQuote("IRS", "10Y", 0.040)]
+    quotes = [
+        CurveQuote("DEPO", "6M", 0.045),
+        CurveQuote("IRS", "2Y", 0.041),
+        CurveQuote("IRS", "5Y", 0.039),
+        CurveQuote("IRS", "10Y", 0.040),
+    ]
     market = Market(curve=bootstrap(EXAMPLE_ASOF, quotes, conv))
     swap = VanillaSwap.from_conventions(conv, "5Y", 0.0, NOTIONAL, kind="IRS", trade_date=EXAMPLE_ASOF)
     swap = replace(swap, fixed_rate=swap.par_rate(market))
@@ -405,8 +425,9 @@ def test_spot_irs_first_period_fixes_on_the_trade_date(conv):
 @pytest.mark.parametrize("kind,tenor,fwd", [("OIS", "10Y", None), ("OIS", "8Y", "2Y"), ("IRS", "12Y", None)])
 def test_key_rate_ladder_sums_to_parallel_pv01(kind, tenor, fwd):
     market = _market()
-    swap = VanillaSwap.from_conventions("USD SOFR", tenor, 0.041, NOTIONAL, receive_fixed=False, kind=kind,
-                                        forward_start=fwd, trade_date=EXAMPLE_ASOF)
+    swap = VanillaSwap.from_conventions(
+        "USD SOFR", tenor, 0.041, NOTIONAL, receive_fixed=False, kind=kind, forward_start=fwd, trade_date=EXAMPLE_ASOF
+    )
     rows = key_rate_pv01(swap.pv, market)
     total = parallel_pv01(swap.pv, market)
     assert total > 0  # payer gains when rates rise
@@ -420,8 +441,9 @@ def test_key_rate_ladder_sums_to_parallel_pv01(kind, tenor, fwd):
     "swap",
     [
         VanillaSwap.from_conventions("USD SOFR", "10Y", 0.0425, 5e7, trade_date=EXAMPLE_ASOF),
-        VanillaSwap.from_conventions("USD SOFR", "8Y", 0.031, 2e7, receive_fixed=False, forward_start="2Y",
-                                     trade_date=EXAMPLE_ASOF),
+        VanillaSwap.from_conventions(
+            "USD SOFR", "8Y", 0.031, 2e7, receive_fixed=False, forward_start="2Y", trade_date=EXAMPLE_ASOF
+        ),
         VanillaSwap.from_conventions("USD SOFR", "25Y", 0.039, 1e7, forward_start="5Y", trade_date=EXAMPLE_ASOF),
     ],
     ids=["10Y", "2Yx8Y", "5Yx25Y"],
@@ -451,13 +473,17 @@ def test_benchmark_hedge_flattens_the_ladder(swap):
 
 def test_curve_bumps_are_reusable_and_match_the_sensitivities():
     market = _market()
-    swaps = [VanillaSwap.from_conventions("USD SOFR", t, 0.038, NOTIONAL, kind=k, trade_date=EXAMPLE_ASOF)
-             for t, k in (("7Y", "OIS"), ("12Y", "IRS"))]
+    swaps = [
+        VanillaSwap.from_conventions("USD SOFR", t, 0.038, NOTIONAL, kind=k, trade_date=EXAMPLE_ASOF)
+        for t, k in (("7Y", "OIS"), ("12Y", "IRS"))
+    ]
     bumps = curve_bumps(market)
     for swap in swaps:
         assert bumps.parallel_pv01(swap.pv) == parallel_pv01(swap.pv, market)
-    np.testing.assert_array_equal(bumps.key_rate_matrix([s.pv for s in swaps]),
-                                  np.column_stack([ladder(key_rate_pv01(s.pv, market)) for s in swaps]))
+    np.testing.assert_array_equal(
+        bumps.key_rate_matrix([s.pv for s in swaps]),
+        np.column_stack([ladder(key_rate_pv01(s.pv, market)) for s in swaps]),
+    )
     position = swap_position(swaps[0])
     shared = hedge_with_benchmarks(position, market, bumps=bumps)
     assert shared["ladder"] == hedge_with_benchmarks(position, market)["ladder"]
@@ -516,8 +542,9 @@ def _forward_curve(curve: Curve, asof: dt.date) -> Curve:
 @pytest.mark.parametrize("horizon", [dt.date(2027, 2, 17), dt.date(2028, 1, 18), dt.date(2029, 6, 1)])
 def test_seasoned_swap_rolls_forward_consistently(kind, horizon):
     m0 = _market()
-    swap = VanillaSwap.from_conventions("USD SOFR", "5Y", 0.0372, NOTIONAL, kind=kind, spread=0.001,
-                                        trade_date=EXAMPLE_ASOF)
+    swap = VanillaSwap.from_conventions(
+        "USD SOFR", "5Y", 0.0372, NOTIONAL, kind=kind, spread=0.001, trade_date=EXAMPLE_ASOF
+    )
     m1 = Market(curve=_forward_curve(m0.curve, horizon), fixings=m0.curve)
     assert swap.schedule_dates(horizon) == swap.schedule_dates(EXAMPLE_ASOF)
     flows0 = swap.cashflows(m0)

@@ -466,9 +466,7 @@ def vegas(positions: Sequence[Position], market: Market) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 
-def _revalue(
-    positions: Sequence[Position], market: Market, moved: Market
-) -> Tuple[np.ndarray, np.ndarray]:
+def _revalue(positions: Sequence[Position], market: Market, moved: Market) -> Tuple[np.ndarray, np.ndarray]:
     """(PV on ``moved``, cash each position pays between the two dates)."""
 
     pv = _pvs(positions, moved)
@@ -513,12 +511,7 @@ def run_scenario(
     for which, b in bumps.items():
         moved = np.flatnonzero(b)
         qr = (risk or {}).get(which)
-        if (
-            qr is None
-            or qr.asof != rolled.asof
-            or qr.pv01.shape != (len(b), n)
-            or not qr.computed[moved].all()
-        ):
+        if qr is None or qr.asof != rolled.asof or qr.pv01.shape != (len(b), n) or not qr.computed[moved].all():
             qr = quote_risk(positions, rolled, which, indices=moved, base=rolled_pv)
         delta += b @ qr.pv01
         gamma += 0.5 * (b * b) @ qr.gamma

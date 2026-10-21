@@ -24,7 +24,7 @@ mode = st.sidebar.radio(
     "MODE",
     ["[ EQUITY ]", "[ FX ]", "[ RATES ]", "[ ANALYTICS ]"],
     format_func=lambda x: x,
-    label_visibility="collapsed"
+    label_visibility="collapsed",
 )
 mode = mode.replace("[", "").replace("]", "").strip()  # Extract mode name
 

@@ -22,6 +22,7 @@ business day, as in QuantLib).
 Every value is in currency for the swap's notional and signed to the holder:
 a receiver swap gains when rates fall, so its PV01 is negative.
 """
+
 from __future__ import annotations
 
 import datetime as dt
