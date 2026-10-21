@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -238,6 +239,26 @@ def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
     )
     assert not any("without FX conversion" in w.value for w in at.warning)
     _assert_bounded(at)
+
+    # EURUSD +10% on SCENARIOS: no local amount moves; the converted total gains the euro positions'
+    # translation, shown as the explain's FX column (ALL IN row only) and an FX bar of the waterfall.
+    at.number_input(key="scn_fx_eurusd").set_value(10.0).run()
+    assert not at.exception and not at.error, [e.value for e in at.error]
+    shocked = next(d.value for d in at.dataframe if "TOTAL P&L" in d.value.columns).set_index("POSITION")
+    fx = next(c for c in shocked.columns if str(c).startswith("FX"))
+    for ccy in ("TOTAL EUR", "TOTAL USD"):
+        assert shocked.loc[ccy, "TOTAL P&L"] == pytest.approx(rows.loc[ccy, "TOTAL P&L"], rel=1e-12, abs=1e-9)
+        assert math.isnan(shocked.loc[ccy, fx])
+    translation = shocked.loc["ALL IN USD", fx]
+    assert abs(translation) > 1.0
+    assert shocked.loc["ALL IN USD", "TOTAL P&L"] == pytest.approx(
+        rows.loc["TOTAL USD", "TOTAL P&L"] + rows.loc["TOTAL EUR", "TOTAL P&L"] * eurusd + translation, rel=1e-10
+    )
+    assert float(_metric(at, "TOTAL P&L (IN $)").replace(",", "")) == pytest.approx(
+        shocked.loc["ALL IN USD", "TOTAL P&L"], abs=0.006
+    )
+    assert "FX" in _chart(at, "scn_waterfall")["data"][0]["x"]
+    assert any("FX = the FX shock's translation" in c.value for c in at.caption)
 
 
 def test_estr_compounded_cap_on_the_eur_curve_set(eur):
