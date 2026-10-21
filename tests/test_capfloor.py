@@ -594,7 +594,9 @@ def test_tab_renders_and_returns_the_position():
     assert not at.error
     pv = float(at.metric[0].value.replace(",", ""))
     assert pv == pytest.approx(positions[0].pv(example_market()), abs=0.01)
-    assert len(at.get("plotly_chart")) == 3 and len(at.get("download_button")) == 2  # strip, vega, ladder
+    assert len(at.get("plotly_chart")) == 3  # strip, vega, ladder
+    downloads = [b.proto.id.rsplit("-", 1)[-1] for b in at.get("download_button")]
+    assert downloads == ["cap_caplets_csv", "cap_ladder_csv", "cap_export_zip", "cap_export_manifest"]
     assert not at.warning
     labels = [m.label for m in at.metric]
     assert {"GAMMA (/BP²)", "THETA (1 BUS. DAY)", "VEGA (/1BP)", "PV01 (/BP)"} <= set(labels)
