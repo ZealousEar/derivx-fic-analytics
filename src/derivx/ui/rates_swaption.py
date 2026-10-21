@@ -43,6 +43,7 @@ from derivx.risk.scenarios import theta
 from derivx.risk.sensitivities import Position, rate_pv01_gamma
 from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
+from derivx.ui.state import data_editor as persistent_editor  # edits survive mode switches (UIE-04)
 from derivx.ui.theme import (
     ACCENT,
     CELL_TEXT,
@@ -157,7 +158,7 @@ def _quotes_expander(currency: str) -> Tuple[Optional[VolGrid], List[str]]:
             + (f" of lognormal vol on F + {base.shift:.2%}" if base.vol_type == "lognormal" else " of normal vol")
             + ". Edit cells to change the quotes."
         )
-        edited = st.data_editor(
+        edited = persistent_editor(
             table, hide_index=True, width="stretch", key=f"swn_grid_{currency}_{digest}", disabled=["expiry", "tenor"]
         )
     if edited.equals(table):
