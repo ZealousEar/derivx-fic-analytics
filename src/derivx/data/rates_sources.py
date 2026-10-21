@@ -457,6 +457,16 @@ def parse_fred_json(text: str, sid: str, units: Optional[Mapping[str, str]] = No
     return long_frame(dates, "FRED", [sid] * n, [tenor] * n, values, [unit] * n, [measure] * n, [dataset] * n)
 
 
+def fred_api_key() -> str:
+    """The FRED API key from ``FRED_API_KEY``, or "" if unset.
+
+    Surrounding whitespace and quotes are dropped, so a key pasted as
+    ``"abc..."`` into an environment-variable form still works.
+    """
+
+    return os.environ.get(FRED_KEY_ENV, "").strip().strip("\"'").strip()
+
+
 def fred_series(
     ids: Sequence[str],
     start: Optional[dt.date] = None,
@@ -483,7 +493,7 @@ def fred_series(
         raise ValueError("give at least one FRED series id, e.g. DGS10")
     if start and end and end < start:
         raise ValueError(f"end {end} is before start {start}")
-    key = os.environ.get(FRED_KEY_ENV, "").strip()
+    key = fred_api_key()
     if vintage is not None and not key:
         raise ValueError(f"FRED vintages (ALFRED) need a free API key in ${FRED_KEY_ENV}")
     params = {"ids": ids, "start": _iso(start), "end": _iso(end), "vintage": _iso(vintage), "units": dict(units or {})}

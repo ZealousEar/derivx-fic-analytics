@@ -337,6 +337,14 @@ def test_fred_api_key_is_used_but_never_stored(serve, tmp_path, monkeypatch):
         rs.fred_series(["DGS10"], vintage=D("2026-10-20"), offline=False, cache=cache)
 
 
+@pytest.mark.parametrize("raw", ['"abc123"', "'abc123'", "  abc123\n", ' "abc123" '])
+def test_fred_api_key_ignores_quotes_and_whitespace(monkeypatch, raw):
+    monkeypatch.setenv("FRED_API_KEY", raw)
+    assert rs.fred_api_key() == "abc123"
+    monkeypatch.setenv("FRED_API_KEY", '""')
+    assert rs.fred_api_key() == ""  # an empty quoted value means no key
+
+
 def test_missing_fred_series_are_reported(serve, tmp_path):
     serve({"fredgraph.csv": [fixture("fred_ust.csv")]})
     got = rs.fred_series(["DGS10", "NOPE"], D("2026-10-13"), offline=False, cache=DiskCache(tmp_path))
