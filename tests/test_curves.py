@@ -1,8 +1,10 @@
 import datetime as dt
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from derivx.data.ingestion import load_rates_quotes_from_csv
 from derivx.rates.curves import CurveQuote, Market, bill_bey, bill_price, bootstrap, flat_curve
 from derivx.rates.examples import EXAMPLE_ASOF, example_curve, ust_curve
 from derivx.rates.quotes import clean_quotes, detect_units
@@ -116,3 +118,93 @@ def test_legacy_build_zero_curve_now_reprices_its_quotes():
         build_zero_curve({"1W": 0.0512, "2Y": 5.3, "5Y": 0.055})
     with pytest.raises(ValueError, match="tenor"):
         build_zero_curve({"1Q": 0.05})
+
+
+BUNDLED_QUOTES = Path(__file__).resolve().parents[1] / "data" / "examples" / "rates_quotes.csv"
+
+
+def test_library_path_builds_the_bundled_csv_with_its_instruments(golden):
+    """RC-11: the library loader kept {tenor: rate}, dropping the instrument
+    column, and build_zero_curve priced every row as OIS (and could not read
+    the file's decimals at all: auto units refused them). The IRS rows are
+    now single-curve swaps, and the curve matches QuantLib's bootstrap of
+    OIS + swap rate helpers."""
+
+    quotes = load_rates_quotes_from_csv(str(BUNDLED_QUOTES))
+    assert [q.kind for q in quotes] == ["OIS", "OIS", "IRS", "IRS", "IRS"]
+    curve = build_zero_curve(quotes, asof=EXAMPLE_ASOF)
+    assert [q.kind for q in curve.quotes] == ["OIS", "OIS", "IRS", "IRS", "IRS"]
+    assert max(abs(r["error_bp"]) for r in curve.repricing()) < 1e-8
+    (case,) = [c for c in golden("curves")["cases"] if c.get("source") == "data/examples/rates_quotes.csv"]
+    worst_bp = max(abs(curve.zero_rate(D(day)) - z) for day, z in case["zeros"]) * 1e4
+    assert worst_bp < 1e-6
+    # The same rates as OIS give another curve: the instrument column matters.
+    as_ois = build_zero_curve({q.tenor: q.rate for q in quotes}, asof=EXAMPLE_ASOF, units="decimal")
+    assert abs(as_ois.zero_rate(5.0) - curve.zero_rate(5.0)) * 1e4 > 0.2
+    # Rows with an instrument key are honoured the same way; unknown instruments are refused.
+    rows = [{"instrument": q.kind, "tenor": q.tenor, "rate": q.rate} for q in quotes]
+    assert build_zero_curve(rows, asof=EXAMPLE_ASOF, units="decimal").zero_rate(5.0) == pytest.approx(
+        curve.zero_rate(5.0), abs=1e-14
+    )
+    with pytest.raises(ValueError, match="BANANA"):
+        build_zero_curve([dict(rows[0], instrument="BANANA"), *rows[1:]], asof=EXAMPLE_ASOF, units="decimal")
+
+
+def test_build_zero_curve_units_argument():
+    decimals = {"1W": 0.0512, "1M": 0.052, "2Y": 0.053, "5Y": 0.055, "10Y": 0.056}
+    with pytest.raises(ValueError, match="units='decimal'"):  # 0.053 reads as 5.3% or 0.053%: auto refuses
+        build_zero_curve(decimals, asof=EXAMPLE_ASOF)
+    curve = build_zero_curve(decimals, asof=EXAMPLE_ASOF, units="decimal")
+    for units, scale in (("percent", 100.0), ("bp", 1e4)):
+        other = build_zero_curve({t: r * scale for t, r in decimals.items()}, asof=EXAMPLE_ASOF, units=units)
+        assert other.zero_rate(10.0) == pytest.approx(curve.zero_rate(10.0), abs=1e-14)
+    with pytest.raises(ValueError, match="outside"):  # percent read as decimals is refused, not built
+        build_zero_curve({t: r * 100 for t, r in decimals.items()}, asof=EXAMPLE_ASOF, units="decimal")
+    with pytest.raises(ValueError, match="units must be"):
+        build_zero_curve(decimals, asof=EXAMPLE_ASOF, units="percnt")
+    with pytest.raises(ValueError, match="CurveQuote rates are decimals"):
+        build_zero_curve([CurveQuote("OIS", "1Y", 0.05)], asof=EXAMPLE_ASOF, units="percent")
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"day_count": "BOGUS"}, "not a day count"),
+        ({"day_count": "30/360"}, "cannot be applied"),
+        ({"day_count": "ACT/360"}, "time axis is ACT/365F"),
+        ({"compounding": "weird"}, "unknown"),
+        ({"compounding": "simple"}, r"curve.zero_rate\(t, compounding"),
+    ],
+)
+def test_build_zero_curve_refuses_conventions_it_cannot_apply(kwargs, message):
+    """RC-12: day_count and compounding were accepted and ignored, invalid
+    values included ('BOGUS' built the same curve as the defaults)."""
+
+    with pytest.raises(ValueError, match=message):
+        build_zero_curve({"1Y": 4.0, "5Y": 4.2}, asof=EXAMPLE_ASOF, **kwargs)
+
+
+def test_build_zero_curve_accepts_the_curves_own_conventions():
+    base = build_zero_curve({"1Y": 4.0, "5Y": 4.2}, asof=EXAMPLE_ASOF)
+    for day_count, compounding in (("ACT/365F", "continuous"), ("act/365", "CONT"), (None, None)):
+        same = build_zero_curve({"1Y": 4.0, "5Y": 4.2}, day_count, compounding, asof=EXAMPLE_ASOF)
+        assert same.zero_rate(3.0) == base.zero_rate(3.0)
+
+
+def test_rates_csv_loader_honours_instruments_and_units(tmp_path):
+    path = tmp_path / "pct.csv"
+    path.write_text("instrument,tenor,rate\nDEPO,ON,5.10\nOIS,1Y,5.00\nIRS,5Y,4.80\n")
+    with pytest.raises(ValueError, match="outside"):  # the default is decimals: 5.10 would be 510%
+        load_rates_quotes_from_csv(str(path))
+    quotes = load_rates_quotes_from_csv(str(path), units="percent")
+    assert [(q.kind, q.tenor, q.rate) for q in quotes] == [
+        ("DEPO", "ON", pytest.approx(0.051)), ("OIS", "1Y", pytest.approx(0.05)), ("IRS", "5Y", pytest.approx(0.048))
+    ]  # fmt: skip
+    bad = tmp_path / "bad.csv"
+    bad.write_text("instrument,tenor,rate\nBANANA,1Y,0.05\nOIS,2Y,0.05\n")
+    with pytest.raises(ValueError, match="row 1: instrument 'BANANA'"):
+        load_rates_quotes_from_csv(str(bad))
+    two = tmp_path / "two.csv"
+    two.write_text("curve,instrument,tenor,rate\nEUR ESTR,OIS,1Y,0.02\nEURIBOR 6M,IRS,2Y,0.022\n")
+    with pytest.raises(ValueError, match="load_curve_quotes_from_csv"):
+        load_rates_quotes_from_csv(str(two))

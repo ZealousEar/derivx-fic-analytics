@@ -1,13 +1,16 @@
 """QuantLib bootstraps of the same quotes derivx bootstraps
 (tests/test_curves.py): OIS curves in three currencies, a single-curve IRS
-curve and the Treasury bill/par-bond curve."""
+curve, the bundled data/examples/rates_quotes.csv (OIS and IRS rows on one
+curve) and the Treasury bill/par-bond curve."""
 
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import QuantLib as ql
 
+from derivx.data.ingestion import load_rates_quotes_from_csv
 from derivx.rates.curves import CurveQuote, bill_price, bootstrap
 from derivx.rates.examples import EXAMPLE_ASOF, sofr_example_rows, ust_par_rows
 from derivx.rates.quotes import clean_quotes
@@ -40,6 +43,39 @@ def _zeros(curve, asof: dt.date) -> list:
     ]
 
 
+BUNDLED_CSV = Path(__file__).resolve().parents[2] / "data" / "examples" / "rates_quotes.csv"
+
+
+def _term3m_index(cal: ql.Calendar) -> ql.IborIndex:
+    """The generic single-curve 3M index of a derivx ``IRS`` float leg."""
+
+    return ql.IborIndex(
+        "TERM3M",
+        ql.Period(3, ql.Months),
+        2,
+        ql.USDCurrency(),
+        cal,
+        ql.ModifiedFollowing,
+        False,
+        ql.Actual360(),
+        ql.RelinkableYieldTermStructureHandle(),
+    )
+
+
+def _irs_helper(quote: ql.QuoteHandle, tenor: str, cal: ql.Calendar) -> ql.SwapRateHelper:
+    """USD single-curve IRS: 6M 30/360 fixed against the 3M index."""
+
+    return ql.SwapRateHelper(
+        quote,
+        ql.Period(tenor),
+        cal,
+        ql.Semiannual,
+        ql.ModifiedFollowing,
+        ql.Thirty360(ql.Thirty360.BondBasis),
+        _term3m_index(cal),
+    )
+
+
 def _ois_case(conv: str, interp: str, quotes: list) -> dict:
     index_cls, cal, spot, lag, _ = OIS_SETUPS[conv]
     handle = ql.RelinkableYieldTermStructureHandle()
@@ -47,7 +83,9 @@ def _ois_case(conv: str, interp: str, quotes: list) -> dict:
     helpers = []
     for q in quotes:
         quote = ql.QuoteHandle(ql.SimpleQuote(q.rate))
-        if q.kind == "DEPO":
+        if q.kind == "IRS":
+            helpers.append(_irs_helper(quote, q.tenor, cal))
+        elif q.kind == "DEPO":
             helpers.append(
                 ql.DepositRateHelper(
                     quote, ql.Period(q.tenor), spot, cal, ql.ModifiedFollowing, False, index.dayCounter()
@@ -164,6 +202,14 @@ def _ust_case(on=None) -> dict:
     }
 
 
+def _bundled_csv_case() -> dict:
+    """data/examples/rates_quotes.csv as the library loader reads it: OIS rows
+    on SOFR OIS helpers and IRS rows on single-curve swap helpers, one curve."""
+
+    case = _ois_case("USD SOFR", "loglinear", load_rates_quotes_from_csv(str(BUNDLED_CSV)))
+    return {**case, "source": "data/examples/rates_quotes.csv"}
+
+
 def generate() -> dict:
     set_evaluation_date(EXAMPLE_ASOF)
     sofr, _, _ = clean_quotes(sofr_example_rows())
@@ -173,6 +219,7 @@ def generate() -> dict:
         for interp in CURVE_CLASS:
             cases.append(_ois_case(conv, interp, quotes))
     cases.append(_irs_case())
+    cases.append(_bundled_csv_case())
     set_evaluation_date(EXAMPLE_ASOF)
     cases.append(_ust_case())
     cases.append(_ust_case(dt.date(2026, 8, 28)))  # spot on Aug 31: month-end coupon dates
