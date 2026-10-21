@@ -31,9 +31,15 @@ import streamlit as st
 
 from derivx.data import rates_history as rh
 from derivx.data.rates_history import HistoryStore
-from derivx.rates.conventions import parse_tenor
-from derivx.rates.curves import CONVENTIONS
-from derivx.rates.examples import EXAMPLE_ASOF, sofr_example_rows
+from derivx.rates.prefill import (  # noqa: F401  (re-exported: the Rates tabs and tests use them from here)
+    FIXING_LABELS,
+    ILLUSTRATIVE,
+    PROXY_DATASET,
+    REAL_DATASET,
+    SHORT_CURVE_YEARS,
+    QuotePrefill,
+    swap_prefill,
+)
 
 MODES = ("BUNDLED SNAPSHOT", "LIVE (CACHED)", "UPLOAD")
 LIVE_MAX_AGE = 3600.0  # seconds a download is reused before it is fetched again
@@ -42,18 +48,7 @@ UPLOAD_KEY = "rates_uploaded_quotes"
 TREASURY_UPLOAD_KEY = "rates_uploaded_treasury"
 STORE_KEY = "rates_store"
 BADGE_KEY = "rates_badges"
-ILLUSTRATIVE = "ILLUSTRATIVE (not market data)"
 SWAP_KINDS = ("DEPO", "OIS", "IRS")
-FIXING_LABELS = {
-    "SOFR": "SOFR (NY Fed)",
-    "EFFR": "EFFR (NY Fed)",
-    "OBFR": "OBFR (NY Fed)",
-    "ESTR": "ESTR (ECB)",
-    "SONIA": "SONIA (Bank of England via FRED)",
-}
-PROXY_DATASET = {"EUR": "EUR_AAA_ECB"}  # zero curves used as labelled proxies where no OIS curve is free
-REAL_DATASET = {"GBP": "GBP_OIS_BOE"}  # real OIS curves
-SHORT_CURVE_YEARS = 10.0  # a prefilled curve ending before this says that the rest is extrapolated
 
 
 @dataclass
@@ -65,19 +60,6 @@ class RatesData:
     store: HistoryStore
     notices: List[Tuple[str, str]] = field(default_factory=list)
     uploaded: Optional[Dict[str, object]] = None
-
-
-@dataclass(frozen=True)
-class QuotePrefill:
-    """Swap quotes to start the editor from: ``table`` has ``instrument``,
-    ``tenor``, ``rate`` (percent) and ``source`` (per row). ``kind`` is
-    ``real``, ``proxy``, ``illustrative`` or ``upload``."""
-
-    table: pd.DataFrame
-    label: str
-    kind: str
-    key: str
-    notes: Tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -313,84 +295,6 @@ def active_store() -> HistoryStore:
 # --------------------------------------------------------------------------
 # Quote prefill
 # --------------------------------------------------------------------------
-
-
-def _percent(rate: float) -> float:
-    return round(100.0 * rate, 6)
-
-
-def _fixing_row(store: HistoryStore, currency: str, asof: dt.date) -> Tuple[Optional[dict], Optional[str]]:
-    name = rh.CURRENCY_FIXING.get(currency)
-    got = store.fixing(name, asof) if name else None
-    if got is None:
-        return None, None
-    day, rate, _ = got
-    label = f"{FIXING_LABELS.get(name, name)} fixing for {day}"
-    return {"instrument": "DEPO", "tenor": "ON", "rate": _percent(rate), "source": label}, label
-
-
-def _illustrative_rows() -> List[dict]:
-    return [
-        {"instrument": r["kind"], "tenor": r["tenor"], "rate": _percent(r["rate"]), "source": ILLUSTRATIVE}
-        for r in sofr_example_rows()
-    ]
-
-
-def swap_prefill(store: HistoryStore, conventions: str, asof: dt.date) -> QuotePrefill:
-    """Starting quotes for the swap curve on ``asof``: a real OIS curve where
-    one is free (GBP: the Bank of England's fitted SONIA curve as par OIS
-    rates), a labelled proxy for EUR (par OIS rates derived from the ECB AAA
-    government spot curve), otherwise the illustrative SOFR set. The
-    currency's overnight fixing, where the store has one, is the ON quote."""
-
-    currency = CONVENTIONS[conventions].currency
-    fixing, fixing_label = _fixing_row(store, currency, asof)
-    notes: List[str] = []
-    rows: List[dict] = []
-    kind, label = "illustrative", ""
-    dataset = REAL_DATASET.get(currency) or PROXY_DATASET.get(currency)
-    day = store.latest_on_or_before(dataset, asof, "zero_cc") if dataset and store.has(dataset) else None
-    if day is not None:
-        try:
-            par = store.ois_par(dataset, day)
-        except ValueError as exc:
-            par = {}
-            notes.append(f"{rh.dataset_info(dataset).title} on {day} could not be converted ({exc})")
-        if par:
-            info = rh.dataset_info(dataset)
-            kind = "real" if dataset in REAL_DATASET.values() else "proxy"
-            tag = f"{info.title} {day}, par OIS derived"
-            source = tag if kind == "real" else f"PROXY: {tag} (government curve, not OIS quotes)"
-            rows = [{"instrument": "OIS", "tenor": t, "rate": _percent(r), "source": source} for t, r in par.items()]
-            label = source
-            if day != asof:
-                notes.append(f"{info.title}: latest curve on or before {asof} is from {day}")
-            last = list(par)[-1]
-            if parse_tenor(last).years < SHORT_CURVE_YEARS:
-                notes.append(
-                    f"The {info.title} on {day} reaches only {last}: longer rates on this curve are flat-forward "
-                    "extrapolations, not market data."
-                )
-    if not rows:
-        if dataset:
-            notes.append(
-                f"No spot (zero) rates of the {rh.dataset_info(dataset).title} on or before {asof} in the store: "
-                "showing the illustrative USD SOFR set instead"
-            )
-        rows = _illustrative_rows()
-        label = "ILLUSTRATIVE quotes (not market data)"
-        if asof != EXAMPLE_ASOF:
-            notes.append(
-                f"The illustrative quotes are fixed at {EXAMPLE_ASOF} levels: they do not follow the valuation date "
-                f"{asof}. Paste or upload quotes for that date."
-            )
-    if fixing is not None:
-        rows = [r for r in rows if r["tenor"] not in ("ON", "1D")]
-        rows.insert(0, fixing)
-        label = f"{label} + {fixing_label}"
-    table = pd.DataFrame(rows, columns=["instrument", "tenor", "rate", "source"])
-    digest = hashlib.sha1(table.to_csv(index=False).encode()).hexdigest()[:10]
-    return QuotePrefill(table, label, kind, f"{conventions}_{digest}", tuple(notes))
 
 
 def uploaded_prefill(uploaded: Dict[str, object]) -> QuotePrefill:
