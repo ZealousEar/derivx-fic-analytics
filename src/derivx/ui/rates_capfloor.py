@@ -98,19 +98,29 @@ def _strip_chart(table: pd.DataFrame, strike: float, kind: str) -> go.Figure:
     forwards = (table["forward"] * 100).tolist()
     pvs = table["pv"].tolist()
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.55, 0.45],
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        row_heights=[0.55, 0.45],
         subplot_titles=("FORWARD VS STRIKE (%)", f"{kind.upper()}LET PV"),
     )
     fig.add_trace(
         go.Scatter(x=fixes, y=forwards, mode="lines+markers", name="FORWARD", line=dict(color=SERIES[0], width=2)),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
     fig.add_trace(
         go.Scatter(
-            x=fixes, y=[strike * 100] * len(fixes), mode="lines" if len(fixes) > 1 else "markers", name="STRIKE",
-            line=dict(color=ACCENT, width=2, dash="dash"), marker=dict(color=ACCENT, symbol="line-ew-open", size=14),
+            x=fixes,
+            y=[strike * 100] * len(fixes),
+            mode="lines" if len(fixes) > 1 else "markers",
+            name="STRIKE",
+            line=dict(color=ACCENT, width=2, dash="dash"),
+            marker=dict(color=ACCENT, symbol="line-ew-open", size=14),
         ),
-        row=1, col=1,
+        row=1,
+        col=1,
     )
     fig.add_trace(go.Bar(x=fixes, y=pvs, name="PV", marker=dict(color=SERIES[2])), row=2, col=1)
     dark_layout(fig, height=520)
@@ -133,7 +143,9 @@ def _ladder_chart(rows: List[dict]) -> go.Figure:
     values = [r["pv01"] for r in rows]
     fig = go.Figure(
         go.Bar(
-            x=labels, y=values, name="PV01",
+            x=labels,
+            y=values,
+            name="PV01",
             marker=dict(color=[SERIES[0] if v >= 0 else ACCENT for v in values]),
         )
     )
@@ -158,7 +170,12 @@ def render(market: Market) -> List[Position]:
     c1, c2, c3, c4, c5 = st.columns(5)
     kind = c1.radio("TYPE", ["Cap", "Floor"], horizontal=True, key="cap_kind").lower()
     notional = c2.number_input(
-        "NOTIONAL", min_value=1.0, max_value=1e12, value=10_000_000.0, step=1_000_000.0, format="%.0f",
+        "NOTIONAL",
+        min_value=1.0,
+        max_value=1e12,
+        value=10_000_000.0,
+        step=1_000_000.0,
+        format="%.0f",
         key="cap_notional",
     )
     tenor = c3.selectbox("TENOR", TENORS, index=TENORS.index("5Y"), key="cap_tenor")
@@ -173,30 +190,49 @@ def render(market: Market) -> List[Position]:
         )
     else:
         offset_bp = c2.number_input(
-            "ATM OFFSET (BP)", min_value=-1000.0, max_value=1000.0, value=0.0, step=25.0, format="%.1f",
+            "ATM OFFSET (BP)",
+            min_value=-1000.0,
+            max_value=1000.0,
+            value=0.0,
+            step=25.0,
+            format="%.1f",
             key="cap_atm_offset_bp",
         )
     model = MODEL_LABELS[c3.selectbox("MODEL", list(MODEL_LABELS), key="cap_model")]
     shift = 0.0
     if model == "shifted_black":
-        shift = c4.number_input(
-            "SHIFT (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f", key="cap_shift_pct"
-        ) / 100
+        shift = (
+            c4.number_input(
+                "SHIFT (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25, format="%.2f", key="cap_shift_pct"
+            )
+            / 100
+        )
 
     vol_label, vol_unit, vol_top = VOL_UNITS[model]
     vol_mode = st.radio("VOL INPUT", ["Flat", "Term structure"], horizontal=True, key="cap_vol_mode")
     try:
         if vol_mode == "Flat":
-            vol = st.number_input(
-                f"FLAT VOL ({vol_label})", min_value=0.0, max_value=vol_top, value=DEFAULT_FLAT_VOL[model],
-                step=1.0, format="%.2f", key=f"cap_flat_vol_{model}",
-            ) * vol_unit
+            vol = (
+                st.number_input(
+                    f"FLAT VOL ({vol_label})",
+                    min_value=0.0,
+                    max_value=vol_top,
+                    value=DEFAULT_FLAT_VOL[model],
+                    step=1.0,
+                    format="%.2f",
+                    key=f"cap_flat_vol_{model}",
+                )
+                * vol_unit
+            )
         else:
             st.caption("Vol by option expiry (years to fixing), linear in expiry and flat outside the table.")
             vol = _vol_table(model)
         terms = dict(
-            forward_start=None if fwd == "Spot" else fwd, index_months=index_months, day_count=day_count,
-            calendar=calendar, fixing_lag=fixing_lag,
+            forward_start=None if fwd == "Spot" else fwd,
+            index_months=index_months,
+            day_count=day_count,
+            calendar=calendar,
+            fixing_lag=fixing_lag,
         )
         atm = CapFloor(notional, kind, 0.0, tenor, 0.0, **terms).atm_strike(market)
         strike = strike_pct / 100 if strike_mode == "Absolute %" else atm + offset_bp * 1e-4
@@ -241,16 +277,18 @@ def render(market: Market) -> List[Position]:
         st.warning(f"The {kind} pays after the curve's last quote ({pillars[-1]}); forwards beyond it are held flat.")
 
     st.markdown(f"### / {kind.upper()}LETS")
-    st.plotly_chart(
-        _strip_chart(table, strike, kind), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_strip_chart"
-    )
+    st.plotly_chart(_strip_chart(table, strike, kind), width="stretch", config=PLOTLY_2D_CONFIG, key="cap_strip_chart")
     view = _caplet_view(table, model)
     two_dp = st.column_config.NumberColumn(format="%.2f")
     formats = {**CAPLET_FORMATS, **{c: two_dp for c in view.columns if c.startswith(("VOL (", "VEGA ("))}}
     st.dataframe(view, width="stretch", hide_index=True, column_config=formats)
     st.download_button(
-        "DOWNLOAD CAPLETS CSV", view.to_csv(index=False), file_name=f"{kind}lets.csv", mime="text/csv",
-        on_click="ignore", key="cap_caplets_csv",
+        "DOWNLOAD CAPLETS CSV",
+        view.to_csv(index=False),
+        file_name=f"{kind}lets.csv",
+        mime="text/csv",
+        on_click="ignore",
+        key="cap_caplets_csv",
     )
 
     st.markdown("### / KEY-RATE PV01")
@@ -258,8 +296,12 @@ def render(market: Market) -> List[Position]:
     ladder_view = pd.DataFrame({"QUOTE": [r["label"] for r in ladder], "PV01 (/BP)": [r["pv01"] for r in ladder]})
     st.dataframe(ladder_view, width="stretch", hide_index=True, column_config=CAPLET_FORMATS)
     st.download_button(
-        "DOWNLOAD KEY-RATE PV01 CSV", ladder_view.to_csv(index=False), file_name=f"{kind}_key_rate_pv01.csv",
-        mime="text/csv", on_click="ignore", key="cap_ladder_csv",
+        "DOWNLOAD KEY-RATE PV01 CSV",
+        ladder_view.to_csv(index=False),
+        file_name=f"{kind}_key_rate_pv01.csv",
+        mime="text/csv",
+        on_click="ignore",
+        key="cap_ladder_csv",
     )
     st.caption(
         f"P&L for +1bp on one curve quote at a time (central difference, curve rebuilt). Buckets sum to "

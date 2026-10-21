@@ -1,5 +1,6 @@
 """Swap tab of the Rates page: price one vanilla swap, show its cash flows
 and key-rate risk, and size benchmark par swaps that hedge it."""
+
 from __future__ import annotations
 
 import datetime as dt

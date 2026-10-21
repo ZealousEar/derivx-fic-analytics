@@ -96,7 +96,7 @@ def _spot(curve: Curve) -> dt.date:
 def _coupon_days(bond: FixedRateBond, settle: dt.date) -> str:
     if bond.end_of_month:
         return "month ends"
-    ends = sorted({(c.end.month, c.end.day) for c in bond.coupons(settle)[-bond.frequency:]})
+    ends = sorted({(c.end.month, c.end.day) for c in bond.coupons(settle)[-bond.frequency :]})
     return " / ".join(f"{calendar.month_abbr[month]} {day}" for month, day in ends)
 
 

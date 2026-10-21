@@ -69,7 +69,11 @@ CASES: List[Dict[str, object]] = [
     {
         "name": "30/360 annual, short first coupon",
         "bond": {
-            "coupon": 0.061, "maturity": "2034-03-15", "dated": "2026-09-01", "day_count": "30/360", "frequency": 1
+            "coupon": 0.061,
+            "maturity": "2034-03-15",
+            "dated": "2026-09-01",
+            "day_count": "30/360",
+            "frequency": 1,
         },
     },
     {"name": "Sunday maturity", "bond": {"coupon": 0.0425, "maturity": "2037-11-15"}, "street_only": True},
@@ -174,8 +178,9 @@ def _ois_rate(curve: Curve, handle: ql.YieldTermStructureHandle, maturity: dt.da
     ql_cal = CALENDARS[conv.calendar]
     index = ql.OvernightIndex(f"{conv.name} ON", 0, ql.USDCurrency(), ql_cal, dc, handle)
     schedule = ql.Schedule(ql.DateVector([qd(d) for d in dates]))
-    swap = ql.OvernightIndexedSwap(ql.Swap.Payer, 1.0, schedule, 0.0, dc, index, 0.0, conv.payment_lag, ql.Following,
-                                   ql_cal)
+    swap = ql.OvernightIndexedSwap(
+        ql.Swap.Payer, 1.0, schedule, 0.0, dc, index, 0.0, conv.payment_lag, ql.Following, ql_cal
+    )
     swap.setPricingEngine(ql.DiscountingSwapEngine(handle))
     return swap.fairRate()
 
@@ -216,12 +221,21 @@ def _par_yields() -> Dict[str, object]:
     for text in PAR_MATURITIES:
         maturity = dt.date.fromisoformat(text)
         eom = FixedRateBond(0.0, maturity).end_of_month
-        schedule = ql.Schedule(qd(settle), qd(maturity), ql.Period(6, ql.Months), cal, ql.Unadjusted, ql.Unadjusted,
-                               ql.DateGeneration.Backward, eom)
+        schedule = ql.Schedule(
+            qd(settle),
+            qd(maturity),
+            ql.Period(6, ql.Months),
+            cal,
+            ql.Unadjusted,
+            ql.Unadjusted,
+            ql.DateGeneration.Backward,
+            eom,
+        )
         dc = ql.ActualActual(ql.ActualActual.Bond, schedule)
         p0, p1 = (
-            ql.BondFunctions.cleanPrice(ql.FixedRateBond(1, 100.0, schedule, [c], dc, ql.Following),
-                                        handle.currentLink(), qd(settle))
+            ql.BondFunctions.cleanPrice(
+                ql.FixedRateBond(1, 100.0, schedule, [c], dc, ql.Following), handle.currentLink(), qd(settle)
+            )
             for c in (0.0, 0.01)
         )
         rates.append(0.01 * (100.0 - p0) / (p1 - p0))

@@ -156,7 +156,9 @@ def test_random_caps_match_live_quantlib():
         fwd = rng.choice([None, None, "1M", "3M", "1Y", "2Y", "10Y"])
         low = 0.01 if model == "black" else (-0.015 if negative else -0.01)  # above -shift for shifted Black
         terms = dict(
-            index_months=months, day_count=conv.irs_float_day_count, calendar=conv.calendar,
+            index_months=months,
+            day_count=conv.irs_float_day_count,
+            calendar=conv.calendar,
             fixing_lag=conv.spot_lag,
         )
         fixings = None
@@ -166,8 +168,13 @@ def test_random_caps_match_live_quantlib():
             terms.update(start=start, exclude_first=bool(rng.randrange(2)))
         else:
             terms.update(forward_start=fwd)
-        market = _case_market(asof, preset, rng.choice(["loglinear", "linear_zero", "monotone_convex"]),
-                              -0.045 if negative else 0.0, fixings)
+        market = _case_market(
+            asof,
+            preset,
+            rng.choice(["loglinear", "linear_zero", "monotone_convex"]),
+            -0.045 if negative else 0.0,
+            fixings,
+        )
         cf = CapFloor(3e6, rng.choice(["cap", "floor"]), rng.uniform(low, 0.07), tenor, vol, model, shift, **terms)
         if not cf.caplets(market).shape[0]:
             continue
