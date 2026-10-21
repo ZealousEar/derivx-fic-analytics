@@ -246,12 +246,14 @@ def test_swaptions_flow_into_the_scenarios_of_the_full_app():
     at.run()
     at.sidebar.radio[0].set_value("[ RATES ]").run()
     assert not at.exception and not at.error, [e.value for e in at.error]
+    # SCENARIOS runs on the BOOK by default; the trade priced on the SWAPTION tab is one of the TAB TRADES.
+    at.sidebar.radio(key="rates_risk_scope").set_value("TAB TRADES").run()
     at.number_input(key="scn_vol_normal").set_value(10.0).run()
     assert not at.exception and not at.error
     explain = next(d.value for d in at.dataframe if "KIND" in d.value.columns and "VOL ($)" in d.value.columns)
     row = explain[explain["KIND"] == "swaption"].iloc[0]
     assert row["VOL ($)"] > 0 and abs(row["RESIDUAL ($)"]) < 0.02 * abs(row["TOTAL P&L ($)"]) + 1.0
-    grid = next(d.value for d in at.dataframe if "SCENARIO" in d.value.columns)
+    grid = [d.value for d in at.dataframe if "SCENARIO" in d.value.columns][-1]  # the SCENARIOS tab's (after BOOK's)
     assert any(c.startswith("1Yx5Y PAYER") or "PAYER" in c for c in grid.columns)
 
 

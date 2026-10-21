@@ -218,6 +218,7 @@ def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
     assert rate_sum == pytest.approx(pv01, rel=1e-4, abs=0.05)
     assert "basis-spread buckets" in cap_caption
 
+    at.sidebar.radio(key="rates_risk_scope").set_value("TAB TRADES").run()  # the tabs' swap, cap and bond
     at.number_input(key="scn_horizon").set_value(90).run()  # past the DEC26 futures fixing of the 3M curve
     assert not at.exception and not at.error, [e.value for e in at.error]
     assert any("without FX conversion" in w.value for w in at.warning)  # EUR swaps and caps with a USD bond

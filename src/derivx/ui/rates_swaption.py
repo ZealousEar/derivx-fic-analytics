@@ -41,7 +41,7 @@ from derivx.rates.swaptions import Swaption, swaption_position
 from derivx.rates.vol_examples import illustrative_swaption_grid
 from derivx.risk.scenarios import theta
 from derivx.risk.sensitivities import Position, rate_pv01_gamma
-from derivx.ui import rates_data, rates_risk
+from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -53,6 +53,7 @@ TENORS = ("1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "30Y")
 VOL_UNITS = {"bachelier": ("BP", 1e-4, 1000.0), "black": ("%", 0.01, 300.0), "shifted_black": ("%", 0.01, 300.0)}
 DEFAULT_FLAT = {"bachelier": 95.0, "black": 28.0, "shifted_black": 16.0}
 GRID_KEY = "swn_user_grid"  # session state: {currency: {"name", "sha", "grid"}}
+BOOK_VOLS_KEY = "_swn_book_vols"  # session state: the quotes and SABR settings in use, for the BOOK tab
 SMILE_OFFSETS_BP = np.linspace(-250.0, 250.0, 101)
 MONEY = st.column_config.NumberColumn(format="%,.2f")
 
@@ -194,6 +195,29 @@ def _cube(
     flat = tuple((p.expiry, p.tenor, p.expiry_years, p.tenor_years, p.forward, p.annuity) for p in points)
     with st.spinner("Calibrating SABR at every expiry x tenor..."):
         return _calibrated(grid.rows, grid.vol_type, grid.shift, grid.source, flat, fit, beta, shift, weights, index)
+
+
+def book_cube(market: Market, key: str) -> Tuple[SwaptionVolCube, str, tuple]:
+    """The SABR cube the BOOK prices swaptions without a flat vol on, for
+    underlying ``key`` (``"OIS"`` or a term index): this tab's vol quotes
+    and SABR settings (the illustrative grid and default settings before
+    the tab has run). Returns (cube, quotes source, cache key); raises
+    ValueError if this tab's quotes have errors or the cube cannot be
+    calibrated."""
+
+    currency = _currency(market)
+    state = st.session_state.get(BOOK_VOLS_KEY)
+    if state is not None and state.get("currency") == currency and state.get("error"):
+        raise ValueError(state["error"] + ": fix them or give the swaptions a flat vol")
+    if state is None or state.get("currency") != currency:
+        mine = st.session_state.get(GRID_KEY, {}).get(currency)
+        grid = mine["grid"] if mine else illustrative_swaption_grid(currency)
+        fit, beta, shift, weights = "normal", DEFAULT_BETA["normal"], DEFAULT_SHIFT, None
+    else:
+        grid, fit, beta, shift, weights = state["grid"], state["fit"], state["beta"], state["shift"], state["weights"]
+    index = None if key == "OIS" else key
+    cube = _cube(grid, market, index, fit, beta, shift, weights)
+    return cube, grid.source, (grid.rows, grid.vol_type, grid.shift, fit, beta, shift, weights, index)
 
 
 # --------------------------------------------------------------------------
@@ -437,8 +461,11 @@ def render(market: Market) -> List[Position]:
     for message in messages:
         (st.caption if "fewer than" in message else st.error)(message)
     if grid is None:
+        st.session_state[BOOK_VOLS_KEY] = {"currency": currency, "error": "the SWAPTION tab's vol quotes have errors"}
         st.error("Fix the vol quotes above to price swaptions.")
         return []
+    st.session_state[BOOK_VOLS_KEY] = {"currency": currency, "grid": grid, "fit": ui["fit"], "beta": ui["beta"],
+                                       "shift": ui["sabr_shift"], "weights": ui["weights"]}  # fmt: skip
     try:
         cube = _cube(grid, market, ui["index"], ui["fit"], ui["beta"], ui["sabr_shift"], ui["weights"])
         probe = Swaption(1.0, ui["expiry"], ui["tenor"], 0.0, index=ui["index"])
@@ -616,6 +643,7 @@ def render(market: Market) -> List[Position]:
         "linearly in expiry and linearly in tenor; flat vol outside the grid."
     )
 
+    buckets = None
     if ui["flat"] is None:
         st.markdown(f"### / VEGA BY EXPIRY x TENOR ({c} PER +1BP NORMAL)")
         buckets = rates_risk.cached(
@@ -667,4 +695,22 @@ def render(market: Market) -> List[Position]:
             "paid for the option; the solver works on the out-of-the-money side, so deep in-the-money "
             "premiums keep their digits."
         )
+    tables = {"swaption": pd.DataFrame([{"label": trade.label, **{k: v for k, v in g.items()},
+                                         "pv01_curve": risk["pv01"], "theta_1d": risk["theta"]}]),
+              "sabr_calibration": table, "vol_quotes": grid.frame(), "atm_normal_bp": pd.DataFrame(
+                  cube.atm_normal * 1e4, index=list(cube.expiries), columns=list(cube.tenors)).rename_axis(
+                  "expiry").reset_index()}  # fmt: skip
+    if buckets is not None:
+        tables["vega_buckets"] = pd.DataFrame(buckets, index=list(cube.expiries), columns=list(cube.tenors)
+                                              ).rename_axis("expiry").reset_index()  # fmt: skip
+    rates_exports.export_row(
+        "swaption", market, tables,
+        {"trade": {"notional": trade.notional, "expiry": trade.expiry, "tenor": trade.tenor, "strike": trade.strike,
+                   "kind": trade.kind, "model": trade.model, "shift": trade.shift, "index": trade.index,
+                   "vol": trade.vol, "vol_source": "flat" if ui["flat"] is not None else "SABR cube"},
+         "vol_quotes_source": grid.source},
+        {"sabr_fit": ui["fit"], "beta": ui["beta"], "sabr_shift": ui["sabr_shift"], "weights": ui["weights"],
+         "atm_interpolation": "variance-time in expiry, linear in tenor", "greeks": "analytic in the trade's model"},
+        key="swn_export",
+    )  # fmt: skip
     return [swaption_position(trade, market)]

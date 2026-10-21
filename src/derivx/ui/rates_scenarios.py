@@ -43,6 +43,7 @@ from derivx.risk.scenarios import (
     key_rates,
     parallel,
     pca_factor,
+    pca_library,
     quote_risk,
     run_scenario,
     scenario_grid,
@@ -52,7 +53,7 @@ from derivx.risk.scenarios import (
     twist,
 )
 from derivx.risk.sensitivities import Position
-from derivx.ui import rates_data, rates_risk
+from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -538,6 +539,57 @@ def _explain_table(rows: List[Dict[str, object]], c: str = "$") -> pd.DataFrame:
     return frame[list(labels)].rename(columns=labels)
 
 
+def scenario_library(market: Market, store: rh.HistoryStore) -> Tuple[List[Shock], List[str]]:
+    """The scenario grid's shocks: :func:`standard_library` (parallel, 2s10s
+    twists, 2s5s10s fly, historical episodes), the IBOR-OIS and tenor basis
+    shocks on a multi-curve market, and +/-2 sd one-day moves of PC1-PC3 of
+    the daily US Treasury changes up to the valuation date. Shocks leave the
+    Treasury curve alone when the market has none. Returns (shocks, notes
+    on any left out)."""
+
+    library = standard_library(store)
+    notes: List[str] = []
+    if market.is_multi_curve:
+        library += [ibor_ois_basis(10.0), tenor_basis(5.0)]
+    try:
+        library += pca_library(store, end=market.asof)
+    except ValueError as exc:
+        notes.append(f"PCA shocks: {exc}")
+    if not _has_quotes(market.govt):
+        library = [replace(s, govt=False) for s in library]
+    return library, notes
+
+
+def seed_risk(positions: Sequence[Position], market: Market, risk: Mapping[str, QuoteRisk]) -> None:
+    """Hand key-rate risk measured elsewhere (the BOOK tab's, from the same
+    bumped curves) to this tab's cache, so the P&L explain and the RESEARCH
+    tab's VaR do not bump the curves again for the same positions."""
+
+    key = (_market_key(market), _positions_key(positions, market))
+    for which, qr in risk.items():
+        if qr.asof != market.asof or qr.pv01.shape[1] != len(positions):
+            continue
+        entries = st.session_state.setdefault(f"scn_cache_risk_{which}", {})
+        if (key, 0) not in entries:
+            if len(entries) >= CACHE_ENTRIES:
+                entries.pop(next(iter(entries)))
+            entries[(key, 0)] = qr
+
+
+def library_grid(
+    positions: Sequence[Position], market: Market, store: rh.HistoryStore
+) -> Tuple[pd.DataFrame, List[str], List[Shock]]:
+    """(grid of :func:`scenario_library` shocks x positions with a TOTAL
+    column, reasons for shocks not revalued, the shocks), cached on the
+    market, the positions and the shocks (the BOOK and SCENARIOS tabs share
+    it)."""
+
+    library, notes = scenario_library(market, store)
+    key = ((_market_key(market), _positions_key(positions, market)), tuple(library))
+    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
+    return grid, notes + failed, library
+
+
 def _grid(positions: Sequence[Position], market: Market, shocks: Sequence[Shock]) -> Tuple[pd.DataFrame, List[str]]:
     """Scenario grid rows for the shocks that revalue, and the reasons the
     others do not (e.g. a Black cap pushed to negative rates)."""
@@ -604,7 +656,7 @@ def _show_curves(market: Market, shock: Shock) -> None:
 
 def _show_explain(
     rows: List[Dict[str, object]], market: Market, shock: Shock, positions: Sequence[Position] = ()
-) -> None:
+) -> pd.DataFrame:
     c, mixed = _book_currency(positions, market) if positions else (rates_risk.money(market), False)
     if mixed:
         st.warning(
@@ -641,6 +693,7 @@ def _show_explain(
         st.dataframe(by_curve, hide_index=True, width="stretch",
                      column_config={c: MONEY for c in by_curve.columns[1:]})  # fmt: skip
         st.caption("The delta column split by the curve whose quotes moved (key-rate PV01 x quote move, per curve).")
+    return table
 
 
 def _episode_flags(store: rh.HistoryStore, market: Market) -> str:
@@ -659,42 +712,51 @@ def _episode_flags(store: rh.HistoryStore, market: Market) -> str:
 
 def _show_grid(
     positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple, store: rh.HistoryStore
-) -> None:
+) -> pd.DataFrame:
     """Standard library grid, headed by the custom ``shock`` when given."""
 
     st.markdown("### / SCENARIO GRID")
-    library = standard_library(store)
-    if market.is_multi_curve:
-        library += [ibor_ois_basis(10.0), tenor_basis(5.0)]
-    key = (key, tuple(library))  # the historical shocks depend on the store
-    if not _has_quotes(market.govt):
-        library = [replace(s, govt=False) for s in library]
-    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
+    grid, failed, library = library_grid(positions, market, store)
     if shock is not None:
-        custom, _ = _cached("custom", (key, shock), lambda: _grid(positions, market, [shock]))
+        custom, _ = _cached("custom", (key, tuple(library), shock), lambda: _grid(positions, market, [shock]))
         grid = pd.concat([custom.rename(index=lambda name: f"CUSTOM: {name}"), grid])
     if failed:
         st.warning("Not revalued: " + "; ".join(failed))
     if grid.empty:
-        return
+        return pd.DataFrame()
     table = grid.rename_axis("SCENARIO").reset_index()
+    c, _ = _book_currency(positions, market)
     st.dataframe(table, hide_index=True, width="stretch", column_config={c: MONEY for c in table.columns[1:]})
     st.download_button("Download scenario grid CSV", _csv(table), file_name="scenario_grid.csv", key="scn_grid_csv")
     st.caption(
-        "Full-revaluation P&L in $ per position. The library is instantaneous and moves both curves: parallel "
-        "+/-25 and +/-100bp; 2s10s steepener/flattener (2Y -/+12.5bp, 10Y +/-12.5bp, pivot 5Y, flat beyond); "
-        "2s5s10s fly (5Y +25bp, 2Y and 10Y unchanged); historical episodes, the Treasury curve moving by US "
-        "Treasury par yield changes and the swap curve by: " + _episode_flags(store, market) + "."
+        f"Full-revaluation P&L in {c} per position. " + library_caption(store, market)
+    )  # fmt: skip
+    return table
+
+
+def library_caption(store: rh.HistoryStore, market: Market) -> str:
+    """What the scenario library holds and which data each episode replays."""
+
+    return (
+        "The library is instantaneous and moves every curve: parallel +/-25 and +/-100bp; 2s10s "
+        "steepener/flattener (2Y -/+12.5bp, 10Y +/-12.5bp, pivot 5Y, flat beyond); 2s5s10s fly (5Y +25bp, 2Y and "
+        "10Y unchanged); PC1 level, PC2 slope and PC3 curvature +/-2 sd one-day moves of the daily US Treasury "
+        "changes up to the valuation date (applied to every curve); historical episodes, the Treasury curve moving "
+        "by US Treasury par yield changes and the swap curve by: " + _episode_flags(store, market) + "."
         + (" Multi-curve: the projection curves move with the swap curve in every rate scenario (basis held; no "
            "free EURIBOR history); IBOR-OIS basis +10bp moves only the EURIBOR rate quotes, tenor basis +5bp only "
            "the 3s6s spreads." if market.is_multi_curve else "")
     )  # fmt: skip
 
 
-def render(market: Market, positions: List[Position]) -> None:
-    """Scenario tab: shock builder, P&L explain and scenario grid."""
+def render(market: Market, positions: List[Position], scope: str = "") -> None:
+    """Scenario tab: shock builder, P&L explain and scenario grid on the
+    positions in scope (``scope`` names them: the book, the tab trades or
+    both)."""
 
     st.markdown("### / SCENARIOS")
+    if scope:
+        st.caption(f"RISK ON: {scope} ({len(positions)} positions). Change it with RISK SCOPE in the sidebar.")
     if not market.curve.quotes:
         st.error("Scenarios shock curve quotes: the swap curve must be bootstrapped from quotes.")
         return
@@ -712,8 +774,8 @@ def render(market: Market, positions: List[Position]) -> None:
     st.markdown("### / P&L EXPLAIN")
     if not positions:
         st.info(
-            "No positions yet: price a swap, swaption, cap/floor or bond on the other Rates tabs to explain its "
-            "P&L here."
+            "No positions yet: add trades to the BOOK, or price a swap, swaption, cap/floor or bond on the other "
+            "Rates tabs and pick them under RISK SCOPE, to explain their P&L here."
         )
         return
     floored = _floored_vols(positions, market, shock)
@@ -733,6 +795,18 @@ def render(market: Market, positions: List[Position]) -> None:
     except ValueError as exc:
         st.error(f"Cannot revalue the portfolio under this scenario: {exc}")
         rows = None
-    if rows is not None:
-        _show_explain(rows, market, shock, positions)
-    _show_grid(positions, market, shock if rows is not None else None, key, store)
+    explain = _show_explain(rows, market, shock, positions) if rows is not None else pd.DataFrame()
+    grid = _show_grid(positions, market, shock if rows is not None else None, key, store)
+    rates_exports.export_row(
+        "scenarios", market, {"pnl_explain": explain, "scenario_grid": grid},
+        {"positions": [{"name": p.name, "kind": p.kind, "details": repr(p.details)} for p in positions],
+         "scope": scope, "shock": {"name": shock.name, "description": shock.description,
+                                   "profile": shock.profile, "profiles": shock.profiles,
+                                   "curve": shock.curve, "govt": shock.govt, "projections": shock.projections,
+                                   "normal_vol_bp": shock.normal_vol_bp, "lognormal_vol_pts": shock.lognormal_vol_pts,
+                                   "horizon_days": shock.horizon_days,
+                                   "sources": [vars(src) for src in shock.sources]}},
+        {"revaluation": "quotes shocked, curves rebuilt, positions revalued", "explain": "key-rate PV01 and gamma "
+         "(+/-1bp central differences), cross gamma along the shock, vega x vol shock, carry"},
+        key="scn_export", store=store,
+    )  # fmt: skip

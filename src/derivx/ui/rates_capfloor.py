@@ -26,10 +26,11 @@ from derivx.rates.capfloor import CapFloor, cap_floor_parity, capfloor_position
 from derivx.rates.capvol import CapletVolSurface, quote_vegas, strip_caplet_vols, strip_surface, vega_by_expiry
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
+from derivx.rates.portfolio import cap_terms
 from derivx.rates.vol_examples import ILLUSTRATIVE, illustrative_cap_atm, illustrative_cap_strikes
 from derivx.risk.scenarios import theta
 from derivx.risk.sensitivities import Position, key_rate_pv01, rate_pv01_gamma
-from derivx.ui import rates_data, rates_risk
+from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 from derivx.vol.sabr import calibrate_sabr_smile, sabr_vol
@@ -40,6 +41,7 @@ STRIP_METHODS = {"Piecewise constant": "constant", "Linear": "linear"}
 SMILE_SHIFT = 0.03  # shift of the normal SABR fitted to each caplet smile
 MONEY_2DP = st.column_config.NumberColumn(format="%,.2f")
 TENORS = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y", "12Y", "15Y", "20Y", "25Y", "30Y"]
+BOOK_QUOTES_KEY = "_cap_book_quotes"  # session state: the cap quotes in use, for the BOOK tab
 FORWARD_STARTS = ["Spot", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "10Y"]
 # Vol inputs are in display units: bp for the normal model, % for the Black models.
 VOL_UNITS = {"bachelier": ("bp", 1e-4, 2000.0), "black": ("%", 0.01, 300.0), "shifted_black": ("%", 0.01, 300.0)}
@@ -223,10 +225,27 @@ def _quote_terms(terms: Dict[str, object]) -> Dict[str, object]:
     return {k: v for k, v in terms.items() if k != "forward_start"}
 
 
+def _strip(market: Market, mats, vols, strikes, method: str, terms: Dict[str, object]):
+    """(stripped vols, strip results), cached per market and quotes."""
+
+    key = (rates_risk.market_key(market), tuple(mats), tuple(np.ravel(vols).tolist()),
+           None if strikes is None else tuple(np.ravel(strikes).tolist()), method,
+           tuple(sorted(terms.items())))  # fmt: skip
+
+    def compute():
+        if strikes is None:
+            result = strip_caplet_vols(market, mats, vols, None, method, terms=terms)
+            return result.curve, [result]
+        return strip_surface(market, mats, strikes, vols, method, terms=terms)
+
+    return rates_risk.cached("cap_strip", key, compute)
+
+
 def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, object]:
     """Quote editor and stripping settings; returns the stripped vols (a
     curve for ATM quotes, a surface by strike) and what they came from.
-    ``terms`` are the quoted caps' schedule (:func:`_quote_terms`)."""
+    ``terms`` are the quoted caps' schedule (:func:`_quote_terms`). The
+    quotes in use are kept for the BOOK tab (:func:`book_caplets`)."""
 
     st.markdown("#### / CAP VOL QUOTES")
     c1, c2 = st.columns(2)
@@ -236,20 +255,43 @@ def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, obje
         "Flat normal cap vols (bp) by cap maturity on the selected index: spot-start caps, first caplet excluded. "
         f"Defaults are {ILLUSTRATIVE}; edit the table or paste your broker's quotes."
     )
-    mats, vols, strikes, edited = _quote_tables(market, layout)
-    source = f"{ILLUSTRATIVE}: {_currency(market)} flat cap normal vols" + (" (edited by you)" if edited else "")
-    key = (rates_risk.market_key(market), tuple(mats), tuple(np.ravel(vols).tolist()),
-           None if strikes is None else tuple(strikes.tolist()), method, tuple(sorted(terms.items())))  # fmt: skip
-
-    def compute():
-        if strikes is None:
-            result = strip_caplet_vols(market, mats, vols, None, method, terms=terms)
-            return result.curve, [result]
-        return strip_surface(market, mats, strikes, vols, method, terms=terms)
-
-    vol, results = rates_risk.cached("cap_strip", key, compute)
+    currency = _currency(market)
+    try:
+        mats, vols, strikes, edited = _quote_tables(market, layout)
+        source = f"{ILLUSTRATIVE}: {currency} flat cap normal vols" + (" (edited by you)" if edited else "")
+        vol, results = _strip(market, mats, vols, strikes, method, terms)
+    except ValueError as exc:
+        st.session_state[BOOK_QUOTES_KEY] = {"currency": currency, "error": f"the CAP-FLOOR tab's cap quotes: {exc}"}
+        raise
+    st.session_state[BOOK_QUOTES_KEY] = {"currency": currency, "maturities": tuple(mats), "flat": np.array(vols),
+                                         "strikes": strikes, "method": method, "source": source}  # fmt: skip
     return {"vol": vol, "results": results, "layout": layout, "method": method, "maturities": mats, "flat": vols,
             "strikes": strikes, "source": source}  # fmt: skip
+
+
+def book_caplets(market: Market, key: str) -> Tuple[object, str, tuple]:
+    """Caplet vols the BOOK prices caps and floors without a flat vol on,
+    for cap index ``key`` (``"3M"`` or a term index): stripped from the cap
+    quotes last used on this tab, or the ILLUSTRATIVE ATM quotes. Returns
+    (vols, quotes source, cache key); raises ValueError when the quotes do
+    not strip."""
+
+    currency = _currency(market)
+    state = st.session_state.get(BOOK_QUOTES_KEY)
+    if state is not None and state.get("currency") == currency and state.get("error"):
+        raise ValueError(state["error"])
+    if state is None or state.get("currency") != currency:
+        table = illustrative_cap_atm(currency)
+        mats, vols, strikes, method = list(table["maturity"]), table["vol_bp"].to_numpy() * 1e-4, None, "constant"
+        source = f"{ILLUSTRATIVE}: {currency} flat ATM cap normal vols"
+    else:
+        mats, vols, strikes = list(state["maturities"]), state["flat"], state["strikes"]
+        method, source = state["method"], state["source"]
+    terms = cap_terms(key, market)
+    vol, _ = _strip(market, mats, vols, strikes, method, terms)
+    cache_key = (tuple(mats), tuple(np.ravel(vols).tolist()), None if strikes is None else
+                 tuple(np.ravel(strikes).tolist()), method, key)  # fmt: skip
+    return vol, source, cache_key
 
 
 def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms: Dict[str, object]) -> None:
@@ -596,4 +638,22 @@ def render(market: Market) -> List[Position]:
         + ("; an OIS bump rebuilds the EURIBOR curves on it, quotes held" if ladders is not None else "")
         + f"). {sums}"
     )
+    tables = {"caplets": view, "key_rate_pv01": ladder_view, "vega_by_expiry": buckets,
+              "summary": pd.DataFrame([{"label": cf.label, "pv": pv, "premium_bp_running": premium_bp, "vega": vega,
+                                        "pv01": pv01, "gamma": greeks["gamma"], "theta_1d": greeks["theta"],
+                                        "decay_1d": decay, "atm_strike": atm, **{f"parity_{k}": v for k, v in
+                                                                                 parity.items()}}])}  # fmt: skip
+    if stripped is not None:
+        tables["caplet_vol_strip"] = pd.concat([r.table for r in stripped["results"]], ignore_index=True)
+    vol_input = vol if isinstance(vol, (int, float)) else ("term structure " + repr(vol) if isinstance(vol, dict)
+                                                            else stripped["source"] if stripped else repr(vol))
+    rates_exports.export_row(
+        "cap floor", market, tables,
+        {"trade": {"kind": kind, "notional": notional, "tenor": tenor, "forward_start": fwd, "strike": strike,
+                   "model": model, "shift": shift, **terms}, "vol": vol_input, "vol_mode": vol_mode},
+        {"pricing": f"{model} per caplet, forwards from {'the ' + projection if projection else 'the swap curve'}, "
+         "OIS discounting", "strip_method": stripped["method"] if stripped else None,
+         "risk": "+/-1bp per curve quote, curves rebuilt, central difference"},
+        key="cap_export",
+    )  # fmt: skip
     return [position]

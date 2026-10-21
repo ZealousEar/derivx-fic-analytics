@@ -30,7 +30,7 @@ from derivx.risk import var as var_mod
 from derivx.risk.scenarios import factor_risk as position_factor_risk
 from derivx.risk.scenarios import vegas as position_vegas
 from derivx.risk.sensitivities import Position
-from derivx.ui import rates_data, rates_risk, rates_scenarios
+from derivx.ui import rates_data, rates_exports, rates_risk, rates_scenarios
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -863,7 +863,9 @@ def _render_factor_risk(
 ) -> None:
     st.markdown("#### / FACTOR RISK OF THE BOOK")
     if not positions:
-        st.info("No positions: price a trade on the other Rates tabs to see its factor risk.")
+        st.info(
+            "No positions: add trades to the BOOK (or pick the tab trades under RISK SCOPE) to see their factor risk."
+        )
         return
     try:
         frame = _cached(
@@ -922,9 +924,19 @@ def _scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tuple[t
     return key, _cached("var_scen", key, lambda: var_mod.build_scenarios(market, store, lookback))
 
 
+def var_scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tuple[tuple, var_mod.VarScenarios]:
+    """The VaR scenarios of this tab (cached on the market and the store's
+    content), for the BOOK tab: (cache key, scenarios)."""
+
+    return _scenarios(market, store, lookback)
+
+
 def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Position]) -> None:
     if not positions:
-        st.info("No positions yet: price a swap, swaption, cap/floor or bond on the other Rates tabs.")
+        st.info(
+            "No positions yet: add trades to the BOOK, or price a swap, swaption, cap/floor or bond on the other "
+            "Rates tabs and pick them under RISK SCOPE."
+        )
         return
     c1, c2 = st.columns(2)
     lookback = c1.radio("LOOKBACK (DAILY CHANGES)", var_mod.LOOKBACKS, index=1, horizontal=True, key="rs_var_lookback")
@@ -1033,6 +1045,16 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     scenario_frame.insert(0, "date", list(scen.dates))
     scenario_frame[var_mod.TOTAL] = book
     _download("Download scenario P&L CSV", _csv(scenario_frame), file_name="var_scenario_pnl.csv", key="rs_var_pnl_csv")
+    rates_exports.export_row(
+        "value at risk", market, {"var_table": shown, "scenario_pnl": scenario_frame, "risk_report": report,
+                                  "worst_days": worst, "history_sources": sources},
+        {"positions": [{"name": p.name, "kind": p.kind, "details": repr(p.details)} for p in positions],
+         "lookback_days": int(lookback), "confidence": float(confidence), "full_revaluation": full is not None},
+        {"scenarios": "historical daily quote moves of each curve's own history or a flagged proxy, applied to "
+         "today's curves", "pnl": label, "vols": "held", "var": "ceil(n (1 - confidence))-th largest loss",
+         "es": "Acerbi-Tasche", "delta_normal": "z x sd of first-order P&L, mean zero"},
+        key="rs_var_export", store=store,
+    )  # fmt: skip
     st.caption(
         f"One-day {level} VaR and expected shortfall of the book on the valuation date ({market.asof}), from {scen.n} "
         f"daily changes {scen.previous[0]} to {scen.dates[-1]}: each day's change of each curve's history (table "
@@ -1050,10 +1072,14 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
 # --------------------------------------------------------------------------
 
 
-def render(market: Market, positions: List[Position]) -> None:
-    """The RESEARCH tab: RV, carry and roll-down, PCA and VaR sub-tabs."""
+def render(market: Market, positions: List[Position], scope: str = "") -> None:
+    """The RESEARCH tab: RV, carry and roll-down, PCA and VaR sub-tabs (PCA
+    factor risk and VaR on the positions in scope)."""
 
     st.markdown("### / RESEARCH")
+    if scope:
+        st.caption(f"FACTOR RISK AND VAR ON: {scope} ({len(positions)} positions); change it with RISK SCOPE in the "
+                   "sidebar.")  # fmt: skip
     store = rates_scenarios.history_store(market)
     tabs = st.tabs(list(SUBTABS))
     with tabs[0]:

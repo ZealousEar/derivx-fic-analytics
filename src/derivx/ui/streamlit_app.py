@@ -7,6 +7,7 @@ from derivx.ui import (
     fx_page,
     pricer_page,
     rates_bonds,
+    rates_book,
     rates_capfloor,
     rates_curve,
     rates_research,
@@ -38,7 +39,9 @@ elif mode == "FX":
     fx_page.render()
 elif mode == "RATES":
     st.markdown("## / INTEREST RATES")
-    tabs = st.tabs(["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ SCENARIOS", "/ RESEARCH"])
+    tabs = st.tabs(
+        ["/ CURVE", "/ SWAP", "/ SWAPTION", "/ CAP-FLOOR", "/ BONDS", "/ BOOK", "/ SCENARIOS", "/ RESEARCH"]
+    )
     with tabs[0]:
         market = rates_curve.render()
     if market is None:
@@ -46,19 +49,22 @@ elif mode == "RATES":
             with tab:
                 st.info("Fix the quotes on the CURVE tab to price instruments.")
     else:
-        positions = []
+        tab_trades = []
         with tabs[1]:
-            positions += rates_swap.render(market)
+            tab_trades += rates_swap.render(market)
         with tabs[2]:
-            positions += rates_swaption.render(market)
+            tab_trades += rates_swaption.render(market)
         with tabs[3]:
-            positions += rates_capfloor.render(market)
+            tab_trades += rates_capfloor.render(market)
         with tabs[4]:
-            positions += rates_bonds.render(market)
+            tab_trades += rates_bonds.render(market)
         with tabs[5]:
-            rates_scenarios.render(market, positions)
+            book = rates_book.render(market)
+        positions, scope = rates_book.risk_scope(book, tab_trades)  # one position set for SCENARIOS and RESEARCH
         with tabs[6]:
-            rates_research.render(market, positions)
+            rates_scenarios.render(market, positions, scope)
+        with tabs[7]:
+            rates_research.render(market, positions, scope)
 elif mode == "ANALYTICS":
     analytics_lab.render()
 
