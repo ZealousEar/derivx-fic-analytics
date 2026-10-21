@@ -24,13 +24,20 @@ Conventions
 * Enforcing no arbitrage (``fit_svi_strike_slice(enforce_no_arbitrage=
   True)``): when the free fit fails the butterfly or Lee check, it is
   replaced by a constrained fit (SLSQP with ``g(k) >= 1e-4`` on the check
-  grid and both Lee slopes <= 2), started from the free fit and from an
-  SSVI slice ``w = theta/2 (1 + rho phi k + sqrt((phi k + rho)^2 + 1 -
-  rho^2))`` with ``theta phi (1 + |rho|) < 4`` and ``theta phi^2 (1 + |rho|)
-  <= 4``, which is free of butterfly arbitrage by construction
-  (Gatheral-Jacquier 2014, Theorem 4.2). The best start that passes the
-  final checks is kept; if the constrained fit fails, the SSVI slice itself
-  is returned (``arbitrage_repair`` says which).
+  grid and both Lee slopes <= 2, analytic gradients), started from the two
+  best quasi-explicit start points that already satisfy those constraints.
+  Only if neither passes the final checks does it start from an SSVI slice
+  ``w = theta/2 (1 + rho phi k + sqrt((phi k + rho)^2 + 1 - rho^2))`` with
+  ``theta phi (1 + |rho|) < 4`` and ``theta phi^2 (1 + |rho|) <= 4``, which
+  is free of butterfly arbitrage by construction (Gatheral-Jacquier 2014,
+  Theorem 4.2), and from the free fit. The best start that passes the final
+  checks is kept; if the constrained fit fails, the SSVI slice itself is
+  returned (``arbitrage_repair`` says which).
+* Start points: quasi-explicit fits (for fixed (m, sigma), w is linear in
+  (a, b rho, b)) on a grid around the quotes and on a grid over the whole
+  parameter box, ranked by the fit objective itself. The box grid lets the
+  solver start near the far-out optimum of short-dated V-shaped smiles
+  (sigma ~ 1, m at a bound) instead of crawling there along a flat valley.
 """
 
 from __future__ import annotations
@@ -53,6 +60,12 @@ LEE_MAX_SLOPE = 2.0
 _RHO_MAX = 0.999
 _G_MARGIN = 1e-4  # constrained fits keep g >= 1e-4 on their constraint grid
 _LEE_MARGIN = 1e-6
+# Constraint-satisfying quasi-explicit starts the constrained refit tries (best objective first): half the free
+# starts, between 1 and REFIT_STARTS (2 for the default 4 free starts, 1 for the 2 of a cross-validation refit).
+REFIT_STARTS = 2
+# With enforcement, the remaining free starts are skipped once the first free start's objective is this far
+# (relative) below the constrained fit's: the free optimum then lies outside the arbitrage-free set.
+CERTIFICATE_GAP = 0.01
 LOSSES = ("linear", "soft_l1", "huber", "cauchy", "arctan")
 
 
@@ -430,35 +443,153 @@ def _raw_to_x(a, b, rho, m, sigma) -> np.ndarray:
     return np.array([a + b * sigma * np.sqrt(1.0 - rho * rho), b, rho, m, sigma])
 
 
-def _seeds(k, w_obs, omega, lb, ub, count) -> List[np.ndarray]:
-    """Start points from the quasi-explicit (Zeliade) linear fit: for fixed
-    (m, sigma), w is linear in (a, b rho, b)."""
+def _linear_fits(k, w_obs, omega, ms, sigmas, lb, ub) -> np.ndarray:
+    """Quasi-explicit (Zeliade) start points, one row of x = (min_variance,
+    b, rho, m, sigma) per (m, sigma) pair: for fixed (m, sigma), w is linear
+    in (a, b rho, b), fitted by weighted least squares in total variance
+    (weights ``omega``, the first-order map from variance to vol errors).
+    All pairs are solved at once (normal equations with a 1e-12 relative
+    ridge for the near-collinear columns of tiny sigma); rows are clipped
+    into the box."""
+
+    u = k[None, :] - ms[:, None]
+    X = np.stack([np.ones_like(u), u, np.sqrt(u * u + sigmas[:, None] ** 2)], axis=2) * omega[None, :, None]
+    XtX = np.einsum("snj,snk->sjk", X, X)
+    Xty = np.einsum("snj,n->sj", X, w_obs * omega)
+    ridge = 1e-12 * np.trace(XtX, axis1=1, axis2=2)[:, None, None] * np.eye(3)[None]
+    a, c_rho, b = np.linalg.solve(XtX + ridge, Xty[..., None])[..., 0].T
+    b = np.maximum(b, 1e-6)
+    rho = np.clip(c_rho / b, -0.95, 0.95)
+    x = np.column_stack([np.maximum(a + b * sigmas * np.sqrt(1.0 - rho * rho), 0.0), b, rho, ms, sigmas])
+    return np.clip(x, lb + 1e-12, ub - 1e-12)
+
+
+def _objective_rows(X, k, vols, T, wts, loss, f_scale) -> np.ndarray:
+    """The fit objective ``0.5 f^2 sum rho((r / f)^2)`` (``0.5 sum r^2`` for
+    loss='linear'; r the weighted vol residuals, model minus market) of each
+    row of X (x parametrisation), vectorised over the rows."""
+
+    wmin, b, rho, m, sigma = (X[:, i, None] for i in range(5))
+    u = k[None, :] - m
+    w = wmin - b * sigma * np.sqrt(1.0 - rho * rho) + b * (rho * u + np.sqrt(u * u + sigma * sigma))
+    r = wts * (np.sqrt(np.maximum(w, 0.0) / T) - vols)
+    f2 = 1.0 if loss == "linear" else float(f_scale) ** 2
+    cost = 0.5 * f2 * np.sum(_loss_rho(r * r / f2, loss)[0], axis=1)
+    return np.where(np.all(np.isfinite(r), axis=1), cost, np.inf)
+
+
+def _seed_pool(k, vols, T, wts, w_obs, omega, lb, ub, loss, f_scale) -> Tuple[np.ndarray, np.ndarray]:
+    """Candidate starts and their objective, best first: quasi-explicit fits
+    on a grid around the quotes (m over the quoted k range and 0, sigma from
+    5% to 100% of the quoted span) and on a grid over the whole box (m over
+    its bounds, sigma log-spaced from 1e-4 to its upper bound). The box grid
+    matters on short-dated V-shaped smiles, whose free optimum lies far out
+    (sigma ~ 1, m at a bound: SVI degenerating to a parabola over the
+    quotes); from a start near the quotes a local solver crawls there along
+    a flat valley in 1,000+ steps."""
 
     kmin, kmax = float(k.min()), float(k.max())
     span = max(kmax - kmin, 1e-3)
-    cands = []
-    for m in np.unique(np.r_[np.linspace(kmin, kmax, 5), 0.0]):
-        for sig in span * np.array([0.05, 0.15, 0.4, 1.0]) + 1e-3:
-            u = k - m
-            X = np.column_stack([np.ones_like(k), u, np.sqrt(u * u + sig * sig)])
-            coef, *_ = np.linalg.lstsq(X * omega[:, None], w_obs * omega, rcond=None)
-            a, c_rho, b = coef
-            b = max(b, 1e-6)
-            rho = float(np.clip(c_rho / b, -0.95, 0.95))
-            x = _raw_to_x(a, b, rho, m, sig)
-            x[0] = max(x[0], 0.0)
-            x = np.clip(x, lb + 1e-12, ub - 1e-12)
-            pred = _raw_w(k, *_x_to_raw(x))
-            cost = float(np.sum((omega * (pred - w_obs)) ** 2))
-            cands.append((cost, x))
-    cands.sort(key=lambda c: c[0])
+    near_m = np.unique(np.r_[np.linspace(kmin, kmax, 5), 0.0])
+    near_s = span * np.array([0.05, 0.15, 0.4, 1.0]) + 1e-3
+    box_m = np.linspace(lb[3], ub[3], 13)
+    box_s = np.geomspace(max(lb[4], 1e-4), ub[4], 12)
+    ms = np.r_[np.repeat(near_m, near_s.size), np.repeat(box_m, box_s.size)]
+    sigmas = np.r_[np.tile(near_s, near_m.size), np.tile(box_s, box_m.size)]
+    X = _linear_fits(k, w_obs, omega, ms, sigmas, lb, ub)
+    cost = _objective_rows(X, k, vols, T, wts, loss, f_scale)
+    order = np.argsort(cost, kind="stable")
+    return X[order], cost[order]
+
+
+def _distinct(X: np.ndarray, lb: np.ndarray, ub: np.ndarray, count: int) -> List[np.ndarray]:
+    """The first ``count`` rows of X that differ from every earlier pick by
+    more than 5% of the box width in some coordinate."""
+
     out: List[np.ndarray] = []
-    for _, x in cands:
+    for x in X:
         if all(np.max(np.abs(x - y) / (ub - lb)) > 0.05 for y in out):
             out.append(x)
         if len(out) >= count:
             break
     return out
+
+
+def _robust_residuals(resid, jac, loss: str, f_scale: float):
+    """Residuals ``r~ = r sqrt(rho(z) / z)`` (z = (r / f)^2) and their
+    Jacobian, for which plain least squares minimises exactly the robust
+    objective ``0.5 f^2 sum rho(z)`` that scipy's ``loss`` minimises
+    (``r~^2 = f^2 rho(z)``). Implemented for 'linear' (r~ = r) and 'soft_l1'
+    (rho(z) / z = 2 / (sqrt(1 + z) + 1), smooth at 0)."""
+
+    if loss == "linear":
+        return resid, jac
+    if loss != "soft_l1":
+        raise ValueError(f"robust residuals are implemented for 'linear' and 'soft_l1', not {loss!r}")
+    f2 = float(f_scale) ** 2
+
+    def scaled(r):
+        q = np.sqrt(1.0 + r * r / f2)
+        s = np.sqrt(2.0 / (q + 1.0))
+        return q, s
+
+    def fun(x):
+        r = resid(x)
+        return r * scaled(r)[1]
+
+    def grad(x):
+        r = resid(x)
+        q, s = scaled(r)
+        # d(r s)/dr = s + r ds/dr with ds/dr = -s^3 r / (4 q f^2)
+        return jac(x) * (s - s**3 * r * r / (4.0 * q * f2))[:, None]
+
+    return fun, grad
+
+
+def _local_fit(resid, jac, xs, lb, ub, loss: str, f_scale: float):
+    """One local free fit from ``xs`` (box ``[lb, ub]``); returns scipy's
+    result of the final TRF run, with ``nfev`` counting every evaluation.
+
+    For 'linear' and 'soft_l1' a MINPACK Levenberg-Marquardt run on the
+    equivalent plain least-squares residuals (:func:`_robust_residuals`)
+    goes first: residuals are evaluated at the point clipped into the box,
+    and an exterior penalty ``1e3 (x - clip(x)) / (ub - lb)`` pulls the
+    iterate back. Its steps cost a fraction of TRF's in Python overhead.
+    scipy's bounded TRF (the reference solver, the same robust loss) then
+    polishes from the LM point clipped into the box, so the result is a
+    TRF stationary point of the exact bounded problem; it converges in 1-10
+    steps from there unless the optimum lies on a bound along a flat valley,
+    where TRF takes over the remaining work. On SPY slices this is never
+    worse than TRF from ``xs`` (worst +4e-9 relative objective) and 2x
+    faster overall. Other losses run TRF alone."""
+
+    nfev = 0
+    start = xs
+    if loss in ("linear", "soft_l1"):
+        fun, grad = _robust_residuals(resid, jac, loss, f_scale)
+        width = ub - lb
+
+        def penalised(x):
+            xc = np.clip(x, lb, ub)
+            return np.r_[fun(xc), 1e3 * (x - xc) / width]
+
+        def penalised_jac(x):
+            xc = np.clip(x, lb, ub)
+            inside = (x >= lb) & (x <= ub)
+            return np.vstack([grad(xc) * inside[None, :], np.diag(np.where(inside, 0.0, 1e3 / width))])
+
+        try:
+            with np.errstate(all="ignore"):
+                lm = least_squares(penalised, xs, jac=penalised_jac, method="lm", x_scale="jac", max_nfev=1000)
+            if np.all(np.isfinite(lm.x)):
+                start, nfev = np.clip(lm.x, lb + 1e-12, ub - 1e-12), int(lm.nfev)
+        except (ValueError, np.linalg.LinAlgError):  # pragma: no cover - defensive: TRF from xs instead
+            start = xs
+    res = least_squares(
+        resid, x0=start, jac=jac, bounds=(lb, ub), loss=loss, f_scale=f_scale, x_scale="jac", max_nfev=3000
+    )
+    res.nfev = int(res.nfev) + nfev
+    return res
 
 
 def fit_svi_strike_slice(
@@ -496,10 +627,16 @@ def fit_svi_strike_slice(
         given, and Lee slopes <= 2), or with an arbitrage-free SSVI slice
         if that fails; ``penalised`` / ``arbitrage_repair`` say what
         happened and the ``butterfly`` / ``lee`` checks report the result.
-    n_starts : start points (from a quasi-explicit linear fit over (m,
-        sigma), best-seeded first); the search stops early once two starts
-        reach the same optimum (``n_starts`` of the result counts the runs).
-        ``x0`` (params) replaces them with one warm start.
+    n_starts : start points (quasi-explicit linear fits over (m, sigma) on a
+        grid near the quotes and one over the whole box, ranked by the fit
+        objective, distinct); the search stops early once two starts reach
+        the same optimum, or, with ``enforce_no_arbitrage``, once the first
+        start is more than ``CERTIFICATE_GAP`` (1%) cheaper than the
+        constrained fit (the free optimum is then arbitrageable and is
+        replaced anyway). ``n_starts`` of the result counts the runs.
+        ``x0`` (params) replaces them with one warm start. Each start runs
+        MINPACK Levenberg-Marquardt, then scipy's bounded TRF from its point
+        (see :func:`_local_fit`).
 
     The constraint ``a + b sigma sqrt(1-rho^2) >= 0`` is imposed exactly by
     fitting the minimum variance instead of ``a`` (``a`` may be negative).
@@ -586,33 +723,52 @@ def fit_svi_strike_slice(
         )
         return dw * dvol_dw[:, None]
 
+    omega = wts / (2.0 * np.maximum(vols, 1e-4) * T)
+    pool = None
     if x0 is not None:
         starts = [np.clip(_raw_to_x(*svi_tuple(x0)), lb + 1e-12, ub - 1e-12)]
     else:
-        omega = wts / (2.0 * np.maximum(vols, 1e-4) * T)
-        starts = _seeds(k, w_obs, omega, lb, ub, max(1, int(n_starts)))
-    best, runs = None, 0
-    for xs in starts:
-        res = least_squares(
-            resid, x0=xs, jac=jac, bounds=(lb, ub), loss=loss, f_scale=f_scale, x_scale="jac", max_nfev=3000
+        pool = _seed_pool(k, vols, T, wts, w_obs, omega, lb, ub, loss, f_scale)
+        starts = _distinct(pool[0], lb, ub, max(1, int(n_starts)))
+    refit_starts = min(REFIT_STARTS, max(1, int(n_starts) // 2))
+
+    def free_ok(x: np.ndarray) -> bool:
+        p = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(x))))
+        return bool(check_butterfly(p, default_k_grid(p, (kmin, kmax))).ok and lee_wing_check(p)["lee_ok"])
+
+    def refit(x_free: np.ndarray):
+        nonlocal pool
+        if pool is None:
+            pool = _seed_pool(k, vols, T, wts, w_obs, omega, lb, ub, loss, f_scale)
+        return _arbitrage_free_refit(
+            x_free, k, vols, T, wts, loss, f_scale, lb, ub, (kmin, kmax), resid, jac, fixed_grid, pool[0], refit_starts
         )
+
+    best, runs, repaired, repaired_from = None, 0, None, None
+    for xs in starts:
+        res = _local_fit(resid, jac, xs, lb, ub, loss, f_scale)
         runs += 1
         agree = best is not None and abs(res.cost - best.cost) <= 1e-6 * max(res.cost, best.cost, 1e-300)
         if best is None or res.cost < best.cost:
             best = res
         if agree:  # two starts reached the same optimum: the remaining (worse-seeded) starts are not run
             break
+        if enforce_no_arbitrage and runs == 1 and len(starts) > 1 and not free_ok(best.x):
+            # The free optimum costs at most this start's objective. When that is clearly (CERTIFICATE_GAP)
+            # below the constrained fit's, the free optimum cannot be arbitrage-free (it would be a feasible
+            # point cheaper than the constrained optimum), so the constrained fit is the answer and the other
+            # free starts would be wasted (they crawl along flat valleys on short-dated smiles).
+            repaired, repaired_from = refit(best.x), best.x
+            c_repaired = float(_objective_rows(repaired[0][None, :], k, vols, T, wts, loss, f_scale)[0])
+            if repaired[2] and best.cost < (1.0 - CERTIFICATE_GAP) * c_repaired:
+                break
     x_fit, success, message, nfev = best.x, bool(best.success), str(best.message), int(best.nfev)
     penalised, repair = False, "none"
-    if enforce_no_arbitrage:
-        p_free = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(x_fit))))
-        free_ok = check_butterfly(p_free, default_k_grid(p_free, (kmin, kmax))).ok and lee_wing_check(p_free)["lee_ok"]
-        if not free_ok:
-            repaired = _arbitrage_free_refit(
-                x_fit, k, vols, T, wts, loss, f_scale, lb, ub, (kmin, kmax), resid, jac, fixed_grid
-            )
-            x_fit, repair, ok, extra_nfev, message = repaired
-            penalised, success, nfev = True, ok, nfev + extra_nfev
+    if enforce_no_arbitrage and not free_ok(x_fit):
+        if repaired is None or repaired_from is not x_fit:
+            repaired = refit(x_fit)
+        x_fit, repair, ok, extra_nfev, message = repaired
+        penalised, success, nfev = True, ok, nfev + extra_nfev
     a, b, rho, m, sigma = _x_to_raw(x_fit)
     params = {"a": float(a), "b": float(b), "rho": float(rho), "m": float(m), "sigma": float(sigma)}
     model = np.sqrt(np.maximum(_raw_w(k, a, b, rho, m, sigma), 0.0) / T)
@@ -708,6 +864,43 @@ def _g_raw(k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float
     return np.where(w > 0, g, np.nan)
 
 
+def _g_and_grad(k: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Gatheral's g(k) and its analytic gradient ``dg/dx`` (shape (k.size,
+    5)) in the fit parametrisation x = (min_variance, b, rho, m, sigma),
+    with a = min_variance - b sigma sqrt(1 - rho^2). Where w(k) <= 0, g is
+    NaN and its gradient row 0 (the constraint treats those points as
+    violated). With u = k - m and R = sqrt(u^2 + sigma^2): w = a + b (rho u
+    + R), w' = b (rho + u / R), w'' = b sigma^2 / R^3, and
+    g = A^2 - w'^2 / 4 (1 / w + 1 / 4) + w'' / 2 with A = 1 - k w' / (2 w)."""
+
+    wmin, b, rho, m, sigma = (float(v) for v in x)
+    c = np.sqrt(1.0 - rho * rho)
+    a = wmin - b * sigma * c
+    u = k - m
+    R2 = u * u + sigma * sigma
+    R = np.sqrt(R2)
+    R3 = R2 * R
+    s2 = sigma * sigma
+    w = a + b * (rho * u + R)
+    w1 = b * (rho + u / R)
+    w2 = b * s2 / R3
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_w = 1.0 / w
+        A = 1.0 - 0.5 * k * w1 * inv_w
+        g = A * A - 0.25 * w1 * w1 * (inv_w + 0.25) + 0.5 * w2
+        g_w = (A * k * w1 + 0.25 * w1 * w1) * inv_w * inv_w  # dg/dw
+        g_w1 = -A * k * inv_w - 0.5 * w1 * (inv_w + 0.25)  # dg/dw'
+    # dg/d(raw) for raw = (a, b, rho, m, sigma); dg/dw'' = 1/2
+    d_a = g_w
+    d_b = g_w * (rho * u + R) + g_w1 * (rho + u / R) + 0.5 * s2 / R3
+    d_rho = g_w * b * u + g_w1 * b
+    d_m = -g_w * w1 - g_w1 * w2 + 1.5 * b * s2 * u / (R3 * R2)
+    d_sigma = g_w * b * sigma / R - g_w1 * b * u * sigma / R3 + 0.5 * b * sigma * (2.0 * R2 - 3.0 * s2) / (R3 * R2)
+    grad = np.column_stack([d_a, d_b - sigma * c * d_a, d_rho + b * sigma * rho / c * d_a, d_m, d_sigma - b * c * d_a])
+    ok = w > 0
+    return np.where(ok, g, np.nan), np.where(ok[:, None], grad, 0.0)
+
+
 def _ssvi_slice_x(theta: float, rho: float, phi: float) -> np.ndarray:
     """(min_variance, b, rho, m, sigma) of the SSVI slice (theta, rho, phi)."""
 
@@ -770,16 +963,115 @@ def _constraint_grid(xs: Sequence[np.ndarray], k_range: Tuple[float, float]) -> 
     return np.unique(np.concatenate(parts))
 
 
-def _arbitrage_free_refit(x_free, k, vols, T, wts, loss, f_scale, lb, ub, k_range, resid, jac, fixed_grid):
+def _feasible_seeds(pool: np.ndarray, grid: np.ndarray, lb: np.ndarray, ub: np.ndarray, count: int) -> List[np.ndarray]:
+    """The best-objective distinct rows of the seed pool (sorted best first)
+    that already satisfy the refit's constraints on ``grid``: g >= 1e-4
+    (w > 0) and both Lee slopes <= 2 - 1e-6. g is evaluated for every row at
+    once."""
+
+    wmin, b, rho, m, sigma = (pool[:, i, None] for i in range(5))
+    a = wmin - b * sigma * np.sqrt(1.0 - rho * rho)
+    u = grid[None, :] - m
+    R = np.sqrt(u * u + sigma * sigma)
+    w = a + b * (rho * u + R)
+    w1 = b * (rho + u / R)
+    w2 = b * sigma * sigma / R**3
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = (1.0 - grid * w1 / (2.0 * w)) ** 2 - 0.25 * w1 * w1 * (1.0 / w + 0.25) + 0.5 * w2
+    g = np.where(w > 0, g, -np.inf)
+    lee = LEE_MAX_SLOPE - _LEE_MARGIN
+    bb, rr = pool[:, 1], pool[:, 2]
+    feasible = (np.min(g, axis=1) >= _G_MARGIN) & (bb * (1.0 + rr) <= lee) & (bb * (1.0 - rr) <= lee)
+    return _distinct(pool[feasible], lb, ub, count)
+
+
+def _constrained_slsqp(x_start, x_free, cost_x, grid, lo, ub, k_range, fixed_grid) -> Tuple[np.ndarray, bool, int]:
+    """SLSQP from ``x_start`` on the robust objective ``cost_x`` (value and
+    gradient) with g(k) >= 1e-4 on ``grid`` and both Lee slopes <= 2 - 1e-6,
+    analytic constraint gradients (:func:`_g_and_grad`), variables scaled to
+    O(1) and the objective normalised by its value at the starts. When the
+    solution dips below zero between grid points, the points of the dense
+    check grid around the dip are added and the fit resumed (up to three
+    rounds; never with a caller's fixed ``grid``). Returns ``(x,
+    passes_checks, nfev)``."""
+
+    scale = np.maximum(np.maximum(np.abs(x_free), np.abs(x_start)), np.array([1e-8, 1e-8, 0.1, 1e-3, 1e-4]))
+    norm = max(cost_x(x_free)[0], cost_x(x_start)[0], 1e-300)  # SLSQP needs an O(1) objective
+    y_lo, y_hi = lo / scale, ub / scale
+    lee = LEE_MAX_SLOPE - _LEE_MARGIN
+
+    def cost(y):
+        c, grad = cost_x(y * scale)
+        return c / norm, grad * scale / norm
+
+    def constraints(kg):
+        def fun(yy):
+            x = yy * scale
+            g = np.nan_to_num(_g_raw(kg, *_x_to_raw(x)), nan=-1.0) - _G_MARGIN
+            return np.r_[g, lee - x[1] * (1.0 + x[2]), lee - x[1] * (1.0 - x[2])]
+
+        def grad(yy):
+            x = yy * scale
+            _, dg = _g_and_grad(kg, x)
+            b, rho = x[1], x[2]
+            lee_rows = np.array([[0.0, -(1.0 + rho), -b, 0.0, 0.0], [0.0, -(1.0 - rho), b, 0.0, 0.0]])
+            return np.vstack([dg, lee_rows]) * scale
+
+        return [{"type": "ineq", "fun": fun, "jac": grad}]
+
+    y = np.clip(x_start, lo, ub) / scale
+    ok, nfev = False, 0
+    for _ in range(3):  # add the dense check grid where a solution dipped between constraint points
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=_SLSQP_CLIP_NOTICE, category=RuntimeWarning)
+            res = minimize(
+                cost,
+                y,
+                jac=True,
+                method="SLSQP",
+                bounds=list(zip(y_lo, y_hi)),
+                constraints=constraints(grid),
+                options={"maxiter": 500, "ftol": 1e-10},
+            )
+        nfev += int(res.nfev)
+        y = np.clip(res.x, y_lo, y_hi)
+        ok, _ = _passes_checks(y * scale, k_range, fixed_grid)
+        if ok or fixed_grid is not None:
+            break
+        grid = np.unique(np.r_[grid, _dip_points(y * scale, k_range)])
+    return y * scale, ok, nfev
+
+
+def _dip_points(x: np.ndarray, k_range: Tuple[float, float]) -> np.ndarray:
+    """Points of the dense check grid (:func:`default_k_grid`) where g of
+    the slice x is below twice the constraint margin (or undefined), with
+    their neighbours on that grid: the constraints added where a solution
+    dipped between constraint points. (Adding the whole dense grid, about
+    2,000 points, made each later SLSQP step several times dearer.)"""
+
+    raw = _x_to_raw(x)
+    dense = default_k_grid(dict(zip(SVI_PARAMS, (float(v) for v in raw))), k_range)
+    low = ~(np.nan_to_num(_g_raw(dense, *raw), nan=-1.0) >= 2.0 * _G_MARGIN)
+    near = low | np.r_[low[1:], False] | np.r_[False, low[:-1]]
+    return dense[near]
+
+
+def _arbitrage_free_refit(
+    x_free, k, vols, T, wts, loss, f_scale, lb, ub, k_range, resid, jac, fixed_grid, pool, n_seeds=REFIT_STARTS
+):
     """Replace an arbitrageable fit; returns ``(x, repair, ok, nfev, message)``
     with ``repair`` in {'constrained', 'ssvi_slice', 'failed'} (see module
     docs). The objective is the same robust loss on the weighted vol
-    residuals as the free fit; among the candidates that pass the final
-    butterfly and Lee checks (SLSQP from the SSVI slice, SLSQP from the free
-    fit only when the first fails, and the SSVI slice itself) the
-    lowest-cost one is kept."""
+    residuals as the free fit. SLSQP starts from the ``n_seeds`` best
+    distinct quasi-explicit starts of ``pool`` (the free fit's seed pool)
+    that already satisfy the constraints; these sit close to the constrained
+    optimum (within a few % of its objective on real slices), where the SSVI
+    slice used before was 5-20x off and SLSQP needed 250-550 steps from it.
+    Only when none of them gives a fit that passes the final butterfly and
+    Lee checks does the refit fall back to SLSQP from the SSVI slice, then
+    from the free fit, and to the SSVI slice itself. The lowest-cost passing
+    candidate is kept."""
 
-    x_ssvi, nfev = _fit_ssvi_slice(k, vols, T, wts, loss, f_scale)
     f2 = 1.0 if loss == "linear" else float(f_scale) ** 2
 
     def cost_x(x):
@@ -787,59 +1079,29 @@ def _arbitrage_free_refit(x_free, k, vols, T, wts, loss, f_scale, lb, ub, k_rang
         rho_z, drho = _loss_rho((r * r) / f2, loss)
         return 0.5 * f2 * float(np.sum(rho_z)), (drho * r) @ jac(x)
 
-    norm = max(cost_x(x_free)[0], cost_x(x_ssvi)[0], 1e-300)  # SLSQP needs an O(1) objective
-    scale = np.maximum(np.maximum(np.abs(x_free), np.abs(x_ssvi)), np.array([1e-8, 1e-8, 0.1, 1e-3, 1e-4]))
     lo = lb.copy()
     lo[0] = max(lo[0], 1e-9 * float(np.max(vols * vols * T)))  # keep w > 0 so g is defined
-    y_lo, y_hi = lo / scale, ub / scale
-    bounds = list(zip(y_lo, y_hi))
-
-    def cost(y):
-        c, grad = cost_x(y * scale)
-        return c / norm, grad * scale / norm
-
-    def constraints(grid):
-        def fun(yy):
-            x = yy * scale
-            g = np.nan_to_num(_g_raw(grid, *_x_to_raw(x)), nan=-1.0) - _G_MARGIN
-            b, rho = x[1], x[2]
-            return np.r_[
-                g, (LEE_MAX_SLOPE - _LEE_MARGIN) - b * (1.0 + rho), (LEE_MAX_SLOPE - _LEE_MARGIN) - b * (1.0 - rho)
-            ]
-
-        return [{"type": "ineq", "fun": fun}]
-
     candidates = []
-    ok_ssvi, _ = _passes_checks(x_ssvi, k_range, fixed_grid)
-    if ok_ssvi:
-        candidates.append((cost_x(x_ssvi)[0], x_ssvi, "ssvi_slice"))
-    for x_start in (x_ssvi, x_free):
-        if any(c[2] == "constrained" for c in candidates):
-            break  # the start from the (feasible) SSVI slice worked: the free start rarely beats it
-        grid = _constraint_grid([x_free, x_ssvi], k_range) if fixed_grid is None else fixed_grid
-        y = np.clip(x_start, lo, ub) / scale
-        ok = False
-        for _ in range(3):  # add the dense check grid where a solution dipped between constraint points
-            with np.errstate(all="ignore"), warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=_SLSQP_CLIP_NOTICE, category=RuntimeWarning)
-                res = minimize(
-                    cost,
-                    y,
-                    jac=True,
-                    method="SLSQP",
-                    bounds=bounds,
-                    constraints=constraints(grid),
-                    options={"maxiter": 500, "ftol": 1e-10},
-                )
-            nfev += int(res.nfev)
-            y = np.clip(res.x, y_lo, y_hi)
-            ok, _ = _passes_checks(y * scale, k_range, fixed_grid)
-            if ok or fixed_grid is not None:
-                break
-            p = dict(zip(SVI_PARAMS, (float(v) for v in _x_to_raw(y * scale))))
-            grid = np.unique(np.r_[grid, default_k_grid(p, k_range)])
+    nfev = 0
+    screen = _constraint_grid([x_free], k_range) if fixed_grid is None else fixed_grid
+    for x_start in _feasible_seeds(pool, screen, lb, ub, n_seeds):
+        grid = _constraint_grid([x_free, x_start], k_range) if fixed_grid is None else fixed_grid
+        x, ok, n = _constrained_slsqp(x_start, x_free, cost_x, grid, lo, ub, k_range, fixed_grid)
+        nfev += n
         if ok:
-            candidates.append((cost_x(y * scale)[0], y * scale, "constrained"))
+            candidates.append((cost_x(x)[0], x, "constrained"))
+    if not candidates:  # fallback: from the SSVI slice (butterfly-free by construction), then the free fit
+        x_ssvi, n = _fit_ssvi_slice(k, vols, T, wts, loss, f_scale)
+        nfev += n
+        if _passes_checks(x_ssvi, k_range, fixed_grid)[0]:
+            candidates.append((cost_x(x_ssvi)[0], x_ssvi, "ssvi_slice"))
+        grid = _constraint_grid([x_free, x_ssvi], k_range) if fixed_grid is None else fixed_grid
+        for x_start in (x_ssvi, x_free):
+            x, ok, n = _constrained_slsqp(x_start, x_free, cost_x, grid, lo, ub, k_range, fixed_grid)
+            nfev += n
+            if ok:
+                candidates.append((cost_x(x)[0], x, "constrained"))
+                break  # the start from the (feasible) SSVI slice worked: the free start rarely beats it
     if candidates:
         _, x_best, how = min(candidates, key=lambda c: c[0])
         message = {
