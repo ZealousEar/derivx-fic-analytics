@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import pandas as pd
 
 from derivx.data.calendar import previous_trading_day, session_date
 from derivx.data.market_data import FetchStatus, fetch_option_chain
+
+if TYPE_CHECKING:
+    from derivx.rates.curves import CurveQuote
 
 
 class ChainFetchError(RuntimeError):
@@ -55,27 +58,48 @@ def load_equity_chain_from_yf(
     return result.chain
 
 
-def load_rates_quotes_from_csv(path: str) -> Dict[str, float]:
-    """Single-curve quotes CSV (columns ``instrument,tenor,rate``, rates in
-    decimals) as ``{tenor: rate}``.
+def load_rates_quotes_from_csv(path: str, units: str = "decimal") -> List["CurveQuote"]:
+    """Quotes for one curve from a CSV with columns ``instrument, tenor,
+    rate``, as decimal :class:`~derivx.rates.curves.CurveQuote` objects in
+    file order, ready for :func:`derivx.rates.term_structure.build_zero_curve`
+    or :func:`derivx.rates.curves.bootstrap`.
 
-    One quote per tenor: a tenor quoted twice raises ``ValueError``. (This
-    loader used to average them, e.g. a 2Y OIS at 4.0% and a 2Y IRS at 5.0%
+    The instrument column is kept: each row is one of
+    :data:`derivx.rates.curves.INSTRUMENT_KINDS` (``DEPO``, ``OIS``, ``IRS``,
+    ...), and anything else (``BANANA``) is an error. (This loader used to
+    return ``{tenor: rate}``, which dropped the instrument and so priced IRS
+    rows as OIS.) ``units`` is what the rate column holds: ``decimal``
+    (0.0512, the default, as in the bundled ``data/examples/rates_quotes.csv``),
+    ``percent`` (5.12), ``bp`` (512) or ``auto`` (guessed, and refused when
+    ambiguous); a rate outside -5%..30% after conversion is an error, so a
+    percent file read as decimals fails instead of building.
+
+    One quote per tenor: a tenor quoted twice raises ``ValueError``. (The
+    loader once averaged them, e.g. a 2Y OIS at 4.0% and a 2Y IRS at 5.0%
     became 4.5%, blending two curves' quotes into one.) Quotes for several
-    curves go through :func:`load_curve_quotes_from_csv`.
+    curves, or for a projection index, carry a ``curve`` column and go
+    through :func:`load_curve_quotes_from_csv`. ``ValueError`` lists every
+    problem.
     """
+
+    from derivx.rates.indices import INDICES
+    from derivx.rates.quotes import clean_quotes
 
     df = pd.read_csv(path)
     if not {"instrument", "tenor", "rate"}.issubset(set(df.columns)):
         raise ValueError("CSV must contain instrument, tenor, rate columns")
-    tenors = df["tenor"].astype(str).str.strip().str.upper()
-    repeated = sorted(set(tenors[tenors.duplicated(keep=False)]))
-    if repeated:
-        raise ValueError(
-            f"tenors {repeated} are quoted more than once; keep one quote per tenor (OIS and IRS quotes belong to "
-            "different curves: give them a 'curve' column and use load_curve_quotes_from_csv)"
-        )
-    return {str(k): float(v) for k, v in zip(df["tenor"], df["rate"])}
+    if "curve" in df.columns:
+        names = sorted(set(df["curve"].dropna().astype(str).str.strip().str.upper()))
+        if len(names) > 1 or any(n in INDICES for n in names):
+            raise ValueError(
+                f"the CSV holds quotes for {', '.join(names)}: load a curve set (or a projection curve) with "
+                "load_curve_quotes_from_csv"
+            )
+    quotes, issues, _ = clean_quotes(df.to_dict("records"), units=units)
+    errors = [i.message for i in issues if i.level == "error"]
+    if errors:
+        raise ValueError("; ".join(errors))
+    return quotes
 
 
 def load_curve_quotes_from_csv(path: str, units: str = "auto") -> Dict[str, List[object]]:
