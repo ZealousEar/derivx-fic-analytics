@@ -42,6 +42,13 @@ def test_committed_summary_belongs_to_the_committed_sample():
     assert "outperforms" not in md and all(s in md for s in mc["statements"])
     manifest = json.loads((COMMITTED / "manifest.json").read_text())
     assert manifest["data"]["data_sha256"] == summary["data"]["data_sha256"]
+    # AL-14: discounted with the Treasury curve of the trade date, not an unstated 0% rate
+    disc = summary["settings"]["discounting"]
+    assert disc["mode"] == "curve" and "rate_cc" not in summary["settings"]
+    assert disc["curves"]["2026-10-20"]["label"].startswith("US Treasury par curve of 2026-10-19")
+    assert "Discounting: US Treasury par curve of 2026-10-19" in md and "American-style" in md
+    scores = pd.read_csv(COMMITTED / "model_scores.csv")
+    assert (scores["discount_method"] == "curve").all() and scores["rate_pct"].between(4.0, 4.8).all()
 
 
 def test_scores_reproduce_the_committed_numbers(quick):

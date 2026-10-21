@@ -37,6 +37,7 @@ from derivx.ui import pricer_calc as calc
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
 from derivx.ui.state import PERSIST
 from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, PNL_COLORS, SERIES, dark_layout
+from derivx.vol.discounting import Discounting
 from derivx.vol.implied import STATUS, implied_vol_bs
 from derivx.vol.svi import svi_iv
 
@@ -527,11 +528,14 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def _market_calibration(chain: pd.DataFrame, rate: float) -> ChainCalibration:
+def _market_calibration(chain: pd.DataFrame, rate: float, discount: Optional[Discounting] = None) -> ChainCalibration:
     """SVI fits of every slice of a loaded chain (cached on the chain's
-    content and the rate; no per-session nonce)."""
+    content, the rate and the discounting; no per-session nonce). The
+    ANALYTICS lab publishes its chain with its discounting (the Treasury
+    curve of the trade date, or put-call parity per expiry), which then
+    sets each expiry's discount factor; ``rate`` is used otherwise."""
 
-    return calibrate_chain(chain, rate=rate, cv_folds=0, enforce_arbitrage=True)
+    return calibrate_chain(chain, rate=rate, cv_folds=0, enforce_arbitrage=True, discount=discount)
 
 
 def _market_chain() -> Optional[pd.DataFrame]:
@@ -656,7 +660,9 @@ def _market_smile(spec: ModeSpec, inp: calc.Inputs, chain: pd.DataFrame) -> None
     meta = st.session_state.get("market_chain_meta") or {}
     ticker = str(meta.get("ticker") or (chain["ticker"].iloc[0] if "ticker" in chain.columns else "unknown ticker"))
     try:
-        result = _market_calibration(chain, float(inp.r))
+        discount = st.session_state.get("market_chain_discount")
+        discount = discount if isinstance(discount, Discounting) else None
+        result = _market_calibration(chain, float(inp.r), discount)
     except ValueError as exc:
         _illustrative_smile(spec, inp, reason=f" (the loaded chain could not be fitted: {exc})")
         return
@@ -703,7 +709,13 @@ def _market_smile(spec: ModeSpec, inp: calc.Inputs, chain: pd.DataFrame) -> None
     st.caption(
         f"T = {sl.tau:.4f}y ({clean.days} days ACT/365F), spot {calc.fmt_sig(clean.spot, 6)}, forward "
         f"{calc.fmt_sig(sl.forward, 6)} ({d.get('forward_source')}), vols {vols} "
-        f"with r = RATE.R = {inp.r:.2%}. SVI fit RMSE {fit.rmse_bp:.1f} vol bp (max {fit.max_abs_error_bp:.1f}) over "
+        + (
+            f"discounted as on the ANALYTICS lab: {d.get('discount_method')} DF {clean.discount_factor:.6f} = "
+            f"{clean.rate:.3%} cc ({d.get('discount_source')}). "
+            if clean.discount_method != "rate"
+            else f"with r = RATE.R = {inp.r:.2%}. "
+        )
+        + f"SVI fit RMSE {fit.rmse_bp:.1f} vol bp (max {fit.max_abs_error_bp:.1f}) over "
         f"{fit.n_points} OTM quotes; butterfly {'ok' if fit.butterfly.ok else 'FAILS'}, Lee wings "
         f"{'ok' if fit.lee['lee_ok'] else 'FAIL'}, arbitrage repair: {fit.arbitrage_repair}. The pricer inputs above "
         "are separate from this chain."

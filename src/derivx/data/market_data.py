@@ -468,23 +468,30 @@ def hygiene_report(
     rate: float = 0.0,
     min_days: float = 1.0,
     hygiene: Optional[Dict[str, object]] = None,
+    discount=None,
 ) -> pd.DataFrame:
     """One row per (trade_date, expiry): what the quote hygiene keeps (one
-    OTM quote per strike) and removes, by reason, and the forward with how
-    it was found (put-call parity, interpolated from the other expiries'
-    parity forwards, or carry), exactly as the calibration step cleans the
-    chain (:func:`derivx.calibration.production.clean_chain`). ``days`` are
-    calendar days to expiry; ``k_min`` / ``k_max`` are ln(K/F) of the kept
+    OTM quote per strike) and removes, by reason, the forward with how it
+    was found (put-call parity, interpolated from the other expiries'
+    parity forwards, or carry) and the discount factor with how it was
+    found (``discount``, a :class:`derivx.vol.discounting.Discounting`, else
+    the flat ``rate``), exactly as the calibration step cleans the chain
+    (:func:`derivx.calibration.production.clean_chain`). ``days`` are
+    calendar days to expiry; ``rate_pct`` is the effective cc rate ``-ln(DF)
+    / tau`` in percent; ``parity_rate_pct`` / ``parity_se_bp`` are the
+    put-call-parity regression's implied rate and its standard error when
+    it was run (parity mode); ``k_min`` / ``k_max`` are ln(K/F) of the kept
     quotes; ``error`` says why a slice could not be cleaned at all."""
 
     from derivx.calibration.production import clean_chain
 
     if chain is None or chain.empty:
         return pd.DataFrame()
-    cleaned, bad = clean_chain(chain, rate=rate, min_days=min_days, hygiene=hygiene)
+    cleaned, bad = clean_chain(chain, rate=rate, min_days=min_days, hygiene=hygiene, discount=discount)
     rows: List[Dict[str, object]] = []
     for td, exp, group, clean in cleaned:
         q = clean.quotes
+        par = clean.parity or {}
         rows.append(
             {
                 "trade_date": td.date(),
@@ -494,6 +501,12 @@ def hygiene_report(
                 "kept": int(len(q)),
                 "forward": clean.forward,
                 "forward_method": clean.forward_method,
+                "discount_factor": clean.discount_factor,
+                "rate_pct": 100.0 * clean.rate,
+                "discount_method": clean.discount_method,
+                "parity_rate_pct": 100.0 * float(par.get("parity_rate", np.nan)),
+                "parity_se_bp": 1e4 * float(par.get("parity_rate_se", np.nan)),
+                "discount_source": clean.discount_source,
                 "iv_source": clean.iv_source,
                 **{f"removed_{k}": v for k, v in clean.counts.items()},
                 "k_min": float(q["k"].min()) if len(q) else np.nan,
@@ -516,6 +529,20 @@ def hygiene_report(
     removed = sorted(c for c in out.columns if c.startswith("removed_"))
     if removed:
         out[removed] = out[removed].fillna(0).astype(int)
-    lead = ["trade_date", "expiry", "days", "quotes_in", "kept", "forward", "forward_method", "iv_source"]
-    tail = [c for c in ("k_min", "k_max", "error") if c in out.columns]
+    lead = [
+        "trade_date",
+        "expiry",
+        "days",
+        "quotes_in",
+        "kept",
+        "forward",
+        "forward_method",
+        "discount_factor",
+        "rate_pct",
+        "discount_method",
+        "parity_rate_pct",
+        "parity_se_bp",
+        "iv_source",
+    ]
+    tail = [c for c in ("k_min", "k_max", "discount_source", "error") if c in out.columns]
     return out[[c for c in lead if c in out.columns] + removed + tail]

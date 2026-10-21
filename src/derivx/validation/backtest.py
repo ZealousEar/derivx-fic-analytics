@@ -9,7 +9,9 @@ origin without one is skipped and reported, so every score has the stated
 horizon. Each (trade date, expiry) slice is cleaned with
 :func:`derivx.calibration.production.clean_chain` (expired and same-day
 expiries dropped, OTM quotes only, one quote per strike, put-call-parity
-forwards, vols re-inverted from bid/ask mids at ``rate``). Origin quotes are
+forwards, vols re-inverted from bid/ask mids, discounted with ``discount``
+- the Treasury curve of each trade date or put-call parity per expiry, see
+:mod:`derivx.vol.discounting` - else at the flat ``rate``). Origin quotes are
 kept within ``|k| <= std_band * atm_vol * sqrt(tau)`` (k = ln(K/F)).
 
 Calibration window: SVI (total variance, fitted with T = the origin's tau)
@@ -57,7 +59,7 @@ sample's distribution (labels only, never forecasts) and need
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -65,6 +67,7 @@ import pandas as pd
 
 from derivx.calibration.production import clean_chain
 from derivx.data.calendar import add_trading_days, trading_days_between
+from derivx.vol.discounting import Discounting
 from derivx.vol.quotes import CleanSlice, apply_std_band, atm_vol
 from derivx.vol.svi import fit_svi_strike_slice, svi_iv
 
@@ -87,8 +90,10 @@ class WalkForwardSettings:
     """``horizon``: trading days from origin to target; ``window``:
     snapshots pooled in the origin calibration; ``min_days`` /
     ``max_days``: calendar days to expiry an origin slice must be within
-    (``max_days`` None: no limit); ``rate``: continuously compounded
-    discount rate for vols re-inverted from mids; ``warm_start``: start each
+    (``max_days`` None: no limit); ``discount``: how premiums are
+    discounted (:class:`derivx.vol.discounting.Discounting`, one curve per
+    trade date), else the flat continuously compounded ``rate``, for vols
+    re-inverted from mids; ``warm_start``: start each
     SVI fit from the previous origin's parameters for the same expiry (one
     start instead of several; about twice as fast, the same fits to 1e-4
     vol bp on the synthetic history)."""
@@ -104,6 +109,7 @@ class WalkForwardSettings:
     warm_start: bool = True
     regime_tenor_days: float = 30.0
     min_regime_days: int = 3
+    discount: Optional[Discounting] = None
 
     def __post_init__(self) -> None:
         if int(self.horizon) < 1:
@@ -116,13 +122,17 @@ class WalkForwardSettings:
             raise ValueError("std_band must be > 0 or None")
 
     def as_dict(self) -> Dict[str, object]:
-        return asdict(self)
+        out = asdict(replace(self, discount=None))
+        out["discount"] = self.discount.describe() if self.discount is not None else {"mode": "rate"}
+        return out
 
 
 @dataclass
 class WalkForwardResult:
     """Everything a run produced (see the module docs). ``slices``: one row
-    per (origin, expiry); ``quotes``: one row per scored quote; ``daily``:
+    per (origin, expiry), with the origin SVI parameters (``svi_a`` ...
+    ``svi_sigma``, total variance for the origin tau; their day-to-day
+    stability: :mod:`derivx.validation.stability`); ``quotes``: one row per scored quote; ``daily``:
     per target day; ``summary``: per predictor, pooled over every scored
     quote; ``regimes``: per snapshot; ``by_regime``: per origin bucket;
     ``skipped``: origins or slices not scored, with the reason."""
@@ -273,7 +283,7 @@ def run_walk_forward(
     skipped: List[Dict[str, object]] = []
     regime_rows = []
     for td, df in history.items():
-        slices, bad = clean_chain(df, rate=cfg.rate, min_days=1.0)
+        slices, bad = clean_chain(df, rate=cfg.rate, min_days=1.0, discount=cfg.discount)
         for s in bad:
             skipped.append({"origin": td, "expiry": s.expiry, "stage": "hygiene", "reason": s.reason})
         day: Dict[pd.Timestamp, Tuple[CleanSlice, CleanSlice]] = {}
@@ -421,6 +431,7 @@ def run_walk_forward(
                 "window_snapshots": len(pool_k),
                 "n_calibration": int(k_pool.size),
                 "svi_fit_rmse_bp": fit.rmse_bp,
+                **{f"svi_{name}": float(value) for name, value in fit.params.items()},
                 "forward_origin": F_t,
                 "forward_target": F_T,
                 "noise_bp": _rmse(half) * 1e4,
