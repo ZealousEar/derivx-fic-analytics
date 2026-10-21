@@ -29,8 +29,8 @@ from derivx.rates.bonds import (
 )
 from derivx.rates.conventions import add_months
 from derivx.rates.curves import Curve, Market, get_conventions
-from derivx.risk.sensitivities import Position, key_rate_pv01, parallel_pv01
-from derivx.ui import rates_exports
+from derivx.risk.sensitivities import Position
+from derivx.ui import rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -453,6 +453,14 @@ def _bill_calculator() -> None:
         )
 
 
+def _ladder_rows(bumps, position: Position) -> List[Dict[str, object]]:
+    """Key-rate PV01 rows (as :func:`derivx.risk.sensitivities.key_rate_pv01`
+    gives them) from the shared bumped Treasury curves."""
+
+    values = bumps.key_rate_matrix([position.pv])[:, 0]
+    return [{**row, "pv01": float(v)} for row, v in zip(bumps.rows, values)]
+
+
 def render(market: Market) -> List[Position]:
     """Bond calculator tab; returns the bond position (none while an input
     is invalid). The T-bill calculator needs no curve and always shows."""
@@ -562,8 +570,9 @@ def _bond_calculator(market: Market) -> List[Position]:
         st.info("Key-rate risk needs a Treasury curve bootstrapped from quotes.")
     else:
         key = (bond, notional, z, _curve_key(govt))
-        rows = _cached("ladder", key, lambda: key_rate_pv01(position.pv, market, which="govt"))
-        pv01 = _cached("pv01", key, lambda: parallel_pv01(position.pv, market, which="govt"))
+        bumps = rates_risk.bumps(market, "govt")  # the Treasury curve rebuilt once per quote, shared with the BOOK
+        rows = _cached("ladder", key, lambda: _ladder_rows(bumps, position))
+        pv01 = _cached("pv01", key, lambda: bumps.parallel_pv01(position.pv))
         st.plotly_chart(_ladder_chart(rows), width="stretch", config=PLOTLY_2D_CONFIG, key="bond_ladder_chart")
         ladder = pd.DataFrame({"QUOTE": [r["label"] for r in rows], "PV01 ($, +1BP)": [r["pv01"] for r in rows]})
         st.download_button("Download key-rate CSV", _csv(ladder), file_name="bond_key_rates.csv", key="bond_kr_csv")

@@ -42,6 +42,7 @@ the negative number.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -52,6 +53,7 @@ from scipy.optimize import least_squares
 PARAM_NAMES = ("alpha", "beta", "rho", "nu", "shift")
 VOL_TYPES = ("lognormal", "normal")
 RHO_MAX = 0.9999  # calibration bound on |rho|
+_SCALARS = (float, int, np.floating, np.integer)
 
 
 def _validate_params(alpha, beta, rho, nu, T) -> None:
@@ -171,14 +173,39 @@ def hagan_sabr_normal_vol(F, K, T, alpha, beta, rho, nu, shift=0.0):
     return sabr_vol(F, K, T, alpha, beta, rho, nu, shift, "normal")
 
 
+def _linear_atm_alpha(F, T, atm_vol, beta, rho, nu, shift, vol_type: str) -> Optional[float]:
+    """Alpha of a normal-vol SABR with beta = 0 from its ATM vol, when every
+    input is a valid scalar: the ATM cubic's two leading coefficients are
+    then zero and its one root is ``atm_vol / c1``. None (the general
+    solver then runs, and raises on invalid inputs) otherwise."""
+
+    values = (beta, rho, nu, T, F, shift, atm_vol)
+    if vol_type != "normal" or not all(isinstance(v, _SCALARS) and not isinstance(v, bool) for v in values):
+        return None  # arrays and other types: the general path validates them
+    b, r, n, t, f, a = float(beta), float(rho), float(nu), float(T), float(F) + float(shift), float(atm_vol)
+    if b != 0.0 or not all(map(math.isfinite, (r, n, t, f, a))) or abs(r) >= 1.0 or n < 0.0 or t < 0.0:
+        return None
+    if f <= 0.0 or a <= 0.0:
+        return None
+    c1 = 1.0 + t * (2.0 - 3.0 * r * r) * n * n / 24.0
+    alpha = -(-a) / c1  # the companion-matrix root of [c1, -atm_vol], bit for bit
+    return float(alpha) if alpha > 0.0 else None
+
+
 def sabr_alpha_from_atm(F, T, atm_vol, beta, rho, nu, shift=0.0, vol_type: str = "lognormal") -> float:
     """Alpha that reproduces ``atm_vol`` at K = F exactly: the smallest
     positive root of Hagan's ATM cubic (West 2005).
 
     Lognormal: ``atm_vol f^(1-b) = alpha + T [(1-b)^2 alpha^3 / (24 f^(2-2b))
     + rho b nu alpha^2 / (4 f^(1-b)) + (2 - 3 rho^2) nu^2 alpha / 24]``;
-    normal: the same with ``-b(2-b)`` for ``(1-b)^2`` and an ``f^b`` factor."""
+    normal: the same with ``-b(2-b)`` for ``(1-b)^2`` and an ``f^b`` factor.
+    For normal SABR with beta = 0 (the rates cube's default) the cubic is
+    linear, ``alpha [1 + T (2 - 3 rho^2) nu^2 / 24] = atm_vol``, and is
+    solved directly (the same number the polynomial solver gives)."""
 
+    alpha = _linear_atm_alpha(F, T, atm_vol, beta, rho, nu, shift, vol_type)
+    if alpha is not None:
+        return alpha
     _check_vol_type(vol_type)
     _validate_params(1.0, beta, rho, nu, T)
     f = float(F) + float(shift)

@@ -284,3 +284,29 @@ def test_sabr_cube_reprices_its_nodes_and_interpolates():
     assert min(corners) <= mid <= max(corners)
     with pytest.raises(ValueError, match="full expiry x tenor grid"):
         SabrCube({(1.0, 2.0): grid[(1.0, 2.0)], (5.0, 10.0): grid[(5.0, 10.0)]})
+
+
+def test_normal_beta_zero_alpha_is_the_polynomial_root_bit_for_bit(monkeypatch):
+    """A3: the rates cube's normal SABR (beta = 0) solves its ATM equation,
+    a linear one, directly instead of through the cubic solver; the alpha
+    and every error are the same as the general path's, bit for bit."""
+
+    import derivx.vol.sabr as sabr
+
+    rng = np.random.default_rng(7)
+    cases = [(rng.uniform(-0.02, 0.08), rng.uniform(0.0, 30.0), rng.uniform(1e-5, 0.03), rng.uniform(-0.9999, 0.9999),
+              rng.uniform(0.0, 8.0), float(rng.choice([0.0, 0.03]))) for _ in range(3000)]  # fmt: skip
+    cases += [(0.01, 1.0, 0.01, 1.0, 0.5, 0.0), (0.01, 1.0, -0.01, 0.0, 0.5, 0.0), (-0.05, 1.0, 0.01, 0.0, 0.5, 0.0),
+              (0.02, float("nan"), 0.01, 0.0, 0.5, 0.03), (0.02, 1.0, 0.01, 0.0, -0.1, 0.03)]  # fmt: skip
+
+    def solve(F, T, atm, rho, nu, shift):
+        try:
+            return sabr.sabr_alpha_from_atm(F, T, atm, 0.0, rho, nu, shift, "normal")
+        except ValueError as exc:
+            return str(exc)
+
+    fast = [solve(*c) for c in cases]
+    monkeypatch.setattr(sabr, "_linear_atm_alpha", lambda *args, **kwargs: None)
+    general = [solve(*c) for c in cases]
+    assert fast == general
+    assert sum(isinstance(v, str) for v in fast) >= 5  # the invalid inputs still raise, with the same message

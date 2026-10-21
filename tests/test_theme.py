@@ -143,3 +143,80 @@ def test_heatmaps_that_print_values_use_readable_cell_colours(mode):
         assert text == theme.FOREGROUND, f"cell text colour {text!r}: set textfont=CELL_TEXT"
         scale = trace["colorscale"]
         assert theme.min_cell_contrast(scale, text) >= 4.5, scale
+
+
+def _reference_dark_layout(fig, height=380, xtitle=None, ytitle=None, legend=True):
+    """The style as Plotly's update calls apply it (the implementation before
+    the faster one-layout build, A3)."""
+
+    fig.update_layout(
+        paper_bgcolor=theme.BACKGROUND,
+        plot_bgcolor=theme.BACKGROUND,
+        font=dict(color=theme.FOREGROUND, family="Helvetica"),
+        height=height,
+        margin=dict(l=60, r=20, t=30, b=50),
+        showlegend=legend,
+        legend=dict(
+            **theme.LEGEND_BELOW,
+            bgcolor=theme.BACKGROUND,
+            bordercolor=theme.FOREGROUND,
+            borderwidth=1,
+            font=dict(family="IBM Plex Mono", color=theme.FOREGROUND),
+        ),  # fmt: skip
+        hovermode="x unified",
+    )
+    fig.update_xaxes(gridcolor=theme.GRID, zeroline=False, title_text=xtitle)
+    fig.update_yaxes(gridcolor=theme.GRID, zeroline=False, title_text=ytitle)
+    return fig
+
+
+def _pruned(value):
+    """A figure's JSON without empty dicts (an emptied title is ``{}`` one
+    way and absent the other; both draw the same)."""
+
+    if isinstance(value, dict):
+        out = {k: _pruned(v) for k, v in value.items()}
+        return {k: v for k, v in out.items() if v != {}}
+    if isinstance(value, list):
+        return [_pruned(v) for v in value]
+    return value
+
+
+def _figures():
+    import numpy as np
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    x = np.linspace(0.0, 30.0, 50)
+    yield go.Figure([go.Scatter(x=x, y=x, name="a")]), {}
+    bars = go.Figure([go.Bar(x=["a", "b"], y=[1.0, -2.0])])
+    bars.update_layout(barmode="relative", annotations=[dict(text="SOURCE: x", x=0, y=1)])
+    yield bars, dict(xtitle="CURVE QUOTE", ytitle="PV01 ($ PER +1BP)", height=460)
+    titled = go.Figure([go.Scatter(x=x, y=x)])
+    titled.update_xaxes(title_text="preset", range=[0, 5], title_font=dict(size=9))
+    titled.update_layout(legend=dict(title=dict(text="L")), font=dict(size=9), margin=dict(l=220))
+    yield titled, dict(legend=False)
+    grid = make_subplots(rows=2, cols=2, shared_xaxes=True)
+    for row in (1, 2):
+        for col in (1, 2):
+            grid.add_trace(go.Scatter(x=x, y=row * x + col), row=row, col=col)
+    yield grid, dict(xtitle="T", ytitle="V", height=500)
+    yield go.Figure(go.Heatmap(z=[[1, 2], [3, 4]], x=["1Y", "2Y"], y=["a", "b"])), dict(legend=False, xtitle="X")
+    overlay = go.Figure([go.Scatter(x=x, y=x)], layout=dict(yaxis2=dict(overlaying="y", side="right", title="R")))
+    yield overlay, dict(xtitle="A", ytitle="B")
+    yield go.Figure(go.Waterfall(x=["a", "b"], y=[1, 2], measure=["relative", "total"])), dict(legend=False)
+
+
+def test_dark_layout_matches_the_update_calls_it_replaces():
+    """A3: dark_layout builds one layout instead of three Plotly update
+    calls (10-15 ms a chart, on every chart of every rerun); the figure is
+    the same as before for blank figures, preset layouts and titles,
+    subplots, overlaid axes, heatmaps and waterfalls."""
+
+    import copy
+
+    for (figure, kwargs), (twin, _) in zip(_figures(), _figures()):
+        expected = _pruned(_reference_dark_layout(copy.deepcopy(twin), **kwargs).to_plotly_json())
+        assert _pruned(theme.dark_layout(figure, **kwargs).to_plotly_json()) == expected, kwargs
+    again = theme.dark_layout(theme.dark_layout(next(_figures())[0], ytitle="Y"), xtitle="X")
+    assert again.layout.yaxis.title.text is None and again.layout.xaxis.title.text == "X"  # None clears a title

@@ -616,6 +616,18 @@ def scenario_library(
     leave the Treasury curve alone when the market has none. Returns
     (shocks, notes on any left out)."""
 
+    has_govt = _has_quotes(market.govt)
+    key = (store.fingerprint, market.asof, market.is_multi_curve, has_govt)
+    library, notes = _cached("library", key, lambda: _rate_library(market, store, has_govt))  # shocks are immutable
+    library = list(library) + (fx_library(currencies, rep.currency) if rep is not None else [])
+    return library, list(notes)
+
+
+def _rate_library(market: Market, store: rh.HistoryStore, has_govt: bool) -> Tuple[Tuple[Shock, ...], Tuple[str, ...]]:
+    """The rate shocks of :func:`scenario_library` (built once per store,
+    valuation date and kind of market: the episodes and PCA factors read the
+    history)."""
+
     library = standard_library(store)
     notes: List[str] = []
     if market.is_multi_curve:
@@ -624,11 +636,9 @@ def scenario_library(
         library += pca_library(store, end=market.asof)
     except ValueError as exc:
         notes.append(f"PCA shocks: {exc}")
-    if not _has_quotes(market.govt):
+    if not has_govt:
         library = [replace(s, govt=False) for s in library]
-    if rep is not None:
-        library += fx_library(currencies, rep.currency)
-    return library, notes
+    return tuple(library), tuple(notes)
 
 
 def seed_risk(positions: Sequence[Position], market: Market, risk: Mapping[str, QuoteRisk]) -> None:
