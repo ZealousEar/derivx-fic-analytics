@@ -1234,9 +1234,12 @@ def _unit_smile_risk(
     by the spot). Cached on the inputs."""
 
     m, q, conv = FxMarket(1.0, rd, rf, tau_e, tau_d), TenorQuote(*quote), SmileConventions(*conventions)
+    base, error = _unit_smile(rd, rf, tau_e, tau_d, quote, conventions, model)  # cached: the page's own smile
+    if base is None:
+        return None, None, str(error)
     try:
-        table = quote_vegas(m, q, conv, model, k_over_s, call)
-        params = sabr_param_vegas(build_smile(m, q, conv, model), k_over_s, call) if model == "SABR" else None
+        table = quote_vegas(m, q, conv, model, k_over_s, call, base=base)
+        params = sabr_param_vegas(base, k_over_s, call) if model == "SABR" else None
     except ValueError as exc:
         return None, None, str(exc)
     return table, params, None

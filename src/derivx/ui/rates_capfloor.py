@@ -37,6 +37,7 @@ from derivx.risk.scenarios import theta
 from derivx.risk.sensitivities import Position, rate_pv01_gamma
 from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
+from derivx.ui.state import data_editor as persistent_editor  # edits survive mode switches (UIE-04)
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 from derivx.vol.sabr import calibrate_sabr_smile, sabr_vol
 
@@ -78,7 +79,7 @@ def _vol_table(model: str) -> Dict[float, float]:
     label, unit, top = VOL_UNITS[model]
     column = f"VOL ({label})"
     default = pd.DataFrame(DEFAULT_TERM_VOLS[model], columns=["EXPIRY (Y)", column])
-    edited = st.data_editor(
+    edited = persistent_editor(
         default,
         num_rows="dynamic",
         hide_index=True,
@@ -252,7 +253,7 @@ def _quote_tables(market: Market, layout: str):
     ccy = _currency(market)
     if layout == "ATM":
         default = illustrative_cap_atm(ccy).rename(columns={"maturity": "MATURITY", "vol_bp": "FLAT VOL (BP)"})
-        edited = st.data_editor(
+        edited = persistent_editor(
             default, num_rows="dynamic", hide_index=True, width="stretch", key=f"cap_strip_atm_{ccy}",
             column_config={"FLAT VOL (BP)": st.column_config.NumberColumn(min_value=0.0, max_value=2000.0,
                                                                           format="%.1f")},
@@ -263,7 +264,9 @@ def _quote_tables(market: Market, layout: str):
         mats = [_maturity(m, i + 1) for i, m in enumerate(rows["MATURITY"])]
         return mats, rows["FLAT VOL (BP)"].astype(float).to_numpy() * 1e-4, None, not edited.equals(default)
     default = illustrative_cap_strikes(ccy).rename(columns={"maturity": "MATURITY"})
-    edited = st.data_editor(default, num_rows="dynamic", hide_index=True, width="stretch", key=f"cap_strip_grid_{ccy}")
+    edited = persistent_editor(
+        default, num_rows="dynamic", hide_index=True, width="stretch", key=f"cap_strip_grid_{ccy}"
+    )
     rows = edited.dropna(how="all", subset=list(edited.columns[1:]))
     if rows.empty:
         raise ValueError("the cap quote grid needs at least one maturity row")
