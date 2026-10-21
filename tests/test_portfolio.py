@@ -767,3 +767,26 @@ def test_trades_priced_beyond_the_market_data_say_so():
     assert "C40 has caplets fixing after the last stripped caplet" in notes
     assert "W15 is outside the swaption cube (10Y x 30Y at most)" in notes
     assert "IN " not in notes and "not market data" in notes
+
+
+def test_a_hedge_not_worth_its_cost_is_no_hedge_whatever_the_rounding():
+    """Follow-up review: when no hedge was worth its bid/ask, the cost
+    penalty's root bracket could round to the same sign at both ends (here
+    61 / 7 * 7 is a ulp under 61), and the BOOK tab showed SciPy's "Cannot
+    size hedges: f(a) and f(b) must have different signs" instead of no
+    hedge. Random books hit it in about 2% of cases."""
+
+    target = np.array([60.0, 11.0])  # ||target|| = 61 exactly
+    H = np.array([[100.0, 0.0], [0.0, 30.0]])
+    assert (61.0 / 7.0) * 7.0 < 61.0
+    x = pf.optimise_hedge(target, H, np.array([1e9, 1e9]), 7.0)
+    assert np.array_equal(x, np.zeros(2))
+    rng = np.random.default_rng(0)
+    for _ in range(400):
+        t = rng.normal(size=6) * 10 ** rng.uniform(0, 5)
+        h = rng.normal(size=(6, 3)) * 10 ** rng.uniform(0, 3)
+        c = np.abs(rng.normal(size=3)) * 10 ** rng.uniform(-1, 4)
+        move = 10 ** rng.uniform(-1, 2)
+        x = pf.optimise_hedge(t, h, c, move)
+        best = pf.hedge_objective(t, h, x, c, move)
+        assert best <= pf.hedge_objective(t, h, np.zeros(3), c, move) * (1 + 1e-12)
