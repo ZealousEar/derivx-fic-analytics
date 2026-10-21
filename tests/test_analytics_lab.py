@@ -121,9 +121,9 @@ def test_calibration_defaults_skip_expired_slices_and_export_a_manifest():
 
 def test_model_comparison_shows_every_model_and_never_mixes_calls_and_puts():
     at = _lab()
-    assert at.selectbox(
-        key=next(k for k in at.session_state if str(k).startswith("lab_mc_exp_"))
-    ).value == pd.Timestamp("2026-11-20")
+    # Found through the widgets, not by iterating at.session_state (not iterable before Streamlit 1.6x).
+    expiry = next(sb for sb in at.selectbox if str(sb.key).startswith("lab_mc_exp_"))
+    assert expiry.value == pd.Timestamp("2026-11-20")
     at.button(key="lab_mc_run").click().run()
     assert not at.exception
     comp = at.session_state[lab.K_MC]["comp"]

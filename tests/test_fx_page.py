@@ -34,6 +34,9 @@ NOTIONAL = 1_000_000.0
 
 def _fx(**state) -> AppTest:
     at = AppTest.from_file(str(APP), default_timeout=180)
+    # Pin the page's trade date (default: today) to the TODAY the expectations use, so a run that
+    # crosses midnight does not compare a 20 October page with 21 October dates.
+    state.setdefault("fx_trade_date", TODAY)
     for key, value in state.items():
         at.session_state[key] = value
     at.run()
@@ -170,7 +173,13 @@ def test_delta_and_atm_strike_modes_solve_on_the_smile():
     d, m = _market("EURUSD", "3M", EURUSD_SPOT, 0.0375, 0.02)
     smile = build_smile(m, _quote("EURUSD", "3M"), SmileConventions("spot", "DNS", "market"))
     K = float(_cell(at, "STRIKE"))
-    assert fx_delta(m, K, smile.vol(K), True, "spot") == pytest.approx(0.25, abs=2e-5)  # strike shown to 0.1 pip
+    # The strike is shown to 0.1 pip (1e-5), so at the shown strike the delta is 25% only to within
+    # half a 0.1 pip times d(delta)/dK (up to ~4e-5 here; a fixed 2e-5 failed on some trade dates).
+    h = 1e-6
+    slope = (
+        fx_delta(m, K + h, smile.vol(K + h), True, "spot") - fx_delta(m, K - h, smile.vol(K - h), True, "spot")
+    ) / (2 * h)
+    assert fx_delta(m, K, smile.vol(K), True, "spot") == pytest.approx(0.25, abs=0.5e-5 * abs(slope) + 1e-7)
     assert K == pytest.approx(smile.strike_at_delta(0.25, True), abs=6e-6)
     at.radio(key="fx_strike_mode").set_value("ATM").run()
     assert float(_cell(at, "STRIKE")) == pytest.approx(smile.atm_strike, abs=6e-6)
