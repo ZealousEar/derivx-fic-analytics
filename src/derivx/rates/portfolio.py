@@ -1703,6 +1703,11 @@ def optimise_hedge(
     g_lo = g(lo)
     if g_lo >= 0.0:  # the book can be hedged (almost) exactly: the cheapest such hedge
         return state["x"]
+    # g(hi) >= 0 in exact arithmetic (the lasso never leaves more than the unhedged ||t||); it rounds to a hair
+    # below zero when no hedge is worth its cost (x = 0 at hi, hi * move_bp a ulp under ||t||): then hi is the
+    # root and its hedge (none) the answer, instead of brentq's "f(a) and f(b) must have different signs".
+    if g(hi) <= 0.0:
+        return state["x"]
     lam = brentq(g, lo, hi, xtol=hi * 1e-14, rtol=1e-14, maxiter=200)
     state["x"] = np.zeros(m)
     residual_norm(lam)
