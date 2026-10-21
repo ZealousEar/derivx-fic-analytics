@@ -383,13 +383,13 @@ hosted app's wake-up check).
 
 ## Tests and validation
 
-Test run on this revision (code at 5e41d7c; the commits after it change only the README and screenshots):
-`pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,445 tests from 71 files and took 17
+Test run on this revision (code at cc1d231; the commits after it change only the README):
+`pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,446 tests from 71 files and took 17
 minutes here on 4 cores; run single files while iterating.
 
 | Environment | Result |
 |---|---|
-| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,445 passed, 0 skipped, 0 failed |
+| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,446 passed, 0 skipped, 0 failed |
 | `pytest --nbmake notebooks` (Python 3.11.17, numpy 2.4.6, pandas 2.3.3, SciPy 1.17.1) | 3 passed |
 | `ruff check .` and `ruff format --check .` (ruff 0.17.1, the CI pin) | clean (208 files formatted) |
 | `mypy` (2.4.0, the CI pin, on the local versions above) | clean (no issues in 103 source files) |
