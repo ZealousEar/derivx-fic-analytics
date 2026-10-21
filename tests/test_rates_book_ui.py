@@ -10,11 +10,13 @@ import json
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from derivx.rates import portfolio as pf
+from derivx.rates.examples import EXAMPLE_ASOF
 from derivx.rates.indices import HullWhite
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -319,23 +321,129 @@ st.session_state["n_positions"] = len(rates_book.render(market))
 """
 
 
-def test_a_book_in_two_currencies_is_totalled_per_currency():
-    """A EUR book with a US Treasury: totals per currency, the mix flagged,
-    and every card still fits (the mixed labels were longer)."""
-
+def _mixed_book() -> pd.DataFrame:
     table = pf.example_blotter("EUR").astype(object)
     bond = {c: None for c in pf.COLUMNS} | dict(id="UST", type="bond", currency="USD", direction="long",
                                                 notional="10mm", maturity="2035-08-15", rate=4.25)  # fmt: skip
-    table = pd.concat([table, pd.DataFrame([bond])], ignore_index=True).astype(object)
+    return pd.concat([table, pd.DataFrame([bond])], ignore_index=True).astype(object)
+
+
+def _mixed_app(**state) -> AppTest:
     at = AppTest.from_string(MIXED_APP, default_timeout=600)
-    at.session_state["book_state"] = {"table": table, "source": "test book", "example": None, "gen": 3}
+    at.session_state["book_state"] = {"table": _mixed_book(), "source": "test book", "example": None, "gen": 3}
+    for key, value in state.items():
+        at.session_state[key] = value
     at.run()
     _ok(at)
+    return at
+
+
+def _frame(at: AppTest, column: str) -> pd.DataFrame:
+    return next(d.value for d in at.dataframe if column in d.value.columns)
+
+
+def _row(frame: pd.DataFrame, column: str, label: str) -> pd.Series:
+    return frame[frame[column] == label].iloc[0]
+
+
+def test_a_book_in_two_currencies_is_totalled_per_currency_and_converted():
+    """Review finding (R2, A1): totals added EUR trade P&L to USD bond P&L
+    without FX conversion. A EUR book with a US Treasury now shows a total
+    per currency and the whole book in USD at the ECB reference rate of the
+    valuation date, in the summary, the cards, the scenario grid (with FX
+    rows), the VaR, the hedges (per currency) and the export; every card
+    still fits."""
+
+    from derivx.risk.reporting import default_reporting
+
+    at = _mixed_app()
     assert at.session_state["n_positions"] == 8
-    assert any("more than one currency" in w.value for w in at.warning)
-    summary = next(d.value for d in at.dataframe if "DESCRIPTION" in d.value.columns)
-    assert {"TOTAL EUR", "TOTAL USD"} <= set(summary["ID"])
+    eurusd = default_reporting(EXAMPLE_ASOF).fx.quote("EURUSD")
+    texts = [w.value for w in at.warning] + [c.value for c in at.caption] + [m.label for m in at.metric]
+    assert not any("without FX conversion" in t or "MIXED" in t or "mixed" in t for t in texts)
+
+    summary = _frame(at, "DESCRIPTION")
+    assert {"TOTAL EUR", "TOTAL USD", "ALL IN USD"} <= set(summary["ID"])
+    eur, usd, book = (_row(summary, "ID", k) for k in ("TOTAL EUR", "TOTAL USD", "ALL IN USD"))
+    assert (eur["CCY"], usd["CCY"], book["CCY"]) == ("EUR", "USD", "USD")
+    for column in ("PV", "PV01", "GAMMA", "VEGA (NORMAL BP)"):
+        assert book[column] == pytest.approx(usd[column] + eur[column] * eurusd, rel=1e-12)
+    trades = summary[~summary["ID"].str.startswith(("TOTAL", "ALL IN"))]
+    assert eur["PV"] == pytest.approx(trades[trades["CCY"] == "EUR"]["PV"].sum(), rel=1e-12)
+    assert "EURUSD" in book["DESCRIPTION"] and str(EXAMPLE_ASOF) in book["DESCRIPTION"]
+    assert _metric(at, "BOOK PV (IN $)") == f"{round(book['PV']) + 0.0:,.0f}"
+    assert {"BOOK PV (€)", "BOOK PV ($)", "HIST VAR 1D (IN $)"} <= {m.label for m in at.metric}
+
+    grid = _frame(at, "SCENARIO")
+    assert {"EU1 (EUR)", "UST (USD)", "TOTAL EUR", "TOTAL USD", "ALL IN USD"} <= set(grid.columns)
+    rates = grid[~grid["SCENARIO"].str.startswith("FX ")]
+    np.testing.assert_allclose(rates["ALL IN USD"], rates["TOTAL USD"] + rates["TOTAL EUR"] * eurusd, rtol=1e-10)
+    up = _row(grid, "SCENARIO", "FX EURUSD +10%")
+    assert up["TOTAL EUR"] == 0.0 and up["TOTAL USD"] == 0.0  # FX moves no local value
+    assert up["ALL IN USD"] == pytest.approx(eur["PV"] * eurusd * 0.10, rel=1e-10)  # the euro book's translation
+    assert _row(grid, "SCENARIO", "FX EURUSD -10%")["ALL IN USD"] == pytest.approx(-up["ALL IN USD"], rel=1e-10)
+
+    var = _frame(at, "HIST VAR")
+    assert list(var["ID"])[-3:] == ["TOTAL USD", "TOTAL EUR", "ALL IN USD"]
+    assert _metric(at, "HIST VAR 1D (IN $)") == f"{round(_row(var, 'ID', 'ALL IN USD')['HIST VAR']) + 0.0:,.0f}"
+
     labels = [m.label for m in at.metric]
-    assert {"BOOK PV (€)", "BOOK PV ($)", "RESIDUAL (MIXED/BP)", "UNHEDGED (MIXED/BP)"} <= set(labels)
+    assert {"RESIDUAL RISK (€/BP)", "UNHEDGED RISK (€/BP)", "RESIDUAL RISK ($/BP)", "UNHEDGED RISK ($/BP)"} <= set(
+        labels
+    )
+    hedges = _frame(at, "HEDGE")
+    assert set(hedges[hedges["CURVE"] == "TREASURY"]["CCY"]) == {"USD"}
+    assert set(hedges[hedges["CURVE"] != "TREASURY"]["CCY"]) == {"EUR"}
     for metric in at.metric:
         assert len(metric.label) <= 20 and len(str(metric.value)) <= 14, (metric.label, metric.value)
+
+
+def test_mixed_book_reports_in_euros_and_at_rates_typed_in():
+    """REPORTING CURRENCY EUR converts the Treasury into euros; ENTER RATES
+    converts at the typed EURUSD and says so."""
+
+    from derivx.risk.reporting import default_reporting
+
+    eurusd = default_reporting(EXAMPLE_ASOF).fx.quote("EURUSD")
+    at = _mixed_app(rates_report_ccy="EUR")
+    summary = _frame(at, "DESCRIPTION")
+    eur, usd, book = (_row(summary, "ID", k) for k in ("TOTAL EUR", "TOTAL USD", "ALL IN EUR"))
+    assert book["CCY"] == "EUR" and book["PV"] == pytest.approx(eur["PV"] + usd["PV"] / eurusd, rel=1e-12)
+    assert "BOOK PV (IN €)" in [m.label for m in at.metric]
+    grid = _frame(at, "SCENARIO")
+    assert "ALL IN EUR" in grid.columns
+    # EURUSD +10%: the dollar bond is worth 1/1.1 - 1 = -9.09% in euros
+    up = _row(grid, "SCENARIO", "FX EURUSD +10%")
+    assert up["ALL IN EUR"] == pytest.approx(usd["PV"] / eurusd * (1.0 / 1.1 - 1.0), rel=1e-10)
+
+    typed = _mixed_app(rates_report_ccy="EUR", rates_fx_source="ENTER RATES", rates_fx_eurusd=1.25,
+                       rates_fx_gbpusd=1.40)  # fmt: skip
+    summary = _frame(typed, "DESCRIPTION")
+    eur, usd, book = (_row(summary, "ID", k) for k in ("TOTAL EUR", "TOTAL USD", "ALL IN EUR"))
+    assert book["PV"] == pytest.approx(eur["PV"] + usd["PV"] / 1.25, rel=1e-12)
+    assert "EURUSD 1.25000" in book["DESCRIPTION"] and "entered by you" in book["DESCRIPTION"]
+
+
+def test_mixed_book_export_states_the_conversion(monkeypatch):
+    from derivx.ui import rates_exports
+
+    seen = {}
+    original = rates_exports.export_row
+
+    def spy(kind, market, tables, inputs, model, key, store=None):
+        seen[kind] = (tables, inputs)
+        return original(kind, market, tables, inputs, model, key, store)
+
+    monkeypatch.setattr(rates_exports, "export_row", spy)
+    _mixed_app()
+    tables, inputs = seen["book"]
+    fx = inputs["reporting"]
+    assert fx["reporting_currency"] == "USD" and fx["converted"] and fx["position_currencies"] == ["USD", "EUR"]
+    assert fx["fx_asof"] == EXAMPLE_ASOF and fx["fx"]["EURUSD"] > 0 and "ECB" in fx["fx_source"]
+    report = tables["risk_report"]
+    pv = report[report["section"] == "pv"].set_index("id")
+    assert pv.loc["ALL IN USD", "value"] == pytest.approx(
+        pv.loc["TOTAL USD", "value"] + pv.loc["TOTAL EUR", "value"] * fx["fx"]["EURUSD"], rel=1e-12
+    )
+    assert {"TOTAL USD", "TOTAL EUR", "ALL IN USD"} <= set(tables["scenario_grid"].columns)
+    assert set(tables["hedges"]["CCY"]) <= {"EUR", "USD"}

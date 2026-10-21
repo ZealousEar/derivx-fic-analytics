@@ -194,8 +194,9 @@ def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
     """EUR trades are valued in euros; the cap caption compares the rate-quote
     buckets with the PV01 (basis spreads held) and reports the 3s6s spread
     buckets on their own; a carry horizon past a futures fixing revalues a
-    EURIBOR 3M book; a book with a dollar bond warns that totals mix
-    currencies."""
+    EURIBOR 3M book; a book with a dollar bond is totalled per currency and
+    converted to the reporting currency (review finding R2 / A1: the totals
+    used to add euros to dollars)."""
 
     at = _eur_app()
     at.radio(key="swap_kind").set_value("EURIBOR 3M").run()
@@ -221,8 +222,21 @@ def test_eur_labels_are_in_euros_and_ladder_sums_do_not_mix_basis_with_rates():
     at.sidebar.radio(key="rates_risk_scope").set_value("TAB TRADES").run()  # the tabs' swap, cap and bond
     at.number_input(key="scn_horizon").set_value(90).run()  # past the DEC26 futures fixing of the 3M curve
     assert not at.exception and not at.error, [e.value for e in at.error]
-    assert any("without FX conversion" in w.value for w in at.warning)  # EUR swaps and caps with a USD bond
-    assert any(m.label.startswith("TOTAL P&L (") and "€" in m.label for m in at.metric)
+    # EUR swaps and caps with a USD bond: a total per currency, and the book in USD at the ECB rate
+    from derivx.risk.reporting import default_reporting
+
+    eurusd = default_reporting(at.session_state["rates_asof"]).fx.quote("EURUSD")
+    explain = next(d.value for d in at.dataframe if "TOTAL P&L" in d.value.columns)
+    rows = explain.set_index("POSITION")
+    assert {"TOTAL EUR", "TOTAL USD", "ALL IN USD"} <= set(rows.index)
+    assert set(rows.loc[[i for i in rows.index if not str(i).startswith(("TOTAL", "ALL IN"))], "CCY"]) == {"EUR", "USD"}
+    for column in ("TOTAL P&L", "DELTA", "CARRY", "RESIDUAL"):
+        expected = rows.loc["TOTAL USD", column] + rows.loc["TOTAL EUR", column] * eurusd
+        assert rows.loc["ALL IN USD", column] == pytest.approx(expected, rel=1e-10, abs=1e-6)
+    assert float(_metric(at, "TOTAL P&L (IN $)").replace(",", "")) == pytest.approx(
+        rows.loc["ALL IN USD", "TOTAL P&L"], abs=0.006
+    )
+    assert not any("without FX conversion" in w.value for w in at.warning)
     _assert_bounded(at)
 
 

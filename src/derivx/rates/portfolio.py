@@ -72,10 +72,18 @@ the trade's currency and signed to the holder:
   grid points, caps and floors by caplet expiry, allocated linearly to the
   grid's expiries.
 
+Amounts are never added across currencies: :meth:`BookRisk.summary` totals
+each currency (``TOTAL USD``, ``TOTAL EUR``; ``TOTAL`` for a book in one
+currency) and, given a :class:`~derivx.risk.reporting.Reporting`, adds the
+whole book converted at stated FX spots (``ALL IN <R>``).
+
 :func:`hedge_book` sizes par hedge instruments (OIS / term-index swaps,
 tenor basis swaps, par Treasuries) to minimise ``move_bp * ||k + H x||_2 +
-sum_j cost_j |x_j|``: ``k`` is the book's stacked key-rate ladder (every
-quote of every curve, currency per bp), ``H`` the hedges' ladders,
+sum_j cost_j |x_j|`` for each currency's curves on their own (a EUR book
+with US Treasuries is hedged in EUR on the EUR curves and in USD on the
+Treasury curve; :attr:`HedgeResult.by_currency`): ``k`` is the stacked
+key-rate ladder of that currency's curves (every quote, currency per bp),
+``H`` the hedges' ladders,
 ``move_bp * ||r||_2`` the largest first-order loss of the residual book on
 any curve move whose bp moves have a Euclidean norm of ``move_bp``, and
 ``cost_j`` half the bid/ask (bp) times the hedge's DV01 to its own quote.
@@ -128,6 +136,7 @@ from derivx.rates.swaption_vol import (
 )
 from derivx.rates.swaptions import KINDS as SWAPTION_KINDS
 from derivx.rates.swaptions import Swaption, swaption_position
+from derivx.risk.reporting import ALL_IN, Reporting, add_total_rows, ordered
 from derivx.risk.scenarios import QuoteRisk
 from derivx.risk.sensitivities import Position
 from derivx.vol.implied import lognormal_to_normal_vol
@@ -146,7 +155,7 @@ BP = 1.0  # risk bump, bp
 NOISE = 0.005  # currency per bp: smaller hedge notionals and buckets are rebuild rounding
 DEFAULT_UNIT_NOTIONAL = 1e6
 TOTAL = "TOTAL"
-RESERVED_IDS = (TOTAL, "BOOK")  # the book's total rows and columns; "TOTAL USD" etc. too
+RESERVED_IDS = (TOTAL, "BOOK")  # the book's total rows and columns; "TOTAL USD", "ALL IN USD" etc. too
 FUTURE_PRICES = (70.0, 110.0)  # 100 - rate for rates of -10% to 30%, the range rates and strikes are checked on
 MAX_VOL = {"normal": (2000.0, "bp"), "black": (300.0, "%"), "shifted black": (300.0, "%")}  # the CAP-FLOOR tab's
 
@@ -463,7 +472,8 @@ def parse_trade(row: Mapping[str, object], number: int = 0) -> Tuple[Optional[Tr
     def issue(level: str, message: str) -> None:
         issues.append(BlotterIssue(level, number, trade_id, message))
 
-    if trade_id and (trade_id.upper() in RESERVED_IDS or trade_id.upper().startswith(TOTAL + " ")):
+    upper = trade_id.upper()
+    if trade_id and (upper in RESERVED_IDS or upper.startswith(TOTAL + " ") or upper.startswith(ALL_IN + " ")):
         issue("error", f"id {trade_id!r} is reserved for the book's totals: give the trade another id")
 
     raw_type = row.get("type")
@@ -1026,7 +1036,8 @@ def trade_position(trade: Trade, market: Market, vols: Optional[VolSet] = None) 
     else:
         instrument, vol_source = _swaption(trade, market, vols)
         position = swaption_position(instrument, market, trade.id)
-    position.details = {**position.details, "blotter": trade, "instrument": instrument, "vol_source": vol_source}
+    position.details = {**position.details, "blotter": trade, "instrument": instrument, "vol_source": vol_source,
+                        "currency": _currency_of(trade, market)}  # fmt: skip
     value = float(position.pv(market))
     if not math.isfinite(value):
         raise ValueError(f"no finite value on {market.asof}")
@@ -1195,9 +1206,9 @@ class BookRisk:
     def mixed(self) -> bool:
         return len(set(self.currencies)) > 1
 
-    def summary(self) -> pd.DataFrame:
-        """One row per trade and a TOTAL row per currency: id, type,
-        description, currency, pv, pv01, gamma, vega, vol source."""
+    def trade_rows(self) -> pd.DataFrame:
+        """One row per trade: id, type, description, currency, pv, pv01,
+        gamma, vega, vol source."""
 
         rows = []
         for k, (trade, position) in enumerate(zip(self.trades, self.positions)):
@@ -1205,23 +1216,17 @@ class BookRisk:
                          "currency": self.currencies[k], "pv": float(self.pv[k]), "pv01": float(self.pv01[k]),
                          "gamma": float(self.gamma[k]), "vega": float(self.vega[k]),
                          "vol_source": position.details.get("vol_source") or ""})  # fmt: skip
-        frame = pd.DataFrame(rows, columns=["id", "type", "description", "currency", "pv", "pv01", "gamma", "vega",
-                                            "vol_source"])  # fmt: skip
-        totals = []
-        for ccy in sorted(set(self.currencies)):
-            part = frame[frame["currency"] == ccy]
-            label = TOTAL if not self.mixed else f"{TOTAL} {ccy}"
-            totals.append(
-                {
-                    "id": label,
-                    "type": "",
-                    "description": f"{len(part)} trades",
-                    "currency": ccy,
-                    **{c: float(part[c].sum()) for c in ("pv", "pv01", "gamma", "vega")},
-                    "vol_source": "",
-                }
-            )
-        return pd.concat([frame, pd.DataFrame(totals)], ignore_index=True) if rows else frame
+        return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
+
+    def summary(self, reporting: Optional[Reporting] = None) -> pd.DataFrame:
+        """One row per trade, a TOTAL row per currency (``TOTAL`` for a book
+        in one currency, ``TOTAL USD``, ``TOTAL EUR``... otherwise) and, with
+        ``reporting`` when some trade is in another currency, ``ALL IN <R>``
+        (every trade converted at the stated FX spots; the description says
+        which): id, type, description, currency, pv, pv01, gamma, vega, vol
+        source (see :func:`summary_table`)."""
+
+        return summary_table([self], reporting)
 
     def ladder(self) -> pd.DataFrame:
         """Key-rate PV01s, long: curve, quote, kind, years, trade id,
@@ -1264,6 +1269,27 @@ class BookRisk:
             if row.expiry in table.index and row.bucket in table.columns:
                 table.loc[row.expiry, row.bucket] += row.vega
         return table
+
+
+SUMMARY_COLUMNS = ["id", "type", "description", "currency", "pv", "pv01", "gamma", "vega", "vol_source"]
+
+
+def summary_table(risks: Sequence[BookRisk], reporting: Optional[Reporting] = None) -> pd.DataFrame:
+    """The trades of one or more books (each priced on its own market, e.g.
+    one per currency) in one table, with a TOTAL row per currency and, with
+    ``reporting`` when some trade is in another currency, ``ALL IN <R>``:
+    amounts are never added across currencies unconverted."""
+
+    frame = pd.concat([r.trade_rows() for r in risks], ignore_index=True) if risks else pd.DataFrame()
+    if frame.empty:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+    table = add_total_rows(frame, ("pv", "pv01", "gamma", "vega"), "id", "currency", reporting, note="description")
+    total = ~table.index.isin(frame.index)
+    table.loc[total, ["type", "vol_source"]] = ""
+    notes = [str(d).replace("positions in", "trades in").replace("position in", "trade in")
+             for d in table.loc[total, "description"]]  # fmt: skip
+    table.loc[total, "description"] = notes
+    return table
 
 
 def _trade_curves(trade: Trade) -> List[str]:
@@ -1636,32 +1662,95 @@ def hedge_objective(target: np.ndarray, hedges: np.ndarray, x: np.ndarray, unit_
                  + np.asarray(unit_costs) @ np.abs(x))  # fmt: skip
 
 
-@dataclass
-class HedgeResult:
-    """Sized hedges and the residual risk they leave (currency per bp unless
-    stated): ``table`` one row per instrument (curve, instrument, notional
-    signed as in :class:`HedgeInstrument`, direction, par, bid/ask, cost,
-    pv01); ``ladder`` the stacked book, hedge and residual ladders;
-    ``positions`` the sized hedges."""
+@dataclass(frozen=True)
+class HedgeRisk:
+    """The risk of one currency's curves before and after the hedge, in that
+    currency: root sum of squares of the stacked key-rate ladder (per bp),
+    the bid/ask crossed (``cost``) and, with the cost penalty, the move size
+    ``move_bp`` the hedge was sized against."""
 
-    table: pd.DataFrame
-    ladder: pd.DataFrame
-    positions: List[Position]
+    currency: str
+    curves: Tuple[str, ...]
     risk_before: float
     risk_after: float
-    risk_removed: float
     cost: float
     move_bp: Optional[float]
-    multiples: np.ndarray
-    unit_ladders: np.ndarray
+
+    @property
+    def risk_removed(self) -> float:
+        """Share of the squared ladder the hedge takes out."""
+
+        before = self.risk_before
+        return 1.0 - (self.risk_after * self.risk_after) / (before * before) if before > 0 else 1.0
 
     @property
     def worst_before(self) -> Optional[float]:
+        """Largest first-order loss of the book on a curve move of
+        ``move_bp`` (Euclidean norm of the bp moves), unhedged."""
+
         return None if self.move_bp is None else self.move_bp * self.risk_before
 
     @property
     def worst_after(self) -> Optional[float]:
         return None if self.move_bp is None else self.move_bp * self.risk_after
+
+
+@dataclass
+class HedgeResult:
+    """Sized hedges and the residual risk they leave (currency per bp unless
+    stated): ``table`` one row per instrument (curve, currency, instrument,
+    notional signed as in :class:`HedgeInstrument`, direction, par, bid/ask,
+    cost, pv01); ``ladder`` the stacked book, hedge and residual ladders
+    (with each curve's currency); ``positions`` the sized hedges;
+    ``by_currency`` the risk of each currency's curves (hedged on their
+    own). ``risk_before``, ``risk_after``, ``risk_removed``, ``cost`` and
+    the ``worst_*`` losses are those of a book in one currency; for a book
+    in several they raise ``ValueError`` (amounts in different currencies do
+    not add): read :attr:`by_currency`."""
+
+    table: pd.DataFrame
+    ladder: pd.DataFrame
+    positions: List[Position]
+    by_currency: Dict[str, HedgeRisk]
+    move_bp: Optional[float]
+    multiples: np.ndarray
+    unit_ladders: np.ndarray
+
+    @property
+    def currencies(self) -> List[str]:
+        return list(self.by_currency)
+
+    def _one(self) -> HedgeRisk:
+        if len(self.by_currency) != 1:
+            raise ValueError(
+                f"the book's curves are in {' and '.join(self.by_currency)}: its risk does not add across currencies; "
+                "read it per currency (by_currency)"
+            )
+        return next(iter(self.by_currency.values()))
+
+    @property
+    def risk_before(self) -> float:
+        return self._one().risk_before
+
+    @property
+    def risk_after(self) -> float:
+        return self._one().risk_after
+
+    @property
+    def risk_removed(self) -> float:
+        return self._one().risk_removed
+
+    @property
+    def cost(self) -> float:
+        return self._one().cost
+
+    @property
+    def worst_before(self) -> Optional[float]:
+        return self._one().worst_before
+
+    @property
+    def worst_after(self) -> Optional[float]:
+        return self._one().worst_after
 
 
 def unit_ladders(
@@ -1703,20 +1792,45 @@ def hedge_book(
     ladders: Optional[np.ndarray] = None,
 ) -> HedgeResult:
     """Size ``instruments`` against the book's stacked key-rate ladder (see
-    :func:`optimise_hedge`); the cost of a hedge is half its bid/ask times
-    its quote DV01 per unit. ``ladders`` reuses :func:`unit_ladders`."""
+    :func:`optimise_hedge`), each currency's curves on their own: the
+    ladder of the curves of one currency (``risk.curve_currency``) is
+    hedged with the instruments on those curves, so no norm or cost adds
+    amounts in different currencies (a hedge on one currency's curves has
+    no risk on another's, so without costs this is the least-squares hedge
+    of the whole stacked ladder). The cost of a hedge is half its bid/ask
+    times its quote DV01 per unit. ``ladders`` reuses :func:`unit_ladders`."""
 
     curves = list(risk.risk)
     target = risk.stacked()
     H = unit_ladders(instruments, market, curves, bumps) if ladders is None else np.asarray(ladders, dtype=float)
     if H.shape != (target.size, len(instruments)):
         raise ValueError("the hedge ladders were built on another market")
+    known = set(curves)
+    stray = [h.label for h in instruments if h.curve not in known]
+    if stray:
+        raise ValueError(f"hedges on curves the book has no ladder for: {', '.join(stray)}")
     costs = np.array([0.5 * h.bid_ask_bp * h.quote_dv01 for h in instruments])
-    x = optimise_hedge(target, H, costs, move_bp)
+    row_ccy = np.array([risk.curve_currency[key] for key, qr in risk.risk.items() for _ in qr.labels], dtype=object)
+    hedge_ccy = [risk.curve_currency[h.curve] for h in instruments]
+    x = np.zeros(len(instruments))
+    for ccy in ordered(list(risk.curve_currency[k] for k in curves)):
+        rows_c = np.flatnonzero(row_ccy == ccy)
+        cols_c = [j for j, c in enumerate(hedge_ccy) if c == ccy]
+        if cols_c and rows_c.size:
+            x[cols_c] = optimise_hedge(target[rows_c], H[np.ix_(rows_c, cols_c)], costs[cols_c], move_bp)
     x[np.abs(x) * np.array([h.unit_notional for h in instruments]) < 0.01] = 0.0  # under a cent of notional
     hedge = H @ x
     residual = target + hedge
-    before, after = float(np.linalg.norm(target)), float(np.linalg.norm(residual))
+    penalised = move_bp is not None and bool(np.any(costs))
+    by_currency: Dict[str, HedgeRisk] = {}
+    for ccy in ordered(list(risk.curve_currency[k] for k in curves)):
+        rows_c = row_ccy == ccy
+        cols_c = [j for j, c in enumerate(hedge_ccy) if c == ccy]
+        by_currency[ccy] = HedgeRisk(
+            ccy, tuple(k for k in curves if risk.curve_currency[k] == ccy), float(np.linalg.norm(target[rows_c])),
+            float(np.linalg.norm(residual[rows_c])), float(sum(costs[j] * abs(x[j]) for j in cols_c)),
+            float(move_bp) if penalised and any(costs[j] for j in cols_c) else None,
+        )  # fmt: skip
     rows, positions = [], []
     for h, multiple, column, cost in zip(instruments, x, H.T, costs):
         if h.curve == GOVT_KEY:
@@ -1725,27 +1839,26 @@ def hedge_book(
             side = ("Receive fixed", "Pay fixed")
         else:
             side = ("Receive spread leg", "Pay spread leg")
-        rows.append({"curve": h.curve, "instrument": h.label, "notional": float(multiple * h.unit_notional),
+        rows.append({"curve": h.curve, "currency": risk.curve_currency[h.curve], "instrument": h.label,
+                     "notional": float(multiple * h.unit_notional),
                      "direction": side[0] if multiple > 0 else side[1] if multiple < 0 else "-", "par": h.par,
                      "bid_ask_bp": h.bid_ask_bp, "cost": float(cost * abs(multiple)),
                      "pv01": float(multiple * column.sum())})  # fmt: skip
         if multiple != 0.0:
             positions.append(_sized(h, float(multiple)))
     labels = [(key, label, float(y)) for key, qr in risk.risk.items() for label, y in zip(qr.labels, qr.years)]
-    ladder = pd.DataFrame([{"curve": k, "quote": q, "years": y, "book": float(a), "hedge": float(b),
-                            "residual": float(c)} for (k, q, y), a, b, c in zip(labels, target, hedge, residual)],
-                          columns=["curve", "quote", "years", "book", "hedge", "residual"])  # fmt: skip
-    table = pd.DataFrame(rows, columns=["curve", "instrument", "notional", "direction", "par", "bid_ask_bp", "cost",
-                                        "pv01"])  # fmt: skip
+    ladder = pd.DataFrame([{"curve": k, "currency": risk.curve_currency[k], "quote": q, "years": y, "book": float(a),
+                            "hedge": float(b), "residual": float(c)}
+                           for (k, q, y), a, b, c in zip(labels, target, hedge, residual)],
+                          columns=["curve", "currency", "quote", "years", "book", "hedge", "residual"])  # fmt: skip
+    table = pd.DataFrame(rows, columns=["curve", "currency", "instrument", "notional", "direction", "par",
+                                        "bid_ask_bp", "cost", "pv01"])  # fmt: skip
     return HedgeResult(
         table=table,
         ladder=ladder,
         positions=positions,
-        risk_before=before,
-        risk_after=after,
-        risk_removed=1.0 - (after * after) / (before * before) if before > 0 else 1.0,
-        cost=float(table["cost"].sum()),
-        move_bp=None if move_bp is None or not np.any(costs) else float(move_bp),
+        by_currency=by_currency,
+        move_bp=float(move_bp) if penalised else None,
         multiples=x,
         unit_ladders=H,
     )
@@ -1785,6 +1898,7 @@ __all__ = [
     "COLUMNS",
     "HedgeInstrument",
     "HedgeResult",
+    "HedgeRisk",
     "TRADE_TYPES",
     "Trade",
     "VolSet",
@@ -1800,5 +1914,6 @@ __all__ = [
     "parse_blotter",
     "price_book",
     "read_blotter_csv",
+    "summary_table",
     "trade_position",
 ]

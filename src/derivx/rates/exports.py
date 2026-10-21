@@ -7,7 +7,9 @@
 * :func:`book_cashflows` - the remaining cash flows of a book's swaps,
   basis swaps and bonds, and each live caplet / floorlet.
 * :func:`risk_report` - a book's PV, PV01, gamma, key-rate PV01s and
-  gammas per curve, vega and vega buckets in one long table.
+  gammas per curve, vega and vega buckets in one long table, with totals
+  per currency and, given a reporting currency, the book converted at
+  stated FX spots.
 
 Units are in the column names: ``_pct`` columns are percent, ``_bp`` basis
 points, ``df`` and decimals otherwise; times are ACT/365F years from the
@@ -19,13 +21,14 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, Curve, Market
 from derivx.rates.portfolio import BookRisk
+from derivx.risk.reporting import Reporting, ordered, total_label
 
 NODE_COLUMNS = ["curve", "pillar", "years", "df", "zero_cc_pct", "forward_cc_pct", "quote_kind", "quote_tenor",
                 "quote", "quote_units"]  # fmt: skip
@@ -151,42 +154,60 @@ def book_cashflows(risk: BookRisk, market: Market) -> pd.DataFrame:
 REPORT_COLUMNS = ["section", "id", "curve", "item", "value", "unit", "currency"]
 
 
-def risk_report(risk: BookRisk, extra: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def risk_report(
+    risk: Union[BookRisk, Sequence[BookRisk]],
+    extra: Optional[pd.DataFrame] = None,
+    reporting: Optional[Reporting] = None,
+) -> pd.DataFrame:
     """The book's risk in one long table: ``section`` is ``pv``, ``pv01``,
     ``gamma``, ``krd`` (key-rate PV01 of one quote), ``krd_gamma``,
     ``vega`` or ``vega_bucket``; ``id`` the trade (``TOTAL`` rows sum the
-    trades of one currency); ``unit`` states the convention."""
+    trades of a book in one currency, ``TOTAL USD``, ``TOTAL EUR``... those
+    of each currency of a book in several; with ``reporting``, ``ALL IN
+    <R>`` rows convert every trade at the stated FX spots, which ``item``
+    names); ``unit`` states the convention, ``currency`` that of
+    ``value``. ``risk`` may be several books, each priced on its own market
+    (one per currency): their trades are reported together, ``curve`` keys
+    are then read with ``currency``."""
 
+    risks = [risk] if isinstance(risk, BookRisk) else list(risk)
     rows: List[Dict[str, object]] = []
     units = {"pv": "currency", "pv01": "P&L per +1bp on every rate quote of every curve",
              "gamma": "P&L per (1bp)^2 of that move", "vega": "P&L per +1bp normal vol"}  # fmt: skip
-    for k, trade in enumerate(risk.trades):
-        for section, values in (("pv", risk.pv), ("pv01", risk.pv01), ("gamma", risk.gamma), ("vega", risk.vega)):
-            rows.append(
-                {
-                    "section": section,
-                    "id": trade.id,
-                    "curve": "",
-                    "item": trade.type,
-                    "value": float(values[k]),
-                    "unit": units[section],
-                    "currency": risk.currencies[k],
-                }
-            )
-    for ccy in sorted(set(risk.currencies)):
-        picks = [k for k, c in enumerate(risk.currencies) if c == ccy]
-        for section, values in (("pv", risk.pv), ("pv01", risk.pv01), ("gamma", risk.gamma), ("vega", risk.vega)):
-            rows.append(
-                {
-                    "section": section,
-                    "id": "TOTAL",
-                    "curve": "",
-                    "item": f"{len(picks)} trades",
-                    "value": float(np.sum(values[picks])),
-                    "unit": units[section],
-                    "currency": ccy,
-                }
-            )
+    sections = ("pv", "pv01", "gamma", "vega")
+    trades: List[Tuple[str, str, Dict[str, float]]] = []
+    for book in risks:
+        for k, trade in enumerate(book.trades):
+            values = {"pv": book.pv[k], "pv01": book.pv01[k], "gamma": book.gamma[k], "vega": book.vega[k]}
+            trades.append((trade.id, book.currencies[k], {s: float(v) for s, v in values.items()}))
+            for section in sections:
+                rows.append({"section": section, "id": trade.id, "curve": "", "item": trade.type,
+                             "value": float(values[section]), "unit": units[section],
+                             "currency": book.currencies[k]})  # fmt: skip
+    currencies = [c for _, c, _ in trades]
+    groups = ordered(currencies)
+    for ccy in groups:
+        picks = [v for _, c, v in trades if c == ccy]
+        for section in sections:
+            rows.append({"section": section, "id": total_label(ccy, len(groups) > 1), "curve": "",
+                         "item": f"{len(picks)} trades", "value": float(sum(v[section] for v in picks)),
+                         "unit": units[section], "currency": ccy})  # fmt: skip
+    if reporting is not None and reporting.needs_conversion(currencies):
+        rates = reporting.rates(currencies)
+        for section in sections:
+            rows.append({"section": section, "id": reporting.label, "curve": "",
+                         "item": f"{len(trades)} trades converted at {reporting.describe(currencies)}",
+                         "value": float(sum(v[section] * r for (_, _, v), r in zip(trades, rates))),
+                         "unit": units[section], "currency": reporting.currency})  # fmt: skip
+    for book in risks:
+        _ladder_rows(book, rows)
+    frame = pd.DataFrame(rows, columns=REPORT_COLUMNS)
+    return pd.concat([frame, extra], ignore_index=True) if extra is not None else frame
+
+
+def _ladder_rows(risk: BookRisk, rows: List[Dict[str, object]]) -> None:
+    """Key-rate and vega bucket rows of one book (see :func:`risk_report`)."""
+
     ladder = risk.ladder()
     for row in ladder.itertuples():
         rows.append(
@@ -223,5 +244,3 @@ def risk_report(risk: BookRisk, extra: Optional[pd.DataFrame] = None) -> pd.Data
                 "currency": risk.currencies[risk.ids.index(row.id)],
             }
         )
-    frame = pd.DataFrame(rows, columns=REPORT_COLUMNS)
-    return pd.concat([frame, extra], ignore_index=True) if extra is not None else frame
