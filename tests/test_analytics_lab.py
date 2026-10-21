@@ -79,8 +79,10 @@ def _charts(at: AppTest) -> dict:
 
 def test_every_tab_renders_on_the_bundled_sample_without_network(no_network):
     at = _lab()
-    banners = _banners(at)
-    assert len(banners) == 3  # market data, calibration, model comparison
+    banners = [b for b in _banners(at) if "<b>ACTIVE DATASET</b>" in b]
+    assert len(banners) == 4  # market data, calibration, vol surface, model comparison
+    rates = [b for b in _banners(at) if "<b>RATES HISTORY</b>" in b]  # AL-20: the lab's rates tab, real history
+    assert len(rates) == 1 and "US Treasury par yield curve" in rates[0] and "bundled snapshot" in rates[0]
     for b in banners:
         assert "SPY" in b and "session 2026-10-20" in b and "fetched 2026-10-20 20:59:39 UTC" in b
         assert "bundled sample: real SPY chain from Yahoo Finance" in b and "10,040 rows" in b
@@ -128,7 +130,13 @@ def test_calibration_defaults_skip_expired_slices_and_export_a_manifest():
     sample = load_sample_chain()
     assert m["kind"] == "calibration" and m["data"]["data_sha256"] == sample.fingerprint
     assert m["data"]["fetched_at_utc"].startswith("2026-10-20T20:59:39")
-    assert m["inputs"]["filters"] == {"min_volume": 10, "min_mid": 0.1, "max_spread": 0.4, "rate_cc": 0.0}
+    assert m["inputs"]["filters"] == {"min_volume": 10, "min_mid": 0.1, "max_spread": 0.4}
+    # AL-14: discounted with the Treasury curve of the trade date (SPY options are American: no parity DF), not 0%
+    disc = m["inputs"]["discounting"]
+    assert disc["mode"] == "curve" and list(disc["curves"]) == ["2026-10-20"]
+    assert disc["curves"]["2026-10-20"]["label"].startswith("US Treasury par curve of 2026-10-19")
+    rates = table.set_index("expiry")["rate_pct"]
+    assert 4.0 < rates.min() and rates.max() < 4.4 and (table["discount_method"] == "curve").all()
     zipped = lab.results_zip(m, lab._calibration_tables(stored["result"]))
     with zipfile.ZipFile(io.BytesIO(zipped)) as zf:
         assert {"manifest.json", "params.csv", "metrics.csv", "skipped.csv"} <= set(zf.namelist())
@@ -344,10 +352,16 @@ def test_the_equity_page_gets_standard_tenors_of_the_active_chain_with_provenanc
     meta = at.session_state["market_chain_meta"]
     assert meta["ticker"] == "SPY" and "expiries nearest 1W, 1M" in meta["source"]
     assert meta["data_sha256"] == load_sample_chain().fingerprint
+    assert meta["discounting"]["mode"] == "curve"
     at.sidebar.radio[0].set_value("[ EQUITY ]").run()
     at.radio(key="eq_smile_src").set_value("MARKET").run()
     assert not at.exception
     assert len(at.selectbox(key="eq_smile_expiry").options) == len(days)
+    # AL-14: the MARKET smile re-inverts the vols with the lab's Treasury discounting, not the pricer's RATE.R
+    caption = " ".join(c.value for c in at.caption)
+    assert (
+        "discounted as on the ANALYTICS lab: curve DF" in caption and "US Treasury par curve of 2026-10-19" in caption
+    )
 
 
 def test_a_file_with_only_the_required_columns_never_crashes_the_lab():

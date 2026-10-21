@@ -79,6 +79,8 @@ from derivx.fx.smile import (
     smile_by_delta,
     smile_strikes,
 )
+from derivx.fx.smile_risk import quote_vegas
+from derivx.fx.smile_risk import sabr_parameter_vegas as sabr_param_vegas
 from derivx.ui import pricer_calc as calc
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes
 from derivx.ui.pricer_page import PAGE_CSS, ZOOM_HINT
@@ -1211,6 +1213,85 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     for note in smile.notes:
         st.warning(note)
     _smile_tables(inp, sel)
+    if p is not None and inp.vol_src == "SMILE":
+        _smile_risk(inp, sel, p)
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _unit_smile_risk(
+    rd: float,
+    rf: float,
+    tau_e: float,
+    tau_d: float,
+    quote: Tuple,
+    conventions: Tuple[str, str, str],
+    model: str,
+    k_over_s: float,
+    call: bool,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
+    """Quote and SABR parameter vegas at spot 1 for strike ``k_over_s``
+    (GK is homogeneous of degree one in spot and strike: the caller scales
+    by the spot). Cached on the inputs."""
+
+    m, q, conv = FxMarket(1.0, rd, rf, tau_e, tau_d), TenorQuote(*quote), SmileConventions(*conventions)
+    try:
+        table = quote_vegas(m, q, conv, model, k_over_s, call)
+        params = sabr_param_vegas(build_smile(m, q, conv, model), k_over_s, call) if model == "SABR" else None
+    except ValueError as exc:
+        return None, None, str(exc)
+    return table, params, None
+
+
+def _smile_risk(inp: FxInputs, sel: Selected, p: Priced) -> None:
+    """Vega of the priced position to each market quote of its tenor (and
+    to the SABR parameters): VM-18."""
+
+    m, pair = sel.market, inp.pair
+    S = m.S
+    table, params, error = _unit_smile_risk(
+        inp.rd,
+        m.rf,
+        m.tau_e,
+        m.tau_d,
+        _quote_key(sel.quote),
+        (sel.delta_type, inp.atm_type, inp.strangle),
+        inp.model,
+        p.K / S,
+        inp.call,
+    )
+    st.markdown("#### / SMILE RISK · VEGA BY QUOTE")
+    if table is None:
+        st.warning(f"Smile risk is not available for this option: {error}.")
+        return
+    n = p.n_base
+    rows = [
+        {
+            "QUOTE": r.quote,
+            "QUOTED (%)": f"{100 * r.quoted:+.4f}" if r.quote != "ATM" else f"{100 * r.quoted:.4f}",
+            f"PER 1 {pair.base} ({pair.quote})": f"{S * r.vega:+.6f}",
+            f"POSITION ({pair.quote})": _money(n * S * r.vega, pair.quote),
+            "FITTED": "yes" if r.used else "no (checked only)",
+        }
+        for r in table.itertuples()
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        f"P&L per +1 vol point on one quote of the {sel.quote.tenor} tenor, the smile rebuilt from the bumped quotes "
+        f"({MODEL_LABELS[inp.model]}, same conventions) and the option repriced at the same strike "
+        f"{pair.fmt(p.K)}. ATM is the vega to a parallel move of the quoted smile (RR and BF are spreads to ATM); "
+        "RR is the skew (vanna) exposure, BF the wing (volga) exposure. Central differences of ±5 vol bp."
+    )
+    if params is not None:
+        prm = [
+            {
+                "SABR PARAMETER": r.parameter,
+                "VALUE": f"{r.value:+.6f}",
+                f"POSITION PER +0.01 ({pair.quote})": _money(n * S * r._4, pair.quote),
+            }
+            for r in params.itertuples()
+        ]
+        st.dataframe(pd.DataFrame(prm), hide_index=True, width="stretch")
+        st.caption("SABR (β = 1) parameter vegas: P&L of the position per +0.01 of α, ρ or ν, the others fixed.")
 
 
 def _smile_tables(inp: FxInputs, sel: Selected) -> None:

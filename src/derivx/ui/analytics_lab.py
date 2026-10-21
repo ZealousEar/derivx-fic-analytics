@@ -1,6 +1,10 @@
 """ANALYTICS lab: option-chain data with lineage, production SVI
-calibration, walk-forward validation against benchmarks, and smile-model
-comparison.
+calibration with smile risk, an arbitrage-free SSVI surface with Dupire
+local vol, walk-forward validation against benchmarks with daily parameter
+stability, smile-model comparison, and the same research tools on rates:
+curve histories (forecast walk-forward, regimes, curve-model comparison)
+and dated swaption / cap vol smiles (:mod:`derivx.ui.lab_vol`,
+:mod:`derivx.ui.lab_rates`).
 
 Data and lineage. The Market Data tab holds one *active dataset* (one
 snapshot): the bundled real SPY sample (loaded by default), an uploaded file
@@ -20,17 +24,25 @@ settings that produced it: when the active data change, a result is marked
 STALE until it is re-run. Each result downloads as a ZIP with a run
 manifest (:mod:`derivx.validation.manifest`) and CSV tables.
 
+Discounting (AL-14): premiums are discounted from the trade date to each
+expiry with the US Treasury curve of the trade date (the latest published
+on or before it, from the bundled snapshot or the download cache,
+bootstrapped by :mod:`derivx.rates.curves`), or, for European-style index
+options, with the discount factor put-call parity implies per expiry
+(Treasury curve where parity fails its gates), or a flat input rate
+(:mod:`derivx.vol.discounting`). The hygiene table shows each expiry's DF,
+effective rate and where it came from.
+
 Units: strikes and premiums in the underlying's currency per share, vols
 as per-annum decimals (``*_bp`` columns and chart axes: vol basis points,
 1 bp = 0.0001), ``k = ln(K/F)`` on put-call-parity forwards, ``tau`` in
-ACT/365F years, horizons in exchange trading days.
+ACT/365F years, rates continuously compounded, horizons in exchange
+trading days.
 """
 
 from __future__ import annotations
 
 import gzip
-import hashlib
-import html
 import json
 import time
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -41,6 +53,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from derivx.calibration.production import ChainCalibration, calibrate_chain
+from derivx.data import rates_history as rh
 from derivx.data.calendar import missing_trading_days
 from derivx.data.chain_schema import (
     ChainDataset,
@@ -61,25 +74,38 @@ from derivx.models.comparison import (
     pairwise_wins,
     summarise_comparison,
 )
+from derivx.ui import lab_rates, lab_vol
+from derivx.ui.lab_common import banner, downloads, fingerprint, legend, stale_notice, stats
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.state import PERSIST
-from derivx.ui.theme import ACCENT, FOREGROUND, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, SERIES, dark_layout
 from derivx.validation.backtest import PREDICTORS, WalkForwardResult, WalkForwardSettings, run_walk_forward
-from derivx.validation.manifest import build_manifest, jsonable, manifest_bytes, results_zip
+from derivx.validation.manifest import build_manifest, jsonable, results_zip  # noqa: F401 (results_zip: re-export)
+from derivx.vol.discounting import Discounting, european_style, treasury_discount
 from derivx.vol.quotes import REASONS
 from derivx.vol.svi import svi_iv
 
 ANALYTICS_TABS = [
     "Market Data",
     "Production Calibration",
+    "Vol Surface",
     "Walk-Forward Validation",
     "Model Comparison",
+    "Rates Curves",
+    "Rates Vol History",
 ]
 UPLOAD_TYPES = ["csv", "gz", "parquet", "pq", "txt"]
 PULL_BUCKET_S = 300  # Yahoo pulls are shared between sessions within one 5-minute bucket
 MIN_FIT_DAYS = 2.0  # expiries closer than this are not fitted or scored
 PRICER_TENORS_DAYS = (7.0, 30.0, 61.0, 91.0, 182.0, 365.0)  # expiries handed to the EQUITY page's MARKET smile
 SPOT_DRIFT_WARN = 1e-3  # warn when spot moved more than 0.1% between the first and last expiry response of a fetch
+
+DISCOUNT_CHOICES: Dict[str, str] = {
+    "auto": "Auto: put-call parity for European index options, else the US Treasury curve",
+    "curve": "US Treasury curve of the trade date",
+    "parity": "Put-call parity per expiry (European options; Treasury curve where it fails)",
+    "rate": "Flat rate (input)",
+}
 
 # session-state keys (results are per session; nothing here is shared)
 K_DATA = "lab_dataset"
@@ -134,11 +160,10 @@ def init_state() -> None:
 # -- helpers -------------------------------------------------------------------
 
 
-def _key(*parts) -> str:
-    """Fingerprint of JSON-able parts (data hashes, filters, settings)."""
-
-    blob = json.dumps(jsonable(list(parts)), sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()
+_key = fingerprint
+_downloads = downloads
+_legend = legend
+_stats = stats
 
 
 def _day(value) -> str:
@@ -174,63 +199,20 @@ def _banner(
         *(["SYNTHETIC ROWS: not market data"] if synth_rows else []),
         *extra,
     ]
-    is_synth = labelled or bool(synth_rows)
-    css = " ".join(c for c in ("dx-lab-banner", kind, "synthetic" if is_synth else "") if c)
-    body = " · ".join(html.escape(p) for p in parts)
-    st.markdown(f"<div class='{css}'><b>{html.escape(label)}</b> · {body}</div>", unsafe_allow_html=True)
-
-
-def _downloads(stem: str, manifest: Mapping[str, object], tables: Mapping[str, pd.DataFrame], key: str) -> None:
-    c1, c2 = st.columns(2)
-    c1.download_button(
-        "Download results (.zip: manifest + CSVs)",
-        results_zip(manifest, tables),
-        file_name=f"{stem}.zip",
-        mime="application/zip",
-        key=f"{key}_zip",
-        on_click="ignore",
-        width="stretch",
-    )
-    c2.download_button(
-        "Download run manifest (.json)",
-        manifest_bytes(manifest),
-        file_name=f"{stem}_manifest.json",
-        mime="application/json",
-        key=f"{key}_manifest",
-        on_click="ignore",
-        width="stretch",
-    )
+    banner(label, parts, kind, synthetic=labelled or bool(synth_rows))
 
 
 def _stale_notice(stored: Mapping[str, object], data_key: str, settings_key: str, what: str) -> bool:
     """Warn when a stored result no longer matches the data or settings;
     True when the data changed (the result is STALE)."""
 
-    if stored.get("data_key") != data_key:
-        _banner(stored["provenance"], label=f"STALE {what.upper()}: COMPUTED ON", kind="stale")
-        st.warning(
-            f"These {what} results were computed on the dataset above, not on the active one (or with other "
-            "filters). Re-run to update them."
-        )
-        return True
-    if stored.get("settings_key") != settings_key:
-        st.info(f"Settings changed since this {what} run: press the button to apply them.")
-    return False
-
-
-def _legend() -> Dict[str, object]:
-    """Horizontal legend at the bottom of the figure, below the x-axis title, in the foreground colour."""
-
-    return dict(**LEGEND_BELOW, font=dict(color=FOREGROUND))
-
-
-def _stats(items: Sequence[Tuple[str, str]]) -> None:
-    """A row of labelled numbers that reflows on narrow screens."""
-
-    cells = "".join(
-        f"<div class='dx-lab-stat'><span>{html.escape(k)}</span><b>{html.escape(v)}</b></div>" for k, v in items
+    return stale_notice(
+        stored,
+        data_key,
+        settings_key,
+        what,
+        lambda: _banner(stored["provenance"], label=f"STALE {what.upper()}: COMPUTED ON", kind="stale"),
     )
-    st.markdown(f"<div class='dx-lab-stats'>{cells}</div>", unsafe_allow_html=True)
 
 
 def _manifest(kind: str, prov: Mapping, inputs: Mapping, model: Mapping, seed=None) -> Dict[str, object]:
@@ -339,11 +321,97 @@ def _csv_bytes(chain: pd.DataFrame, compress: bool = False) -> bytes:
 
 
 @st.cache_data(max_entries=8, show_spinner=False)
-def _hygiene(chain: pd.DataFrame, rate: float) -> pd.DataFrame:
-    """Per-expiry hygiene report (content-keyed: the same quotes and rate
-    give the same report in any session)."""
+def _hygiene(chain: pd.DataFrame, discount: Discounting) -> pd.DataFrame:
+    """Per-expiry hygiene report (content-keyed: the same quotes and
+    discounting give the same report in any session)."""
 
-    return hygiene_report(chain, rate=rate)
+    return hygiene_report(chain, discount=discount)
+
+
+# -- discounting -------------------------------------------------------------------
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def _treasury_curves(signature: Tuple[Tuple[str, str], ...], days: Tuple[str, ...]):
+    """(trade date, Treasury curve) pairs for ``days`` (ISO dates); dates
+    without a curve within a week are left out."""
+
+    store = lab_rates.rates_store(signature)
+    out = []
+    for day in days:
+        curve = treasury_discount(store, pd.Timestamp(day))
+        if curve is not None:
+            out.append((day, curve))
+    return tuple(out)
+
+
+def _discount_controls(prefix: str, ticker: Optional[str], trade_dates: Sequence) -> Tuple[Discounting, List[str]]:
+    """The discounting widgets of a tab (keys ``{prefix}_discount`` and
+    ``{prefix}_rate``): returns the :class:`Discounting` and notes to show
+    (warnings start with '!')."""
+
+    c1, c2 = st.columns([3, 1])
+    choice = c1.selectbox(
+        "Discount premiums with",
+        list(DISCOUNT_CHOICES),
+        format_func=DISCOUNT_CHOICES.get,
+        key=f"{prefix}_discount",
+        persist_state=PERSIST,
+        help="Vols are re-inverted from bid/ask mids with Black-76 on the parity forward and this discount factor "
+        "(trade date to expiry). Put-call parity DFs are only valid for European options: SPY, QQQ and single "
+        "stocks list American options, whose early-exercise premium biases the parity slope.",
+    )
+    rate_pct = c2.number_input(
+        "Flat / fallback rate r (% cc)",
+        min_value=-5.0,
+        max_value=20.0,
+        value=0.0,
+        step=0.25,
+        key=f"{prefix}_rate",
+        persist_state=PERSIST,
+        help="Continuously compounded. Used in 'Flat rate' mode, and for a trade date the rates store has no "
+        "Treasury curve for (an input, not market data).",
+    )
+    rate = float(rate_pct) / 100.0
+    notes: List[str] = []
+    european = european_style(ticker)
+    mode = ("parity" if european else "curve") if choice == "auto" else choice
+    if mode == "rate":
+        return Discounting.flat(rate), [f"flat rate {rate:.2%} cc (an input, not market data)"]
+    if mode == "parity" and not european:
+        notes.append(
+            f"!{ticker or 'This underlying'} is not a known European-style index: its options are probably "
+            "American, and their early-exercise premium biases the put-call-parity discount factor (the gates "
+            "fall back to the Treasury curve where the implied rate is more than 100 bp from it)."
+        )
+    days = tuple(sorted({pd.Timestamp(d).date().isoformat() for d in trade_dates}))
+    signature = rh.cache_signature()
+    try:
+        curves = _treasury_curves(signature, days)
+    except ValueError as exc:  # a broken cached curve must not take the page down
+        curves = ()
+        notes.append(f"!The Treasury curve could not be bootstrapped ({exc}).")
+    missing = [d for d in days if d not in {k for k, _ in curves}]
+    if missing:
+        notes.append(
+            f"!No US Treasury curve within a week before {', '.join(missing[:4])}"
+            f"{'...' if len(missing) > 4 else ''}: those trade dates are discounted at the flat fallback rate "
+            f"{rate:.2%}. Refresh the rates data on the RATES page (LIVE mode) to extend the curve history."
+        )
+    if not curves and mode == "curve":
+        return Discounting.flat(rate), notes
+    if curves:
+        notes.append(f"{curves[-1][1].label}" + (f" (+{len(curves) - 1} other trade dates)" if len(curves) > 1 else ""))
+    return Discounting(mode, rate, curves), notes
+
+
+def _show_discount_notes(notes: Sequence[str]) -> None:
+    for note in notes:
+        if note.startswith("!"):
+            st.warning(note[1:])
+    plain = [n for n in notes if not n.startswith("!")]
+    if plain:
+        st.caption("Discounting: " + "; ".join(plain) + ".")
 
 
 def _load_controls() -> None:
@@ -501,7 +569,9 @@ def _fetch_status_panel(status: Optional[Mapping[str, object]]) -> None:
         )
 
 
-def _publish_to_pricer(ds: ChainDataset, prov: Mapping, filtered: pd.DataFrame, report: pd.DataFrame, filters) -> None:
+def _publish_to_pricer(
+    ds: ChainDataset, prov: Mapping, filtered: pd.DataFrame, report: pd.DataFrame, filters, discount: Discounting
+) -> None:
     """The EQUITY page's MARKET smile reads ``st.session_state['market_chain']``:
     give it the expiries nearest the standard tenors (each one SVI fit there),
     with the dataset's provenance."""
@@ -516,7 +586,9 @@ def _publish_to_pricer(ds: ChainDataset, prov: Mapping, filtered: pd.DataFrame, 
         "fetched_at_utc": ds.fetched_at_utc,
         "data_sha256": prov["data_sha256"],
         "filters": dict(filters),
+        "discounting": discount.describe(),
     }
+    st.session_state["market_chain_discount"] = discount  # the EQUITY page's MARKET smile discounts the same way
 
 
 def _render_market_data_tab() -> Optional[Dict[str, object]]:
@@ -537,30 +609,21 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         _banner(prov)
 
     st.markdown("#### / LIQUIDITY FILTERS")
-    f1, f2, f3, f4, f5 = st.columns(5)
+    f1, f2, f3, f4 = st.columns(4)
     min_volume = f1.number_input("Min volume", min_value=0, value=10, step=5, key="lab_minvol", persist_state=PERSIST)
     min_mid = f2.number_input("Min mid", min_value=0.0, value=0.10, step=0.05, key="lab_minmid", persist_state=PERSIST)
     max_spread = f3.number_input(
         "Max rel spread", min_value=0.01, value=0.40, step=0.05, key="lab_maxspread", persist_state=PERSIST
     )
     no_cap = f4.checkbox("No spread cap", value=False, key="lab_nocap", persist_state=PERSIST)
-    rate_pct = f5.number_input(
-        "Rate r (% cc)",
-        min_value=-5.0,
-        max_value=20.0,
-        value=0.0,
-        step=0.25,
-        key="lab_rate",
-        persist_state=PERSIST,
-        help="Continuously compounded discount rate used to re-invert vols from bid/ask mids (an input, not market "
-        "data). At 0% vols are biased low by about r x T in price terms (tens of vol bp at 1 year for r = 4%).",
-    )
     filters = {
         "min_volume": int(min_volume),
         "min_mid": float(min_mid),
         "max_spread": None if no_cap else float(max_spread),
-        "rate_cc": float(rate_pct) / 100.0,
     }
+    st.markdown("#### / DISCOUNTING")
+    discount, disc_notes = _discount_controls("lab", ds.ticker, ds.trade_dates)
+    _show_discount_notes(disc_notes)
     try:
         filtered = apply_liquidity_filters(
             raw, min_volume=filters["min_volume"], max_spread=filters["max_spread"], min_mid=filters["min_mid"]
@@ -569,7 +632,7 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         st.session_state["market_chain"] = raw.iloc[0:0]
         st.error(f"The liquidity filters cannot be applied to this chain: {exc}")
         return None
-    data_key = _key(prov["data_sha256"], filters)
+    data_key = _key(prov["data_sha256"], filters, discount.describe())
     if filtered.empty:
         st.session_state["market_chain"] = filtered
         st.warning(
@@ -579,8 +642,8 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         )
         return None
     with st.spinner("Cleaning quotes (hygiene)..."):
-        report = _hygiene(filtered, filters["rate_cc"])
-    _publish_to_pricer(ds, prov, filtered, report, filters)
+        report = _hygiene(filtered, discount)
+    _publish_to_pricer(ds, prov, filtered, report, filters, discount)
     usable = report[(report["days"] >= MIN_FIT_DAYS) & (report["kept"] >= 8)] if not report.empty else report
     spots = pd.to_numeric(raw["underlying_price"], errors="coerce").dropna()
     spot_txt = (
@@ -606,8 +669,10 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         "Removed, by reason: "
         + "; ".join(f"{k}: {v}" for k, v in REASONS.items() if k != "outside_band")
         + ". forward_method: parity = put-call parity on the slice's mids; interpolated = ln F linear in T from the "
-        f"other parity forwards; carry = spot (no parity). {len(usable)} expiries have >= {MIN_FIT_DAYS:g} days and "
-        ">= 8 OTM quotes."
+        f"other parity forwards; carry = spot (no parity). discount_factor: trade date to expiry; rate_pct: its cc "
+        "rate -ln(DF)/tau in %; discount_method: curve (Treasury curve of the trade date), parity (put-call parity "
+        "regression, with parity_rate_pct and its standard error parity_se_bp), rate (flat input); "
+        f"discount_source says why. {len(usable)} expiries have >= {MIN_FIT_DAYS:g} days and >= 8 OTM quotes."
     )
     with st.expander(f"Filtered quotes ({len(filtered):,} rows)"):
         st.dataframe(filtered, hide_index=True, width="stretch")
@@ -634,7 +699,17 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
     )
     d3.download_button(
         "Provenance (.json)",
-        json.dumps(jsonable({"dataset": prov, "filters": filters, "fetch_status": active.get("status")}), indent=2),
+        json.dumps(
+            jsonable(
+                {
+                    "dataset": prov,
+                    "filters": filters,
+                    "discounting": discount.describe(),
+                    "fetch_status": active.get("status"),
+                }
+            ),
+            indent=2,
+        ),
         file_name=f"{stem}_provenance.json",
         mime="application/json",
         key="lab_dl_prov",
@@ -645,6 +720,7 @@ def _render_market_data_tab() -> Optional[Dict[str, object]]:
         "chain": filtered,
         "provenance": prov,
         "filters": filters,
+        "discount": discount,
         "data_key": data_key,
         "report": report,
         "dataset": ds,
@@ -771,7 +847,7 @@ def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
         "enforce_arbitrage": bool(enforce),
         "cv_folds": 5,
         "min_days": MIN_FIT_DAYS,
-        "rate_cc": ctx["filters"]["rate_cc"],
+        "discounting": ctx["discount"].describe(),
     }
     settings_key = _key(settings)
     if st.button("Calibrate selected expiries", key="lab_cal_run", width="stretch", disabled=not sel):
@@ -782,7 +858,7 @@ def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
                 enforce_arbitrage=enforce,
                 std_band=std_band,
                 moneyness_band=band,
-                rate=settings["rate_cc"],
+                discount=ctx["discount"],
                 min_days=MIN_FIT_DAYS,
                 cv_folds=5,
             )
@@ -815,8 +891,9 @@ def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
         "rmse_bp: in-sample RMSE in vol bp; cv_rmse_bp / spline_cv_rmse_bp: 5-fold cross-validated RMSE of SVI and "
         "of a cubic spline of IV in ln K/F at held-out interior strikes (the spline interpolates, so only held-out "
         "errors compare). forward_method: parity / interpolated / carry. Vols re-inverted from bid/ask mids with "
-        f"Black-76 at r = {stored['settings']['rate_cc']:.2%} cc. min_g: Gatheral butterfly density minimum (>= 0 "
-        "is arbitrage-free); calendar_ok: total variance non-decreasing vs the previous fitted expiry."
+        "Black-76 on each expiry's discount factor (rate_pct: its cc rate in %; discount_method: curve, parity or "
+        "rate, see the hygiene table). min_g: Gatheral butterfly density minimum (>= 0 is arbitrage-free); "
+        "calendar_ok: total variance non-decreasing vs the previous fitted expiry."
     )
     labels = [_day(s.expiry) for s in result.slices]
     pick = st.selectbox("Show expiry", labels, key=f"lab_cal_show_{stored['settings_key'][:10]}")
@@ -833,6 +910,7 @@ def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
     with p2:
         st.markdown("#### / DIAGNOSTICS")
         st.json(jsonable(slc.diagnostics), expanded=1)
+    lab_vol.smile_risk_section(slc, key=f"lab_risk_{pick}")
     stem = f"calibration_{(prov.get('ticker') or 'chain').lower()}_{prov['trade_dates'][0]}"
     _downloads(stem, stored["manifest"], tables, key="lab_cal_dl")
 
@@ -992,7 +1070,7 @@ def _render_walkforward_tab() -> None:
         )
         return
     st.markdown("#### / FILTERS AND SETTINGS")
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3 = st.columns(3)
     filters = {
         "min_volume": int(
             f1.number_input("Min volume", min_value=0, value=10, step=5, key="lab_wf_minvol", persist_state=PERSIST)
@@ -1006,9 +1084,8 @@ def _render_walkforward_tab() -> None:
             )
         ),
     }
-    rate = (
-        float(f4.number_input("Rate r (% cc)", -5.0, 20.0, 0.0, 0.25, key="lab_wf_rate", persist_state=PERSIST)) / 100
-    )
+    discount, disc_notes = _discount_controls("lab_wf", ds.ticker, ds.trade_dates)
+    _show_discount_notes(disc_notes)
     s1, s2, s3, s4 = st.columns(4)
     horizon = int(s1.number_input("Horizon (trading days)", 1, 5, 1, key="lab_wf_horizon", persist_state=PERSIST))
     max_window = max(1, min(10, len(ds.chains) - horizon))
@@ -1033,9 +1110,15 @@ def _render_walkforward_tab() -> None:
     )
     enforce = s4.checkbox("Enforce no-arbitrage", value=True, key="lab_wf_enforce", persist_state=PERSIST)
     settings = WalkForwardSettings(
-        horizon=horizon, window=window, rate=rate, max_days=max_days, enforce_arbitrage=enforce, min_days=MIN_FIT_DAYS
+        horizon=horizon,
+        window=window,
+        rate=discount.rate,
+        discount=discount,
+        max_days=max_days,
+        enforce_arbitrage=enforce,
+        min_days=MIN_FIT_DAYS,
     )
-    data_key = _key(prov["data_sha256"], filters)
+    data_key = _key(prov["data_sha256"], filters, discount.describe())
     settings_key = _key(settings.as_dict())
     run = st.button("Run walk-forward test", key="lab_wf_run", width="stretch")
     prepared = None
@@ -1057,8 +1140,12 @@ def _render_walkforward_tab() -> None:
             ),
         }
     stored = st.session_state.get(K_WF)
-    if not stored:
-        return
+    if stored:
+        _walkforward_results(stored, data_key, settings_key, prov)
+    lab_vol.stability_section(lambda: _prepared_history(ds, filters), discount, max_days, data_key, prov, _banner)
+
+
+def _walkforward_results(stored: Mapping[str, object], data_key: str, settings_key: str, prov: Mapping) -> None:
     _stale_notice(stored, data_key, settings_key, "walk-forward")
     result: WalkForwardResult = stored["result"]
     if result.empty:
@@ -1095,7 +1182,7 @@ def _render_walkforward_tab() -> None:
         f"{cfg.min_regime_days} origin days to be 'sufficient'. Vol at k = 0 per expiry, total variance linear in T "
         "between the expiries bracketing 30 days."
     )
-    with st.expander(f"Per-slice scores ({len(result.slices)} origin x expiry rows)"):
+    with st.expander(f"Per-slice scores and origin SVI parameters ({len(result.slices)} origin x expiry rows)"):
         st.dataframe(result.slices, hide_index=True, width="stretch")
     if not result.skipped.empty:
         counts = result.skipped["stage"].value_counts().to_dict()
@@ -1216,7 +1303,7 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
     if not models:
         st.warning("Select at least one model.")
         return
-    rate = ctx["filters"]["rate_cc"]
+    discount: Discounting = ctx["discount"]
     row = ok[pd.to_datetime(ok["expiry"]) == expiry].iloc[0]
     settings = {
         "expiry": _day(expiry),
@@ -1225,7 +1312,7 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
         "cv_folds": 5,
         "std_band": 3.0,
         "min_points": 8,
-        "rate_cc": rate,
+        "discounting": discount.describe(),
     }
     settings_key = _key(settings)
     if st.button("Compare models", key="lab_mc_run", width="stretch"):
@@ -1236,9 +1323,13 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
                     slice_df,
                     models,
                     sabr_beta=float(beta),
-                    rate=rate,
                     min_days=MIN_FIT_DAYS,
-                    hygiene={"forward": float(row["forward"]), "forward_source": f"{row['forward_method']} (chain)"},
+                    hygiene={
+                        "forward": float(row["forward"]),
+                        "forward_source": f"{row['forward_method']} (chain)",
+                        "discount_factor": float(row["discount_factor"]),
+                        "discount_source": f"{row['discount_method']}: {row['discount_source']}",
+                    },
                 )
         except ValueError as exc:
             st.session_state[K_MC] = {"error": str(exc), "data_key": ctx["data_key"], "settings_key": settings_key}
@@ -1269,7 +1360,9 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
         st.caption(
             f"Slice {attrs.get('expiry')} (trade date {attrs.get('trade_date')}, "
             f"tau {attrs.get('tau', float('nan')):.4f}y), "
-            f"forward {attrs.get('forward', float('nan')):.4f} ({stored.get('forward_method')}). One OTM quote per "
+            f"forward {attrs.get('forward', float('nan')):.4f} ({stored.get('forward_method')}), "
+            f"discount factor {attrs.get('discount_factor', float('nan')):.6f} "
+            f"({100 * attrs.get('rate', float('nan')):.3f}% cc). One OTM quote per "
             "strike (puts below F, calls above: call and put vols are never mixed at a strike), vols re-inverted "
             "from mids, band |k| <= 3 sd. rmse_cv_bp: 5-fold CV at held-out interior strikes, the comparable "
             "out-of-sample number (the spline interpolates, so its in-sample error is 0 by construction)."
@@ -1292,7 +1385,7 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
     if st.button("Compare models on every expiry", key="lab_mc_all_run", width="stretch"):
         with st.spinner(f"Scoring {len(models)} model(s) on {n_all} expiries..."):
             scores, skipped = compare_models_by_expiry(
-                chain, models, rate=rate, min_days=MIN_FIT_DAYS, max_days=max_days, sabr_beta=float(beta)
+                chain, models, discount=discount, min_days=MIN_FIT_DAYS, max_days=max_days, sabr_beta=float(beta)
             )
         st.session_state[K_MC_ALL] = {
             "data_key": ctx["data_key"],
@@ -1342,6 +1435,12 @@ def render() -> None:
     with tabs[1]:
         _render_calibration_tab(ctx)
     with tabs[2]:
-        _render_walkforward_tab()
+        lab_vol.render_surface_tab(ctx, _banner)
     with tabs[3]:
+        _render_walkforward_tab()
+    with tabs[4]:
         _render_model_comparison_tab(ctx)
+    with tabs[5]:
+        lab_rates.render_curves_tab()
+    with tabs[6]:
+        lab_rates.render_vol_tab()
