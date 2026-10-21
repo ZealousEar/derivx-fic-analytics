@@ -35,6 +35,7 @@ Conventions
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
@@ -43,6 +44,11 @@ import numpy as np
 from scipy.optimize import least_squares, minimize
 
 SVI_PARAMS = ("a", "b", "rho", "m", "sigma")
+# SciPy's notice when an SLSQP step lands a rounding error past a bound: SciPy
+# clips the point back into the bounds before evaluating it (SciPy 1.11 does
+# so on the walk-forward's synthetic history), and the result is clipped again
+# below, so it is the one warning the constrained refit silences.
+_SLSQP_CLIP_NOTICE = "Values in x were outside bounds during a minimize step"
 LEE_MAX_SLOPE = 2.0
 _RHO_MAX = 0.999
 _G_MARGIN = 1e-4  # constrained fits keep g >= 1e-4 on their constraint grid
@@ -814,7 +820,8 @@ def _arbitrage_free_refit(x_free, k, vols, T, wts, loss, f_scale, lb, ub, k_rang
         y = np.clip(x_start, lo, ub) / scale
         ok = False
         for _ in range(3):  # add the dense check grid where a solution dipped between constraint points
-            with np.errstate(all="ignore"):
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=_SLSQP_CLIP_NOTICE, category=RuntimeWarning)
                 res = minimize(
                     cost,
                     y,

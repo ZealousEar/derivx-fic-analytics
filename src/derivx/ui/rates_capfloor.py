@@ -358,7 +358,7 @@ def _show_strip(stripped: Dict[str, object], cf: CapFloor, market: Market, terms
             + (f" No SABR fit is drawn: {fit_note}." if fit_note else "")
         )
     elif st.checkbox("SHOW VEGA BY QUOTED CAP (RE-STRIPS EACH QUOTE)", value=False, key="cap_quote_vega"):
-        key = (rates_risk.market_key(market), repr(cf), tuple(stripped["maturities"]),
+        key: tuple = (rates_risk.market_key(market), repr(cf), tuple(stripped["maturities"]),
                tuple(np.ravel(stripped["flat"]).tolist()), method)  # fmt: skip
         try:
             vegas = rates_risk.cached("cap_quote_vega", key, lambda: quote_vegas(

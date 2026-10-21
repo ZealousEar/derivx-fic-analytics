@@ -44,7 +44,7 @@ USER derivx
 FROM app AS test
 COPY --chown=derivx tests/ tests/
 RUN python -m pip install --user "pytest>=8,<10" \
-    && python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning \
+    && python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -W error::RuntimeWarning \
         "tests/test_deploy.py::test_committed_streamlit_config_keeps_protection_on_and_uses_known_options" \
         "tests/test_deploy.py::test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_origins" \
         tests/test_pricer_page.py tests/test_fx_page.py tests/test_analytics_lab.py tests/test_walkforward_tab.py \

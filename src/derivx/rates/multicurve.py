@@ -385,7 +385,8 @@ def _prefetch(
     curve set builds every instrument again). Quotes that do not resolve are
     skipped: building their instrument raises the error."""
 
-    pay, other = set(), set()
+    pay: set = set()  # payment dates
+    other: set = set()  # basis-leg period dates
     for quote in quotes:
         kind = quote.kind.strip().upper()
         if kind not in PROJECTION_KINDS:
@@ -571,7 +572,8 @@ def quarterly_contracts(asof: Date, index: TermIndex, count: int) -> List[str]:
     """The next ``count`` quarterly (Mar/Jun/Sep/Dec) futures that have not
     fixed, as contract labels."""
 
-    out, year, month = [], asof.year, asof.month
+    out: List[str] = []
+    year, month = asof.year, asof.month
     month = ((month - 1) // 3) * 3 + 3
     while len(out) < count:
         start, _ = futures_period("FUT", year, month, index)

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -142,7 +142,7 @@ def _upload_controls() -> None:
         )
 
 
-def _curve_controls(store: rh.HistoryStore) -> Optional[Dict[str, object]]:
+def _curve_controls(store: rh.HistoryStore) -> Optional[Dict[str, Any]]:
     keys = _datasets(store)
     if not keys:
         st.warning(f"No curve history in the store has {MIN_CURVES} complete curves.")
@@ -281,7 +281,7 @@ def _format_summary(summary: pd.DataFrame) -> pd.DataFrame:
     return out[keep]
 
 
-def _curve_walkforward(ctx: Dict[str, object]) -> None:
+def _curve_walkforward(ctx: Dict[str, Any]) -> None:
     st.markdown("#### / WALK-FORWARD: CURVE FORECASTS")
     c1, c2, c3 = st.columns(3)
     horizon = int(c1.number_input("Horizon (observations)", 1, 60, 1, key="lab_rates_h", persist_state=PERSIST))
@@ -423,7 +423,7 @@ def _curve_chart(levels: pd.DataFrame, day, models) -> go.Figure:
     return fig
 
 
-def _curve_comparison(ctx: Dict[str, object]) -> None:
+def _curve_comparison(ctx: Dict[str, Any]) -> None:
     st.markdown("#### / MODEL COMPARISON: CURVE FITS")
     levels = ctx["levels"]
     c1, c2 = st.columns(2)
@@ -633,7 +633,7 @@ def render_vol_tab() -> None:
         ]
     )
 
-    def stale(what: str, stored: Dict[str, object]):
+    def stale(what: str, stored: Dict[str, Any]):
         return lambda: banner(f"STALE {what}: COMPUTED ON", [stored["provenance"]["source"]], "stale")
 
     st.markdown("#### / WALK-FORWARD: SABR SMILE FORECASTS")

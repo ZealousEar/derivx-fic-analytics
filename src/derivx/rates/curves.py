@@ -31,7 +31,7 @@ import collections.abc
 import datetime as dt
 import math
 from dataclasses import dataclass, field, replace
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 from scipy.linalg import lu_factor, lu_solve
@@ -46,6 +46,9 @@ from .indices import (
     overnight_futures_rate,
     parse_contract,
 )
+
+if TYPE_CHECKING:  # multicurve builds on this module
+    from .multicurve import ProjectionCurve
 
 INTERPOLATIONS = ("loglinear", "linear_zero", "monotone_convex")
 INSTRUMENT_KINDS = ("DEPO", "OIS", "IRS", "BILL", "BOND", "SR1", "SR3")
@@ -1408,8 +1411,9 @@ class Market:
                 if getattr(base, "is_projection", False):
                     # Only curves that changed are swapped in, so a bump of this curve's own quotes keeps the
                     # curves it was built on and reuses its unchanged leading pillars.
-                    basis = base.basis_index
-                    return base.rebuilt(
+                    proj = cast("ProjectionCurve", base)
+                    basis = proj.basis_index
+                    return proj.rebuilt(
                         bumps.get(key, 0.0),
                         asof=at,
                         discount=new_curve if DISCOUNT_KEY in changed else None,

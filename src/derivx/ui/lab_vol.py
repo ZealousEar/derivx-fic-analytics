@@ -22,7 +22,7 @@ of forward (Black-76, discounted); ``k = ln(K/F)``; ``T`` ACT/365F years.
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -71,7 +71,7 @@ def smile_risk(
     params: Tuple[Tuple[str, float], ...],
     K: float,
     is_call: bool,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Every smile-risk number of one option on one fitted SVI slice
     (content-keyed: the same quotes, fit and option give the same result in
     any session)."""
@@ -82,7 +82,7 @@ def smile_risk(
     _, w1, _ = (float(x) for x in svi_derivatives(k, p))
     dvol_dk = w1 / (2.0 * vol * T)
     d = smile_deltas(F, K, T, vol, dvol_dk, df, is_call)
-    out: Dict[str, object] = {
+    out: Dict[str, Any] = {
         "vol": vol,
         "price": float(black_price(F, K, T, vol, is_call, df)),
         "vega": 0.01 * float(black_vega(F, K, T, vol, df)),
@@ -232,7 +232,7 @@ def smile_risk_section(slc: CalibratedSlice, key: str) -> None:
 @st.cache_data(max_entries=8, show_spinner=False)
 def fit_surface(
     chain: pd.DataFrame, discount: Discounting, min_days: float, max_days: float, std_band: float, min_points: int
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """SSVI on every usable slice of ``chain`` (content-keyed cache)."""
 
     cleaned, bad = clean_chain(chain, min_days=1.0, discount=discount)
@@ -278,7 +278,7 @@ def _forward_at(table: pd.DataFrame, spot: Optional[float], T: float) -> float:
     return float(np.exp(np.interp(T, taus, logf)))
 
 
-def _smile_at_chart(res: Mapping[str, object], days: float) -> go.Figure:
+def _smile_at_chart(res: Mapping[str, Any], days: float) -> go.Figure:
     fit, table = res["fit"], res["table"]
     T = days / 365.0
     k = np.linspace(min(s[1].min() for s in res["slices"]), max(s[1].max() for s in res["slices"]), 241)
@@ -333,7 +333,7 @@ def _heatmap(name: str, k: np.ndarray, days: np.ndarray, z: np.ndarray, title: s
     return fig
 
 
-def render_surface_tab(ctx: Optional[Dict[str, object]], draw_banner) -> None:
+def render_surface_tab(ctx: Optional[Dict[str, Any]], draw_banner) -> None:
     """The Vol Surface tab (see the module docs); ``draw_banner(prov,
     label=..., kind=...)`` draws the chain's provenance banner."""
 
@@ -536,7 +536,7 @@ def _param_chart(hist: pd.DataFrame, changes: pd.DataFrame, model: str, param: s
     return fig
 
 
-def stability_results(stored: Mapping[str, object], key: str, chart_name: str = "lab_param_history") -> None:
+def stability_results(stored: Mapping[str, Any], key: str, chart_name: str = "lab_param_history") -> None:
     """Summary, chart and jump list of a stored parameter-history run
     (``{"history", "changes", "summary", "skipped", "manifest", "z"}``)."""
 
@@ -558,9 +558,14 @@ def stability_results(stored: Mapping[str, object], key: str, chart_name: str = 
             if ((hist["model"] == m) & (hist["parameter"] == p)).any()
         ]
         pick = st.selectbox("Parameter", options, format_func=lambda o: f"{o[0].upper()} {o[1]}", key=f"{key}_param")
-        st.plotly_chart(
-            _param_chart(hist, changes, *pick, chart_name), width="stretch", config=PLOTLY_2D_CONFIG, key=f"{key}_chart"
-        )
+        if pick is not None:  # None only when no parameter has a history
+            model, param = pick
+            st.plotly_chart(
+                _param_chart(hist, changes, model, param, chart_name),
+                width="stretch",
+                config=PLOTLY_2D_CONFIG,
+                key=f"{key}_chart",
+            )
         jumps = changes[changes["jump"]]
         with st.expander(f"{len(jumps)} jump(s) flagged"):
             st.dataframe(jumps, hide_index=True, width="stretch")
