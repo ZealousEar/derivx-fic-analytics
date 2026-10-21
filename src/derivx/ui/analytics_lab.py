@@ -355,6 +355,18 @@ def _calibration_store() -> _ResultStore:
     return _ResultStore(max_entries=16)
 
 
+def _calibration_key(data_key: str, settings_key: str, discount: Discounting) -> str:
+    """Key of a calibration in :func:`_calibration_store`. ``data_key`` and
+    ``settings_key`` name the discounting by :meth:`Discounting.describe`
+    (mode, curve dates, labels, pillar counts), which two different curves
+    of the same day and source share (a store refreshed with revised yields);
+    a result shared across sessions must also match the discount factors
+    themselves, so the key adds the full repr of ``discount`` (every pillar
+    time and DF, exact)."""
+
+    return _key(data_key, settings_key, repr(discount))
+
+
 @st.cache_data(max_entries=8, show_spinner=False)
 def _hygiene(chain: pd.DataFrame, discount: Discounting) -> pd.DataFrame:
     """Per-expiry hygiene report (content-keyed: the same quotes and
@@ -886,7 +898,7 @@ def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
     }
     settings_key = _key(settings)
     if st.button("Calibrate selected expiries", key="lab_cal_run", width="stretch", disabled=not sel):
-        cache_key = _key(ctx["data_key"], settings_key)
+        cache_key = _calibration_key(ctx["data_key"], settings_key, ctx["discount"])
         store = _calibration_store()
         result = store.get(cache_key)
         if result is None:
