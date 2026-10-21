@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -1019,6 +1020,211 @@ def _register_scenario(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--explain", type=Path, help="write the P&L explain CSV (delta, gamma, vol, carry, residual)")
     parser.add_argument("--manifest", type=Path, help="write the run manifest JSON")
     parser.set_defaults(func=_scenario)
+
+
+# --------------------------------------------------------------------------
+# snapshots: daily option-chain history
+# --------------------------------------------------------------------------
+
+
+def _tickers(text: str) -> List[str]:
+    from derivx.data.snapshots import TICKER_RE
+
+    out = [t.upper() for t in _list(text.replace(" ", ","))]
+    bad = [t for t in out if not TICKER_RE.match(t)]
+    if not out or bad:
+        raise argparse.ArgumentTypeError(f"{text!r}: give tickers as SPY or SPY,QQQ (letters, digits, . ^ = -)")
+    return list(dict.fromkeys(out))
+
+
+def _band(text: str):
+    parts = _list(text)
+    try:
+        lo, hi = (float(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: give LOW,HIGH strike / spot, e.g. 0.4,1.6") from None
+    return lo, hi
+
+
+def _limits(args: argparse.Namespace):
+    from derivx.data.snapshots import StoreLimits
+
+    return StoreLimits(max_days=args.max_days, moneyness=args.moneyness)
+
+
+def _snapshots_collect(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotStore, collect
+
+    store = SnapshotStore(args.store, "the data branch") if args.store is not None else None
+    now = pd.Timestamp(args.now) if args.now else None
+    report = collect(args.tickers, args.staging, store, limits=_limits(args), attempts=args.attempts,
+                     wait_s=args.wait, dry_run=args.dry_run, now=now)  # fmt: skip
+    print(f"{report.now_utc}: {report.reason}")
+    for o in report.outcomes:
+        size = f", {o.bytes / 1e3:,.0f} KB" if o.bytes else ""
+        print(f"  {o.ticker} {o.session or '-'}: {o.state.upper()}{size} in {o.seconds:.1f}s"
+              f"{' - ' + o.reason if o.reason else ''}")  # fmt: skip
+    if args.summary is not None:
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write(report.markdown())
+    if args.report is not None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report.as_dict(), indent=2) + "\n")
+    if report.failed:
+        print(f"error: {len(report.failed)} ticker(s) produced nothing for the {report.session} session",
+              file=sys.stderr)  # fmt: skip
+    return report.exit_code
+
+
+def _snapshots_merge(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError, SnapshotStore
+
+    target = SnapshotStore(args.into)
+    try:
+        done = target.merge_from(SnapshotStore(args.source))
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    for ticker, session, state in done:
+        print(f"{state:<5} {ticker} {session}")
+    added = sum(1 for *_, state in done if state == "added")
+    print(f"{added} file(s) added to {args.into}, {len(done) - added} already there (kept)")
+    return 0
+
+
+def _snapshots_index(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotStore
+
+    store = SnapshotStore(args.store)
+    if not args.check:
+        store.rebuild_index()
+    problems = store.verify()
+    for problem in problems:
+        print(f"problem: {problem}", file=sys.stderr)
+    print(f"{len(store.index())} file(s) indexed in {store.index_path}; {len(problems)} problem(s)")
+    return EXIT_SOURCE_ERROR if problems else 0
+
+
+def _snapshot_store(args: argparse.Namespace):
+    """The store ``list`` and ``sync`` read: a local checkout, or the synced
+    copy of --repo/--branch in the cache (``sync`` downloads it first)."""
+
+    from derivx.data.snapshots import SnapshotStore, sync
+
+    if args.local is not None:
+        if not (args.local / "options").exists():
+            raise ValueError(f"{args.local} is not a snapshot store (no options/ directory)")
+        return SnapshotStore(args.local, f"local checkout {args.local}"), None
+    result = sync(args.repo, args.branch, tickers=args.tickers, offline=True if args.offline else None,
+                  cache_root=args.cache, base_url=args.base_url)  # fmt: skip
+    return result.store, result
+
+
+def _print_coverage(store, tickers) -> None:
+    from derivx.data.snapshots import coverage_table
+
+    table = coverage_table(store, tickers)
+    if table.empty:
+        print(f"{store.label}: no sessions stored")
+        return
+    for ticker in table["ticker"]:
+        print(store.coverage(ticker).describe())
+    print(table.to_string(index=False))
+
+
+def _snapshots_sync(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError
+
+    try:
+        store, result = _snapshot_store(args)
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    if result is not None:
+        how = "cache only" if result.offline else f"{result.downloaded} downloaded, {result.cached} already cached"
+        print(f"{store.label} -> {store.root} ({how}; synced {result.synced_at})")
+        for notice in result.notices:
+            print(f"  note: {notice}")
+        for problem in result.failed:
+            print(f"  failed: {problem}", file=sys.stderr)
+    _print_coverage(store, args.tickers)
+    return EXIT_SOURCE_ERROR if result is not None and result.failed else 0
+
+
+def _snapshots_list(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError
+
+    args.offline = True  # list never downloads: `derivx snapshots sync` does
+    try:
+        store, result = _snapshot_store(args)
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    if result is not None:
+        print(f"{store.label} (synced {result.synced_at}) in {store.root}")
+    _print_coverage(store, args.tickers)
+    if args.sessions:
+        for ticker in args.tickers or store.tickers():
+            print(f"{ticker}: {' '.join(d.isoformat() for d in store.sessions(ticker))}")
+    return 0
+
+
+@command("snapshots")
+def _register_snapshots(parser: argparse.ArgumentParser) -> None:
+    """collect, publish and read daily option-chain snapshots (the data-snapshots branch)"""
+
+    from derivx.data.snapshots import DATA_BRANCH, StoreLimits
+
+    actions = parser.add_subparsers(dest="action", required=True, metavar="ACTION")
+    defaults = StoreLimits()
+    collect = actions.add_parser(
+        "collect", help="save the due session's chain of each ticker into a staging store (Yahoo, network)",
+        description="Save the chain of the session that closed most recently (16:15 New York, collected 10 minutes "
+        "to 12 hours after) for each ticker, in the compact storage schema, into --staging. Nothing is fetched on "
+        "a weekend, an NYSE holiday or during a session, or for a session --store already holds. Exit 0: saved, "
+        "already stored or nothing due; 1: a session was due and some ticker produced nothing.",
+    )  # fmt: skip
+    collect.add_argument("--tickers", type=_tickers, default=["SPY"], help="comma-separated tickers (default SPY)")
+    collect.add_argument("--staging", type=Path, required=True, help="directory to write the new snapshots into")
+    collect.add_argument("--store", type=Path, help="the published store (a data-branch checkout): sessions it holds "
+                         "are not fetched again")  # fmt: skip
+    collect.add_argument("--max-days", type=int, default=defaults.max_days,
+                         help=f"keep expiries up to this many calendar days (default {defaults.max_days})")  # fmt: skip
+    collect.add_argument("--moneyness", type=_band, default=defaults.moneyness,
+                         help="keep strikes with LOW <= strike / spot <= HIGH (default 0.4,1.6)")  # fmt: skip
+    collect.add_argument("--attempts", type=int, default=3, help="whole-chain fetch attempts per ticker (default 3)")
+    collect.add_argument("--wait", type=float, default=60.0, help="seconds before the 2nd attempt (doubles after)")
+    collect.add_argument("--summary", type=Path, help="append a Markdown summary (e.g. $GITHUB_STEP_SUMMARY)")
+    collect.add_argument("--report", type=Path, help="write the run report as JSON")
+    collect.add_argument("--dry-run", action="store_true", help="label the summary as a dry run (nothing committed)")
+    collect.add_argument("--now", help=argparse.SUPPRESS)  # tests: the clock
+    collect.set_defaults(func=_snapshots_collect)
+    merge = actions.add_parser("merge", help="copy staged snapshots the store lacks into it and append the index")
+    merge.add_argument("source", type=Path, help="the staging store")
+    merge.add_argument("into", type=Path, help="the published store (a data-branch checkout)")
+    merge.set_defaults(func=_snapshots_merge)
+    index = actions.add_parser("index", help="add missing index rows from the manifests and verify every file")
+    index.add_argument("--store", type=Path, required=True)
+    index.add_argument("--check", action="store_true", help="only verify (exit 1 on any problem)")
+    index.set_defaults(func=_snapshots_index)
+    for name, help_text in (
+        ("sync", "download the published store (index and files) into the cache, or read a local checkout"),
+        ("list", "coverage of the synced store or a local checkout: sessions, first, last, gaps (no network)"),
+    ):
+        sub = actions.add_parser(name, help=help_text, description=help_text)
+        sub.add_argument("--repo", help="OWNER/NAME on GitHub (default $DERIVX_SNAPSHOT_REPO or "
+                         "ZealousEar/derivx-fic-analytics)")  # fmt: skip
+        sub.add_argument("--branch", help=f"data branch (default $DERIVX_SNAPSHOT_BRANCH or {DATA_BRANCH})")
+        sub.add_argument("--tickers", type=_tickers, help="only these tickers")
+        sub.add_argument("--local", type=Path, help="read this local checkout of the data branch instead")
+        sub.add_argument("--cache", type=Path, help="cache directory (default data/cache or $DERIVX_CACHE_DIR)")
+        sub.add_argument("--base-url", help=argparse.SUPPRESS)  # tests and mirrors: instead of raw.githubusercontent
+        if name == "sync":
+            sub.add_argument("--offline", action="store_true", help="read only the cache, never the network")
+            sub.set_defaults(func=_snapshots_sync)
+        else:
+            sub.add_argument("--sessions", action="store_true", help="also print every session date")
+            sub.set_defaults(func=_snapshots_list, offline=True)
 
 
 # --------------------------------------------------------------------------

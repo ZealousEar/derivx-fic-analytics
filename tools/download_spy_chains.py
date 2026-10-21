@@ -21,6 +21,15 @@ retries, failed expiries, spot drift) and a run manifest (code version,
 package versions). A file that already exists for the session is kept
 unless ``--replace``. Exit status: 0 saved, 1 nothing saved (error, rate
 limit, empty or refused), 3 saved but partial (some expiries failed).
+
+``--store DIR`` writes the compact storage form instead (the layout of the
+``data-snapshots`` branch, :mod:`derivx.data.snapshots`):
+``DIR/options/<TICKER>/<YYYY>/<TICKER>_<session>.csv.gz`` with its manifest
+and a row in ``DIR/options/index.csv``; only a complete fetch is stored
+there (a partial one exits 3 and writes nothing), and an existing session
+is always kept. The scheduled GitHub workflow
+(``.github/workflows/collect-data.yml``) runs the same fetch through
+``derivx snapshots collect`` and publishes the store on that branch.
 """
 
 from __future__ import annotations
@@ -104,6 +113,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-expiries", type=int, default=None, help="request only the nearest N expiries")
     parser.add_argument("--expiries", nargs="*", help="request only these expiries (YYYY-MM-DD, listed by Yahoo)")
     parser.add_argument("--format", choices=("parquet", "csv.gz"), default="parquet")
+    parser.add_argument("--store", help="write the compact storage form into this store directory instead")
     parser.add_argument("--replace", action="store_true", help="overwrite an existing file for the same session")
     parser.add_argument("--date", help="expected session (YYYY-MM-DD); refused if before the current session")
     parser.add_argument("--start", help=argparse.SUPPRESS)  # kept to explain the refusal
@@ -135,6 +145,17 @@ def main(
             f"error: expected the {args.date} session, Yahoo served {status.quote_date}; nothing saved", file=sys.stderr
         )
         return 1
+    if args.store:
+        from derivx.data.snapshots import SnapshotStore, build_snapshot
+
+        if status.partial:
+            print("error: a partial chain is not stored in the compact store; nothing saved", file=sys.stderr)
+            return 3
+        snapshot = build_snapshot(result, session=status.quote_date)
+        state = SnapshotStore(Path(args.store)).add(snapshot)
+        print(f"{state} {snapshot.manifest['rows']:,} of {status.rows:,} quotes ({snapshot.manifest['bytes']:,} bytes) "
+              f"-> {Path(args.store) / str(snapshot.path)}")  # fmt: skip
+        return 0
     path = save_snapshot(result, Path(args.outdir), fmt=args.format, replace=args.replace)
     if path is None:
         print(f"kept the existing file for the {status.quote_date} session (use --replace to overwrite)")
