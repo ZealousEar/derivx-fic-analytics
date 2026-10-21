@@ -76,7 +76,7 @@ def test_plain_residuals_reproduce_the_robust_objective_and_its_jacobian():
         return r0 + A @ x
 
     def jac(x):
-        return A
+        return A.copy()  # SciPy <= 1.15 rescales the returned Jacobian in place for robust losses
 
     fun, grad = svi._robust_residuals(resid, jac, "soft_l1", 0.005)
     x = rng.normal(0.0, 1e-3, 5)
