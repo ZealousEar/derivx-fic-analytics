@@ -4,6 +4,10 @@
   market data: there is no free source of SOFR swap quotes.
 * ``ust_par_yield_curve_2026.csv`` - US Treasury daily par yield curve rates
   (home.treasury.gov), percent, one row per business day.
+
+The dated history the Rates page and the historical scenarios use (Treasury,
+BoE OIS, ECB, ICE swap curves and fixings) is loaded by
+:mod:`derivx.data.rates_history` from ``data/examples/rates_history``.
 """
 
 from __future__ import annotations

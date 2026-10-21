@@ -693,5 +693,7 @@ def test_swap_tab_other_conventions(conv):
     assert not at.exception and not at.error
     _assert_charts_bounded(at)
     metrics = {m.label: float(m.value.replace(",", "")) for m in at.metric}
-    assert metrics["PV01 ($, +1BP)"] < 0 < metrics["ANNUITY ($ PER BP)"]
+    c = {"EUR ESTR": "€", "GBP SONIA": "£"}[conv]  # values are in the swap curve's currency, not dollars
+    assert metrics[f"PV01 ({c}, +1BP)"] < 0 < metrics[f"ANNUITY ({c} PER BP)"]
+    assert not any("$" in label for label in metrics)
     assert (metrics["PAR RATE (%)"] < 0) == (conv == "EUR ESTR")

@@ -6,17 +6,26 @@ at e_i::
 
     caplet_i = N * tau_i * DF(e_i) * E[max(F_i - K, 0)]
 
-``F_i`` is the simple forward for the period from :meth:`Market.projected_rate`
-and the expectation is taken under the chosen model with option time
-ACT/365F from the valuation date to the fixing. A caplet that has already
-fixed is worth its intrinsic value; one already paid is gone. On the same
-schedule this matches QuantLib's ``Cap``/``Floor`` on an ``IborLeg`` with
-``BlackCapFloorEngine`` (plain and displaced) and ``BachelierCapFloorEngine``
-(``tests/test_capfloor.py``).
+``F_i`` is the simple forward for the period and the expectation is taken
+under the chosen model with option time ACT/365F from the valuation date to
+the fixing. A caplet that has already fixed is worth its intrinsic value;
+one already paid is gone. ``DF`` is always the discount (OIS) curve,
+``market.curve``. The forward comes from the projection curve of the cap's
+``projection`` index (a EURIBOR cap, :meth:`CapFloor.from_index`:
+multi-curve, OIS discounting) through :meth:`Market.index_rate`, or from
+``market.curve`` itself when ``projection`` is None (single-curve, via
+:meth:`Market.projected_rate`). On the same schedule this matches
+QuantLib's ``Cap``/``Floor`` on an ``IborLeg`` with ``BlackCapFloorEngine``
+(plain and displaced) and ``BachelierCapFloorEngine``
+(``tests/test_capfloor.py``, ``tests/test_multicurve.py``).
 
 Vols are in each model's own units: normal (Bachelier) vol in rate units
-(1bp = 1e-4), lognormal vol as a decimal (0.20 = 20%). Vegas are P&L per
-+1bp of normal vol or per +1 vol point of lognormal vol.
+(1bp = 1e-4), lognormal vol as a decimal (0.20 = 20%): one flat vol, an
+``{expiry: vol}`` term structure, or caplet vols stripped from cap quotes
+(:mod:`derivx.rates.capvol`). Vegas are P&L per +1bp of normal vol or per
++1 vol point of lognormal vol; :meth:`CapFloor.decay` is the time decay to
+the next business day with forwards, discount factors and vols held (the
+full one-day theta, curves rolled, is :func:`derivx.risk.scenarios.theta`).
 """
 
 from __future__ import annotations
@@ -41,13 +50,14 @@ from derivx.rates.conventions import (
     year_fraction,
 )
 from derivx.rates.curves import Market
+from derivx.rates.indices import TermIndex, get_index
 from derivx.risk.sensitivities import Position
 
 MODELS = ("bachelier", "black", "shifted_black")
 KINDS = ("cap", "floor")
 INDEX_MONTHS = (1, 3, 6, 12)
 VOL_UNIT = {"bachelier": 1e-4, "black": 0.01, "shifted_black": 0.01}  # 1bp normal, 1 vol point lognormal
-VolInput = Union[float, Mapping[float, float]]
+VolInput = Union[float, Mapping[float, float], object]  # or a stripped vol object with caplet_vols(expiry, strike)
 
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _EPS = np.finfo(float).eps
@@ -194,6 +204,50 @@ def bachelier_delta(F: float, K: float, T: float, sigma_n: float, is_call: bool 
     return w * _cdf(w * (F - K) / std)
 
 
+def shifted_black_gamma(F: float, K: float, T: float, sigma: float, shift: float) -> float:
+    """d2 price / d F2 (per unit of rate squared; same for calls and puts).
+    Zero at zero time value away from the strike."""
+
+    _check_inputs(F, K, T)
+    f, k = _shifted(F, K, shift)
+    _check_vol(sigma)
+    std = sigma * math.sqrt(max(T, 0.0))
+    if std == 0.0:
+        return 0.0
+    return _pdf(_black_d1(f, k, std)) / (f * std)
+
+
+def bachelier_gamma(F: float, K: float, T: float, sigma_n: float) -> float:
+    """d2 price / d F2 (per unit of rate squared; same for calls and puts)."""
+
+    _check_inputs(F, K, T)
+    _check_vol(sigma_n)
+    std = sigma_n * math.sqrt(max(T, 0.0))
+    if std == 0.0:
+        return 0.0
+    return _pdf((F - K) / std) / std
+
+
+def model_delta(
+    model: str, F: float, K: float, T: float, sigma: float, shift: float = 0.0, is_call: bool = True
+) -> float:
+    """d price / d F under one of :data:`MODELS` (undiscounted, per unit of
+    rate): ``N(d1)`` for a Black call, ``N(d)`` for a Bachelier call."""
+
+    if model == "bachelier":
+        return bachelier_delta(F, K, T, sigma, is_call)
+    return shifted_black_delta(F, K, T, sigma, _model_shift(model, shift), is_call)
+
+
+def model_gamma(model: str, F: float, K: float, T: float, sigma: float, shift: float = 0.0) -> float:
+    """d2 price / d F2 under one of :data:`MODELS` (undiscounted, per unit of
+    rate squared)."""
+
+    if model == "bachelier":
+        return bachelier_gamma(F, K, T, sigma)
+    return shifted_black_gamma(F, K, T, sigma, _model_shift(model, shift))
+
+
 def _solve_vol(excess: Callable[[float], float], hi: float, cap: float, what: str) -> float:
     """Root of an increasing ``excess(vol)`` with ``excess(0) < 0``."""
 
@@ -316,9 +370,10 @@ class _Strip:
 class CapFloor:
     """A cap or floor on a term rate.
 
-    ``strike`` is a decimal rate. ``vol`` is one number or a mapping
+    ``strike`` is a decimal rate. ``vol`` is one number, a mapping
     ``{expiry in years: vol}`` interpolated linearly in expiry and flat
-    outside, in the model's units. ``shift`` is the displacement of
+    outside, or stripped caplet vols (:class:`derivx.rates.capvol.CapletVolCurve`
+    or ``CapletVolSurface``, read at the cap's strike), in the model's units. ``shift`` is the displacement of
     ``shifted_black`` (ignored by the other models). ``notional`` < 0 is a
     sold cap.
 
@@ -349,8 +404,47 @@ class CapFloor:
     bdc: str = "MF"
     fixing_lag: int = 2
     exclude_first: Optional[bool] = None
+    projection: Optional[str] = None
+
+    @classmethod
+    def from_index(
+        cls,
+        index: Union[str, TermIndex],
+        notional: float,
+        kind: str,
+        strike: float,
+        tenor: str,
+        vol: VolInput,
+        model: str = "bachelier",
+        shift: float = 0.0,
+        **fields: object,
+    ) -> "CapFloor":
+        """Cap or floor on a term index (multi-curve): periods of the index
+        tenor on its calendar and day count, fixed ``fixing_lag`` business
+        days before each period, forwards from ``market.projection(index)``
+        and discounting on ``market.curve``. ``fields`` overrides any other
+        attribute (``forward_start``, ``start``, ``exclude_first``)."""
+
+        index = get_index(index)
+        terms = dict(
+            index_months=index.months,
+            day_count=index.day_count,
+            calendar=index.calendar,
+            bdc=index.bdc,
+            fixing_lag=index.fixing_lag,
+            projection=index.name,
+        )
+        return cls(notional, kind, strike, tenor, vol, model, shift, **{**terms, **fields})
 
     def __post_init__(self) -> None:
+        if self.projection is not None:
+            index = get_index(self.projection)
+            object.__setattr__(self, "projection", index.name)
+            if self.index_months != index.months or str(self.day_count).upper() != index.day_count:
+                raise ValueError(
+                    f"a {index.name} cap resets every {index.months}M on {index.day_count}, not every "
+                    f"{self.index_months}M on {self.day_count}"
+                )
         object.__setattr__(self, "kind", str(self.kind).lower())
         object.__setattr__(self, "model", str(self.model).lower())
         object.__setattr__(self, "bdc", str(self.bdc).upper())
@@ -392,7 +486,10 @@ class CapFloor:
             raise ValueError(
                 f"shifted Black needs strike + shift > 0 (strike {self.strike:.4%}, shift {self.shift:.4%})"
             )
-        self._vol_points()  # validates vol
+        if self.stripped_vol:
+            self._check_stripped_vol()
+        else:
+            self._vol_points()  # validates vol
 
     # -- conventions -------------------------------------------------------
 
@@ -416,7 +513,50 @@ class CapFloor:
     @property
     def label(self) -> str:
         span = f"{self.forward_start}x{self.tenor}" if self.forward_start else self.tenor
-        return f"{span} {self.kind.upper()} {self.strike:.3%} {self.index_months}M"
+        return f"{span} {self.kind.upper()} {self.strike:.3%} {self.projection or f'{self.index_months}M'}"
+
+    def _forwards(self, market: Market, rows: List[CapletPeriod]) -> np.ndarray:
+        """:meth:`rate` of each period, the forwards of periods still to fix
+        in one curve call."""
+
+        asof = market.asof
+        published = market.index_fixings.get(self.projection, {}) if self.projection is not None else {}
+        future = [p.fix > asof or (p.fix == asof and p.fix not in published) for p in rows]
+        out = np.empty(len(rows))
+        live = [i for i, f in enumerate(future) if f]
+        if live:
+            curve = market.projection(self.projection) if self.projection is not None else market.curve
+            starts = np.asarray(curve.df([rows[i].start for i in live]), dtype=float)
+            ends = np.asarray(curve.df([rows[i].end for i in live]), dtype=float)
+            out[live] = (starts / ends - 1.0) / np.array([rows[i].tau for i in live])
+        for i, p in enumerate(rows):
+            if not future[i]:
+                out[i] = self.rate(market, p)
+        return out
+
+    def rate(self, market: Market, period: CapletPeriod) -> float:
+        """The period's rate: a fixing or the forward (see the module
+        docstring for which curve)."""
+
+        if self.projection is not None:
+            return market.index_rate(self.projection, period.start, period.end, self.day_count, period.fix)
+        return market.projected_rate(period.start, period.end, self.day_count, period.fix)
+
+    @property
+    def stripped_vol(self) -> bool:
+        """True when ``vol`` is a stripped caplet vol object."""
+
+        return hasattr(self.vol, "caplet_vols")
+
+    def _check_stripped_vol(self) -> None:
+        """A stripped vol object belongs to one model and shift."""
+
+        own_shift = float(self.shift) if self.model == "shifted_black" else 0.0
+        if self.vol.model != self.model or float(self.vol.shift) != own_shift:
+            raise ValueError(
+                f"the caplet vols were stripped for the {self.vol.model} model (shift {self.vol.shift:.2%}); "
+                f"price the cap with that model and shift, not {self.model} (shift {own_shift:.2%})"
+            )
 
     def _vol_points(self) -> Tuple[np.ndarray, np.ndarray]:
         if isinstance(self.vol, Mapping):
@@ -435,6 +575,8 @@ class CapFloor:
     def vol_at(self, expiry) -> np.ndarray:
         """Model vol at option expiries (years), before any market vol shift."""
 
+        if self.stripped_vol:
+            return np.asarray(self.vol.caplet_vols(np.asarray(expiry, dtype=float), self.strike), dtype=float)
         xs, ys = self._vol_points()
         return np.interp(np.asarray(expiry, dtype=float), xs, ys)
 
@@ -489,7 +631,7 @@ class CapFloor:
     def _strip(self, market: Market) -> _Strip:
         asof = market.asof
         rows = [p for p in self.periods(asof) if p.pay > asof]
-        forward = np.array([market.projected_rate(p.start, p.end, self.day_count, p.fix) for p in rows])
+        forward = self._forwards(market, rows)
         df = np.asarray(market.curve.df([p.pay for p in rows]), dtype=float) if rows else np.array([])
         return _Strip(
             periods=rows,
@@ -564,6 +706,23 @@ class CapFloor:
         _, vega = self._unit_values(strip, self._market_vols(strip, market))
         return float(np.dot(self._scale(strip), vega) * VOL_UNIT[self.model])
 
+    def decay(self, market: Market, days: Optional[int] = None) -> float:
+        """Time decay in currency: the PV with every live caplet's option time
+        shortened by ``days`` calendar days (default: to the next business
+        day of the cap's calendar), forwards, discount factors and vols held,
+        minus today's PV. A caplet fixing within the window drops to its
+        intrinsic value."""
+
+        if days is None:
+            days = (Calendar(self.calendar).add_business_days(market.asof, 1) - market.asof).days
+        if days < 0:
+            raise ValueError("decay days must be 0 or more")
+        strip = self._strip(market)
+        vols = self._market_vols(strip, market)
+        now, _ = self._unit_values(strip, vols)
+        later, _ = self._unit_values(replace(strip, expiry=np.maximum(strip.expiry - days / 365.0, 0.0)), vols)
+        return float(np.dot(self._scale(strip), later - now))
+
     def annuity(self, market: Market) -> float:
         """Sum of notional x accrual x discount factor over remaining periods
         (currency per unit of rate)."""
@@ -630,11 +789,10 @@ class CapFloor:
         (fixings curve for periods fixed before its valuation date)."""
 
         w = 1.0 if self.is_cap else -1.0
+        window = [p for p in self.periods(market.asof) if start < p.pay <= end]
         total = 0.0
-        for p in self.periods(market.asof):
-            if start < p.pay <= end:
-                rate = market.projected_rate(p.start, p.end, self.day_count, p.fix)
-                total += self.notional * p.tau * max(w * (rate - self.strike), 0.0)
+        for p, rate in zip(window, self._forwards(market, window)):
+            total += self.notional * p.tau * max(w * (rate - self.strike), 0.0)
         return total
 
 
@@ -671,6 +829,7 @@ def capfloor_position(cf: CapFloor, asof: Optional[Date] = None, name: Optional[
             "model": trade.model,
             "vol": trade.vol,
             "shift": trade.shift,
+            "projection": trade.projection,
             "trade": trade,
         },
     )

@@ -487,6 +487,64 @@ def test_a_cap_with_no_caplet_left_after_the_first_is_excluded(market):
 
 
 # --------------------------------------------------------------------------
+# Theta and gamma (RR-9)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model,vol,shift", MODELS)
+def test_decay_is_the_time_value_lost_to_the_next_business_day(market, model, vol, shift):
+    cf = CapFloor(1e7, "cap", 0.0365, "5Y", vol, model, shift, forward_start="3M")
+    table = cf.caplets(market)
+    days = 1  # Monday 2026-10-19 -> Tuesday
+    expected = 0.0
+    for row in table.itertuples():
+        scale = 1e7 * row.tau * row.df
+        later = max(row.expiry - days / 365.0, 0.0)
+        expected += scale * (model_price(model, row.forward, cf.strike, later, row.vol, shift)
+                             - model_price(model, row.forward, cf.strike, row.expiry, row.vol, shift))  # fmt: skip
+    assert cf.decay(market) == pytest.approx(expected, rel=1e-12)
+    assert cf.decay(market) < 0 and replace(cf, notional=-1e7).decay(market) == pytest.approx(-expected, rel=1e-12)
+    friday = Market(bootstrap(D("2026-10-23"), [CurveQuote(r["kind"], r["tenor"], r["rate"])
+                                                for r in sofr_example_rows()], "USD SOFR"))  # fmt: skip
+    assert cf.decay(friday) == pytest.approx(cf.decay(friday, days=3), rel=1e-15)  # Friday -> Monday
+    assert cf.decay(market, days=0) == 0.0
+    with pytest.raises(ValueError, match="0 or more"):
+        cf.decay(market, days=-1)
+
+
+def test_a_caplet_fixing_tomorrow_decays_to_its_intrinsic_value(market):
+    probe = CapFloor(1e7, "cap", 0.03, "6M", 0.01, start=dt.date(2026, 10, 22), exclude_first=False)
+    cf = replace(probe, strike=float(probe.caplets(market)["forward"].iloc[0]))  # first caplet at the money
+    table = cf.caplets(market)
+    first = table.iloc[0]
+    assert first["fix"] == dt.date(2026, 10, 20) and first["expiry"] == pytest.approx(1 / 365)
+    lost = -first["pv"]  # at the money: intrinsic value zero, so its whole value goes
+    assert lost < 0
+    rest = cf.decay(market) - lost
+    assert rest < 0 and abs(rest) < abs(lost)  # the second caplet, 3M longer, loses less in one day
+
+
+def test_full_theta_and_curve_gamma_of_caps_and_floors(market):
+    from derivx.risk.scenarios import carry_market, theta
+    from derivx.risk.sensitivities import rate_pv01_gamma
+
+    cap = CapFloor(1e7, "cap", 0.036, "5Y", 0.0095)
+    floor = replace(cap, kind="floor")
+    positions = [capfloor_position(cap, market.asof), capfloor_position(floor, market.asof)]
+    full = theta(positions, market)
+    rolled = carry_market(market, 1)
+    for value, position in zip(full, positions):
+        assert value == pytest.approx(position.pv(rolled) + position.cash(rolled, market.asof, rolled.asof)
+                                      - position.pv(market), rel=1e-12)  # fmt: skip
+    assert full[0] < 0 and full[1] < 0  # long options lose time value
+    (pv01_c, gamma_c), (pv01_f, gamma_f) = (rate_pv01_gamma(p.pv, market) for p in positions)
+    assert pv01_c > 0 > pv01_f and gamma_c > 0 and gamma_f > 0
+    swap_pv01, swap_gamma = rate_pv01_gamma(cap.swap_pv, market)  # cap - floor = payer swap on the strip
+    assert pv01_c - pv01_f == pytest.approx(swap_pv01, rel=1e-9)
+    assert gamma_c - gamma_f == pytest.approx(swap_gamma, abs=0.5)
+
+
+# --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
 
@@ -543,8 +601,14 @@ def test_tab_renders_and_returns_the_position():
     assert not at.error
     pv = float(at.metric[0].value.replace(",", ""))
     assert pv == pytest.approx(positions[0].pv(example_market()), abs=0.01)
-    assert len(at.get("plotly_chart")) == 2 and len(at.get("download_button")) == 2
+    assert len(at.get("plotly_chart")) == 3  # strip, vega, ladder
+    downloads = [b.proto.id.rsplit("-", 1)[-1] for b in at.get("download_button")]
+    assert downloads == ["cap_caplets_csv", "cap_ladder_csv", "cap_export_zip", "cap_export_manifest"]
     assert not at.warning
+    labels = [m.label for m in at.metric]
+    assert {"GAMMA (/BP²)", "THETA (1 BUS. DAY)", "VEGA (/1BP)", "PV01 (/BP)"} <= set(labels)
+    theta = float(next(m.value for m in at.metric if m.label == "THETA (1 BUS. DAY)").replace(",", ""))
+    assert theta < 0  # a long cap loses time value
 
 
 WIDGETS = {
@@ -558,6 +622,9 @@ WIDGETS = {
     "cap_atm_offset_bp": "number_input",
     "cap_strike_pct": "number_input",
     "cap_flat_vol_bachelier": "number_input",
+    "cap_strip_layout": "radio",
+    "cap_strip_method": "radio",
+    "cap_smile_expiry": "selectbox",
 }
 
 
@@ -584,6 +651,139 @@ def test_tab_handles_edge_inputs(changes):
     assert len(at.session_state["cap_test_positions"]) == 1
     beyond_curve = any("after the curve's last quote" in w.value for w in at.warning)
     assert beyond_curve == (changes.get("cap_forward_start") == "10Y")  # 10Yx30Y pays past the 30Y quote
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"cap_vol_mode": "Stripped from cap quotes"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_method": "Linear", "cap_tenor": "7Y"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike",
+         "cap_smile_expiry": "10Y (9.75Y)"},
+        {"cap_vol_mode": "Stripped from cap quotes", "cap_strip_layout": "By strike", "cap_strike_mode": "Absolute %",
+         "cap_strike_pct": 4.25, "cap_kind": "Floor", "cap_forward_start": "2Y"},
+    ],
+)  # fmt: skip
+def test_tab_strips_caplet_vols_from_cap_quotes(changes):
+    at = _app()
+    for key, value in changes.items():
+        _set(at, key, value)
+    assert not at.error, [e.value for e in at.error]
+    charts = [c.proto.id for c in at.get("plotly_chart")]
+    assert any(i.endswith("cap_vol_strip_chart") for i in charts)
+    assert any(i.endswith("cap_smile_chart") for i in charts) == (changes.get("cap_strip_layout") == "By strike")
+    repricing = next(d.value for d in at.dataframe if "ERROR (BP UPFRONT)" in d.value.columns)
+    assert repricing["ERROR (BP UPFRONT)"].abs().max() < 1e-9
+    position = at.session_state["cap_test_positions"][0]
+    assert position.details["trade"].stripped_vol
+    strip = json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith("cap_vol_strip_chart")).proto.spec)
+    badge = next(a["text"] for a in strip["layout"]["annotations"] if a["text"].startswith("SOURCE:"))
+    assert "ILLUSTRATIVE" in badge
+
+
+def test_stripped_vols_need_the_normal_model_and_show_quote_vegas():
+    at = _app()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    five = vegas.loc[vegas["QUOTED CAP"] == "5Y", "VEGA (PER +1BP FLAT VOL)"].iloc[0]
+    assert five == pytest.approx(total, rel=0.01)  # the 5Y ATM cap is the 5Y quote: its vega sits on that quote
+    _set(at, "cap_model", "Black (%)")
+    assert at.error and "pick the Normal (bp) model" in at.error[0].value
+    assert at.session_state["cap_test_positions"] == []
+
+
+def test_a_forward_start_trade_strips_the_spot_start_cap_quotes():
+    """Cap vols are quoted on spot-start caps: picking a forward start for
+    the trade used to strip the quotes as forward-start caps too (the 1Y
+    quote's caplets fixing 2.25Y-2.75Y ahead), so the trade was priced on
+    wrong caplet vols."""
+
+    from derivx.rates.capvol import strip_caplet_vols
+    from derivx.rates.vol_examples import illustrative_cap_atm
+
+    at = _app()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    spot_curve = at.session_state["cap_test_positions"][0].details["trade"].vol
+    _set(at, "cap_forward_start", "2Y")
+    assert not at.error, [e.value for e in at.error]
+    position = at.session_state["cap_test_positions"][0]
+    trade = position.details["trade"]
+    assert position.details["forward_start"] == "2Y" and trade.vol == spot_curve
+    assert (trade.start - EXAMPLE_ASOF).days > 700
+    repricing = next(d.value for d in at.dataframe if "ERROR (BP UPFRONT)" in d.value.columns)
+    assert repricing["LAST CAPLET EXPIRY (Y)"].iloc[0] < 1.0  # the 1Y quote is a spot-start 1Y cap
+    quotes = illustrative_cap_atm("USD")
+    terms = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
+    expected = strip_caplet_vols(example_market(), list(quotes["maturity"]), quotes["vol_bp"].to_numpy() * 1e-4,
+                                 terms=terms).curve  # fmt: skip
+    assert trade.vol.nodes == expected.nodes
+    np.testing.assert_allclose(trade.vol.vols, expected.vols, rtol=1e-13)
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    by_quote = vegas.set_index("QUOTED CAP")["VEGA (PER +1BP FLAT VOL)"]
+    # The 2Y x 5Y cap's caplets fix by 7Y (its last one within days of the 7Y quote's): quotes from 12Y on
+    # cannot move it, and +1bp on every quote moves every caplet vol by about 1bp.
+    assert by_quote["7Y"] > 0.0 and by_quote["12Y":].abs().max() < 1e-6
+    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    assert by_quote.sum() == pytest.approx(total, rel=0.02)
+
+
+EDGE_APP = """
+import streamlit as st
+import derivx.ui.rates_capfloor as cap
+from derivx.rates.examples import example_market
+
+_base = cap.illustrative_cap_atm
+
+
+def _edge(currency):
+    table = _base(currency)
+    table.loc[table.index[-1], "vol_bp"] = {vol_bp!r}
+    return table
+
+
+cap.illustrative_cap_atm = _edge
+st.session_state["cap_test_positions"] = cap.render(example_market())
+"""
+
+
+def test_quote_vegas_at_the_stripping_limit_do_not_break_the_tab():
+    """Quotes the strip can just meet (a 30Y flat vol 0.4bp above the lowest
+    non-negative caplet vols allow): the -1bp bump of that quote cannot be
+    stripped, which used to raise a traceback below the metrics."""
+
+    from derivx.rates.capvol import strip_caplet_vols
+    from derivx.rates.vol_examples import illustrative_cap_atm
+
+    quotes = illustrative_cap_atm("USD")
+    mats, flat = list(quotes["maturity"]), quotes["vol_bp"].to_numpy() * 1e-4
+    terms = {"index_months": 3, "day_count": "ACT/360", "calendar": "USD", "fixing_lag": 2}
+
+    def strips(vol: float) -> bool:
+        try:
+            strip_caplet_vols(example_market(), mats, np.r_[flat[:-1], vol], terms=terms)
+        except ValueError:
+            return False
+        return True
+
+    lo, hi = 1e-4, flat[-1]
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if strips(mid) else (mid, hi)
+    at = AppTest.from_string(EDGE_APP.format(vol_bp=round((hi + 0.4e-4) * 1e4, 4)), default_timeout=120)
+    at.run()
+    _set(at, "cap_vol_mode", "Stripped from cap quotes")
+    _set(at, "cap_tenor", "30Y")
+    at.checkbox(key="cap_quote_vega").check().run()
+    _assert_tab_contract(at)
+    assert not at.error, [e.value for e in at.error]
+    vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
+    assert vegas.set_index("QUOTED CAP").loc["30Y", "DIFFERENCE"] == "up only"
+    assert any("One-sided at" in c.value and "30Y" in c.value for c in at.caption)
 
 
 def test_tab_reports_black_with_a_negative_strike_as_an_error():

@@ -45,7 +45,7 @@ EPISODES = {
     "2013 taper tantrum": ("2013-05-02", "2013-09-05"),
     "2020 dash for cash": ("2020-03-09", "2020-03-18"),
     "2022 hiking cycle": ("2022-01-03", "2022-10-21"),
-    "Sept 2022 gilt crisis week (UST)": ("2022-09-21", "2022-09-28"),
+    "Sept 2022 gilt crisis week": ("2022-09-21", "2022-09-28"),
     "2023 SVB": ("2023-03-08", "2023-03-15"),
 }
 
@@ -790,6 +790,16 @@ render(market, positions)
 """
 
 
+def _library_size() -> int:
+    """Shocks in the tab's grid: the standard library plus PC1-PC3 +/-2 sd
+    (:func:`derivx.ui.rates_scenarios.scenario_library`)."""
+
+    from derivx.data.rates_history import bundled_store
+    from derivx.risk.scenarios import pca_library
+
+    return len(standard_library()) + len(pca_library(bundled_store(), end=EXAMPLE_ASOF))
+
+
 def _app(**state) -> AppTest:
     at = AppTest.from_string(APP, default_timeout=120)
     for key, value in state.items():
@@ -854,7 +864,7 @@ def test_scenario_tab_without_positions_or_quotes():
     no_govt = _app(scn_test_no_govt=True)
     assert not no_govt.error and len(no_govt.dataframe) == 2
     grid = no_govt.dataframe[1].value
-    assert list(grid.columns) == ["SCENARIO", "REC 10Y", "VOL", TOTAL] and len(grid) == len(standard_library()) + 1
+    assert list(grid.columns) == ["SCENARIO", "REC 10Y", "VOL", TOTAL] and len(grid) == _library_size() + 1
     assert isinstance(grid, pd.DataFrame)
 
 
@@ -893,7 +903,7 @@ def test_scenario_tab_reports_failed_scenarios_and_floored_vols():
     at = _app(scn_test_fragile=True)
     assert not at.error and any("Parallel -100bp: the 10Y quote is below 3%" in w.value for w in at.warning)
     grid = at.dataframe[1].value
-    assert "Parallel -100bp" not in set(grid["SCENARIO"]) and len(grid) == len(standard_library())
+    assert "Parallel -100bp" not in set(grid["SCENARIO"]) and len(grid) == _library_size()
     at.number_input(key="scn_par_bp").set_value(-150.0).run()  # the explain fails; the library grid still shows
     assert not at.exception and at.error and not at.metric and len(at.dataframe) == 1
     broken = _app(scn_test_broken=True)

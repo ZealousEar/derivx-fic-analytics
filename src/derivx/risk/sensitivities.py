@@ -7,23 +7,32 @@ revaluation:
 * ``parallel_pv01`` - P&L for +1bp on every quote of a curve
 * ``key_rate_pv01`` - the same, one quote at a time (the risk ladder)
 * ``parallel_gamma`` - second difference, P&L per (1bp)^2
+* ``rate_pv01_gamma`` - PV01 and gamma for +1bp on every rate quote of the
+  discount and projection curves together (basis spreads held)
 * ``solve_hedge`` - notionals of hedge instruments that flatten a ladder
 
 A long receiver swap or long bond has negative PV01 (it loses when rates
 rise); a long cap has positive PV01.
+
+``which`` names one curve of the market: ``"curve"`` (the discount curve),
+``"govt"`` (Treasury) or a projection index such as ``"EURIBOR 6M"``. Bumping
+the discount curve rebuilds the projection curves bootstrapped on it with
+their own quotes held, so a EURIBOR swap's discount-curve ladder includes
+the projection curve's response (market-quote risk, per curve). A bumped
+``BASIS`` quote moves a tenor basis spread by 1bp.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from derivx.rates.curves import Curve, Market
+from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Curve, Market
 
 PvFunction = Callable[[Market], float]
-CURVE_FIELDS = ("curve", "govt")
+CURVE_FIELDS = ("curve", "govt")  # the single-curve keys; projection curves are keyed by index name
 
 
 @dataclass
@@ -44,23 +53,21 @@ class Position:
 
 
 def _curve(market: Market, which: str) -> Curve:
-    if which not in CURVE_FIELDS:
-        raise ValueError(f"which must be one of {CURVE_FIELDS}")
-    curve = getattr(market, which)
-    if curve is None:
-        raise ValueError(f"market has no {which!r} curve")
-    return curve
+    if which not in market.curve_keys:
+        if which == "govt":
+            raise ValueError("market has no 'govt' curve")
+        raise ValueError(f"which must be one of {list(market.curve_keys)}, got {which!r}")
+    return market.get_curve(which)
 
 
 def bumped_market(market: Market, which: str, bumps_bp) -> Market:
     """Market with one curve rebuilt from bumped quotes (see
-    :meth:`Curve.rebuilt` for the forms ``bumps_bp`` can take)."""
+    :meth:`Curve.rebuilt` for the forms ``bumps_bp`` can take) and the
+    projection curves built on it rebuilt with their quotes held (see
+    :meth:`Market.rebuilt`)."""
 
-    curve = _curve(market, which).rebuilt(bumps_bp)
-    changes = {which: curve}
-    if which == "curve" and market.fixings is None:
-        changes["fixings"] = market.curve  # past fixings stay where they were
-    return market.replace(**changes)
+    _curve(market, which)
+    return market.rebuilt({which: bumps_bp})
 
 
 def parallel_pv01(pv: PvFunction, market: Market, which: str = "curve", bp: float = 1.0) -> float:
@@ -78,6 +85,42 @@ def parallel_gamma(pv: PvFunction, market: Market, which: str = "curve", bp: flo
     up = pv(bumped_market(market, which, bp))
     down = pv(bumped_market(market, which, -bp))
     return (up + down - 2.0 * base) / (bp * bp)
+
+
+def rate_curves(market: Market) -> Tuple[str, ...]:
+    """Curves that price swaps and rate options: the discount curve and every
+    projection curve with quotes of its own (not the Treasury curve; a
+    projection that is the discount curve moves with it)."""
+
+    return tuple(
+        k
+        for k in market.curve_keys
+        if k != GOVT_KEY and (k == DISCOUNT_KEY or not market.projections.is_discount(k)) and market.get_curve(k).quotes
+    )
+
+
+def rate_moved_market(market: Market, bp: float) -> Market:
+    """Every rate quote of every :func:`rate_curves` curve moved by ``bp``
+    and the curves rebuilt; tenor basis spreads (``BASIS`` quotes) held."""
+
+    bumps = {}
+    for key in rate_curves(market):
+        curve = market.get_curve(key)
+        bumps[key] = [0.0 if inst.kind in SPREAD_KINDS else bp for inst in curve.instruments]
+    if not bumps:
+        raise ValueError("the market has no curve with quotes to move")
+    return market.rebuilt(bumps)
+
+
+def rate_pv01_gamma(pv: PvFunction, market: Market, bp: float = 1.0) -> Tuple[float, float]:
+    """(PV01, gamma) for a parallel move of every rate quote (see
+    :func:`rate_moved_market`): P&L per +1bp and per (1bp)^2, central
+    differences on full revaluation, so P&L(x bp) ~ PV01 x + gamma x^2 / 2."""
+
+    base = pv(market)
+    up = pv(rate_moved_market(market, bp))
+    down = pv(rate_moved_market(market, -bp))
+    return (up - down) / (2.0 * bp), (up + down - 2.0 * base) / (bp * bp)
 
 
 def key_rate_pv01(pv: PvFunction, market: Market, which: str = "curve", bp: float = 1.0) -> List[Dict[str, object]]:
@@ -98,7 +141,7 @@ def key_rate_pv01(pv: PvFunction, market: Market, which: str = "curve", bp: floa
                 "index": i,
                 "label": f"{quote.tenor} {quote.kind}",
                 "tenor": quote.tenor,
-                "years": inst.tenor.years,
+                "years": inst.years,
                 "pv01": (up - down) / (2.0 * bp),
             }
         )
