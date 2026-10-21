@@ -138,6 +138,10 @@ def test_every_input_of_every_mode_survives_a_trip_through_the_other_modes():
     for mode in MODES:
         at.radio(key="app_mode").set_value(mode).run()
         assert not at.exception, (mode, [e.value for e in at.exception])
+        if mode == "[ ANALYTICS ]":  # a calibration first: its result adds inputs (expiry shown, smile-risk strike)
+            at.button(key="lab_cal_run").click().run()
+            show = next(e for e in at.selectbox if e.key and e.key.startswith("lab_cal_show_"))
+            show.set_value(show.options[-1]).run()
         defaults = _snapshot(at)
         changed = _change(at, mode)
         if mode == "[ RATES ]":
