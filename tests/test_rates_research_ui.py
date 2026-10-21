@@ -309,3 +309,70 @@ def test_var_follows_the_store_content_and_says_when_the_window_is_short():
     short = "holds only 125 daily changes (from 2014-12-31), not the 250 asked for"
     assert any(short in w.value for w in early.warning)
     assert _metric(early, "SCENARIO DAYS") == "125"
+
+
+BUCKET_APP = """
+import streamlit as st
+from derivx.rates.capfloor import CapFloor, capfloor_position
+from derivx.rates.examples import example_market
+from derivx.rates.swaptions import Swaption, swaption_position
+from derivx.ui import rates_book, rates_research
+
+market = example_market()
+book = rates_book.render(market)
+swaption = swaption_position(Swaption(1e7, "2Y", "10Y", 0.037, "payer", 0.0095), market, "TAB SWAPTION")
+cap = capfloor_position(CapFloor(1e7, "cap", 0.04, "5Y", 0.0090, calendar="USD"), asof=market.asof, name="TAB CAP")
+rates_research.render(market, book + [swaption, cap])
+"""
+
+
+def test_risk_report_has_vega_buckets(monkeypatch):
+    """Review finding (R4, A2): the RESEARCH risk report had one vega per
+    position. It now carries each option's vega by bucket, as the BOOK tab
+    does: book swaptions priced on the SABR cube by the cube's ATM points
+    they move, other swaptions by option expiry x swap tenor (allocated),
+    caps by caplet expiry; buckets add up to the position's normal vega,
+    with a TOTAL per currency and bucket."""
+
+    from derivx.rates import portfolio as pf
+    from derivx.rates.examples import example_market
+    from derivx.ui import rates_exports
+
+    seen = {}
+    original = rates_exports.export_row
+
+    def spy(kind, market, tables, inputs, model, key, store=None):
+        seen[kind] = tables
+        return original(kind, market, tables, inputs, model, key, store)
+
+    monkeypatch.setattr(rates_exports, "export_row", spy)
+    at = AppTest.from_string(BUCKET_APP, default_timeout=600)
+    at.run()
+    _ok(at)
+    report = seen["value at risk"]["risk_report"]
+    buckets = report[report["section"] == "vega_bucket"]
+    assert set(buckets["currency"]) == {"USD"} and (report["currency"] != "").all()
+    market = example_market()
+    from derivx.rates.capfloor import CapFloor
+    from derivx.rates.swaptions import Swaption
+
+    swaption = Swaption(1e7, "2Y", "10Y", 0.037, "payer", 0.0095).pinned(market)
+    flat = buckets[buckets["position"] == "TAB SWAPTION"]
+    assert set(flat["unit"]) == {"P&L per +1bp normal vol (allocated)"}
+    assert set(flat["item"]) == {"2Y x 10Y"}  # on the grid: all of its vega in one bucket
+    assert flat["value"].sum() == pytest.approx(swaption.greeks(market)["vega_normal_bp"], rel=1e-9)
+    cap = buckets[buckets["position"] == "TAB CAP"]
+    cf = CapFloor(1e7, "cap", 0.04, "5Y", 0.0090, calendar="USD").pinned(market.asof)
+    expected = pf.cap_normal_vegas(cf, market)
+    assert cap["value"].sum() == pytest.approx(expected["vega"].sum(), rel=1e-9)
+    assert all(item.endswith("x CAP 3M") for item in cap["item"]) and len(cap) > 3  # by caplet expiry
+    cube = buckets[buckets["position"] == "US9"]
+    assert set(cube["unit"]) == {"P&L per +1bp normal vol (cube)"} and set(cube["item"]) == {"1Y x 10Y"}
+    vega = report[(report["section"] == "vega") & (report["position"] == "US9")]["value"].iloc[0]
+    assert cube["value"].sum() == pytest.approx(vega, rel=0.02)  # ATM-point bumps: second-order terms aside
+    totals = buckets[buckets["position"] == "TOTAL"].set_index("item")
+    trades = buckets[buckets["position"] != "TOTAL"]
+    for item, value in trades.groupby("item")["value"].sum().items():
+        assert totals.loc[item, "value"] == pytest.approx(value, rel=1e-12, abs=1e-9)
+    assert {"US1", "US6"} - set(buckets["position"]) == {"US1", "US6"}  # swaps and bonds have no vega
+    assert any("vega by bucket" in c.value for c in at.caption)

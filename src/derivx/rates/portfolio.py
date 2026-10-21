@@ -1139,19 +1139,41 @@ def _expiry_years(labels: Sequence[str], market: Market) -> np.ndarray:
     return np.array([(Swaption(1.0, t, "1Y", 0.0).expiry_on(market) - market.asof).days / 365.0 for t in labels])
 
 
-def _vega_rows(position: Position, trade: Trade, market: Market, vols: VolSet, expiries: Sequence[str],
-               tenors: Sequence[str]) -> Tuple[float, List[Dict[str, object]]]:  # fmt: skip
-    """(vega per +1bp normal, bucket rows) of one option trade."""
+def cap_label(cf: CapFloor) -> str:
+    """Vega bucket column of a cap: ``CAP <index>`` (a term index, ``OIS 3M``
+    for the overnight rate compounded in arrears, ``3M`` for a single-curve
+    term rate), as the blotter's ``index`` column names it."""
 
-    instrument = position.details["instrument"]
+    if cf.projection:
+        return f"CAP {cf.projection}"
+    return f"CAP OIS {cf.index_months}M" if cf.compounded else f"CAP {cf.index_months}M"
+
+
+def option_vega_rows(
+    instrument: object,
+    market: Market,
+    expiries: Sequence[str] = GRID_EXPIRIES,
+    tenors: Sequence[str] = GRID_TENORS,
+    cube: Optional[SwaptionVolCube] = None,
+    label: Optional[str] = None,
+) -> Tuple[float, List[Dict[str, object]]]:
+    """(vega per +1bp normal vol, bucket rows) of a swaption or a cap /
+    floor / collar. Rows are ``expiry``, ``bucket`` (swap tenor, or ``CAP
+    <index>``), ``vega``, ``method``: a swaption priced on ``cube`` by the
+    cube's ATM points it moves (``cube``, :func:`vega_buckets`), any other
+    swaption with its vega split bilinearly between the nearest grid
+    expiries and tenors (``allocated``), a cap each caplet's vega split
+    linearly between the nearest grid expiries (``allocated``, column
+    ``label`` or :func:`cap_label`). Vegas sum to the trade's vega (cube
+    buckets: to within the second-order terms of the bumps)."""
+
     rows: List[Dict[str, object]] = []
     exp_years = _expiry_years(expiries, market)
-    if trade.type == "swaption":
+    if isinstance(instrument, Swaption):
         greeks = instrument.greeks(market)
         vega = float(greeks["vega_normal_bp"])
         if not math.isfinite(vega):
             vega = 0.0
-        cube = vols.cubes.get(cube_key(trade)) if position.details["vol_source"] == "cube" else None
         if cube is not None:
             grid = vega_buckets([instrument], cube, market)
             for i, e in enumerate(cube.expiries):
@@ -1167,14 +1189,46 @@ def _vega_rows(position: Position, trade: Trade, market: Market, vols: VolSet, e
                 if we[i] * wt[j]:
                     rows.append({"expiry": e, "bucket": t, "vega": vega * we[i] * wt[j], "method": "allocated"})
         return vega, rows
+    if not isinstance(instrument, CapFloor):
+        raise ValueError(f"no vega buckets for a {type(instrument).__name__}: swaptions and caps / floors have them")
     caplets = cap_normal_vegas(instrument, market)
-    bucket = f"CAP {cap_key(trade)}"
+    bucket = label or cap_label(instrument)
     totals = np.zeros(exp_years.size)
     for expiry, value in zip(caplets["expiry"], caplets["vega"]):
         totals += _tent(float(expiry), exp_years) * float(value)
     rows = [{"expiry": e, "bucket": bucket, "vega": float(v), "method": "allocated"}
             for e, v in zip(expiries, totals) if v != 0.0]  # fmt: skip
     return float(caplets["vega"].sum()), rows
+
+
+def _vega_rows(position: Position, trade: Trade, market: Market, vols: VolSet, expiries: Sequence[str],
+               tenors: Sequence[str]) -> Tuple[float, List[Dict[str, object]]]:  # fmt: skip
+    """(vega per +1bp normal, bucket rows) of one option trade of the book."""
+
+    instrument = position.details["instrument"]
+    if trade.type == "swaption":
+        cube = vols.cubes.get(cube_key(trade)) if position.details["vol_source"] == "cube" else None
+        return option_vega_rows(instrument, market, expiries, tenors, cube)
+    return option_vega_rows(instrument, market, expiries, tenors, label=f"CAP {cap_key(trade)}")
+
+
+def position_vega_buckets(position: Position, market: Market) -> List[Dict[str, object]]:
+    """Vega bucket rows of any position (see :func:`option_vega_rows`): its
+    own rows when it carries them (``details["vega_buckets"]``: the BOOK's
+    trades, set by :func:`price_book`, and the SWAPTION tab's trade, both
+    by the SABR cube's ATM points when priced on the cube), else those of
+    the swaption or cap in ``details["trade"]`` on the standard grid
+    (:data:`~derivx.rates.swaption_vol.GRID_EXPIRIES` x
+    :data:`~derivx.rates.swaption_vol.GRID_TENORS`, allocated); none for a
+    position without vol."""
+
+    rows = position.details.get("vega_buckets") if isinstance(position.details, Mapping) else None
+    if rows is not None:
+        return [dict(r) for r in rows]
+    instrument = position.details.get("trade") if isinstance(position.details, Mapping) else None
+    if not isinstance(instrument, (Swaption, CapFloor)):
+        return []
+    return option_vega_rows(instrument, market)[1]
 
 
 @dataclass
@@ -1458,6 +1512,7 @@ def price_book(
             if trade.type in ("cap", "floor", "swaption"):
                 vegas[k], rows = _vega_rows(position, trade, market, vols, grid[0], grid[1])
                 bucket_rows += [{"id": trade.id, **r} for r in rows]
+                position.details["vega_buckets"] = tuple(rows)  # the RESEARCH risk report reads them
     buckets = pd.DataFrame(bucket_rows, columns=["id", "expiry", "bucket", "vega", "method"])
     return BookRisk(
         asof=market.asof,
@@ -1911,7 +1966,9 @@ __all__ = [
     "hedge_book",
     "hedge_instruments",
     "optimise_hedge",
+    "option_vega_rows",
     "parse_blotter",
+    "position_vega_buckets",
     "price_book",
     "read_blotter_csv",
     "summary_table",

@@ -132,10 +132,14 @@ def test_off_grid_points_strikes_sides_and_flat_vols(app):
     trade = app.session_state["swn_test_positions"][0].details["trade"]
     assert trade.kind == "straddle" and trade.notional < 0 and trade.strike == pytest.approx(0.0425)
     assert _metric(app, "PV ($)") < 0 < _metric(app, "THETA ($, 1 BUS. DAY)")
+    cube_rows = app.session_state["swn_test_positions"][0].details["vega_buckets"]  # the RESEARCH report's (A2)
+    assert {r["method"] for r in cube_rows} == {"cube"} and len(cube_rows) == 4  # 4Y x 7Y: four ATM points move
+    assert {(r["expiry"], r["bucket"]) for r in cube_rows} == {("3Y", "5Y"), ("3Y", "10Y"), ("5Y", "5Y"), ("5Y", "10Y")}
     app.radio(key="swn_vol_source").set_value("Flat vol").run()
     _assert_contract(app)
     assert "swn_vega_heatmap" not in _charts(app)
     assert app.session_state["swn_test_positions"][0].details["vol"] == pytest.approx(95e-4)
+    assert "vega_buckets" not in app.session_state["swn_test_positions"][0].details  # flat vol: allocated later
 
 
 def test_implied_vol_from_the_premium_shown(app):
