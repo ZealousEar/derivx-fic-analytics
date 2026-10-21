@@ -131,3 +131,174 @@ def test_units_option_is_validated(capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["pull", "fred", "--ids", "X", "--units", "FOO"])  # used to fail with a dict() error message
     assert exit_info.value.code == 2 and "use SERIES=UNIT" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# curve / book / risk / scenario (offline: the committed sample and an empty cache)
+# --------------------------------------------------------------------------
+
+QUOTES = """curve,instrument,tenor,rate
+,DEPO,1W,3.90
+,OIS,1M,3.91
+,OIS,6M,3.82
+,OIS,1Y,3.69
+,OIS,2Y,3.55
+,OIS,5Y,3.56
+,OIS,10Y,3.73
+,OIS,30Y,3.80
+"""
+
+
+@pytest.fixture
+def book(tmp_path, capsys):
+    path = tmp_path / "trades.csv"
+    assert cli.main(["book", "example", "--currency", "USD", "--out", str(path)]) == 0
+    assert "EXAMPLE USD book (illustrative trades)" in capsys.readouterr().out
+    return path
+
+
+def test_curve_build_round_trips_through_json(tmp_path, capsys):
+    from derivx.rates import curve_io
+
+    quotes = tmp_path / "q.csv"
+    quotes.write_text(QUOTES)
+    out, nodes = tmp_path / "curve.json", tmp_path / "nodes.csv"
+    code = cli.main(["curve", "build", "--quotes", str(quotes), "--asof", "2026-10-19", "--interp", "loglinear",
+                     "--out", str(out), "--nodes", str(nodes), "--cache", str(tmp_path / "c")])  # fmt: skip
+    text = capsys.readouterr().out
+    assert code == 0 and "curve set on 2026-10-19" in text and "max repricing error" in text
+    assert "US Treasury par yields" in text  # added from the store (default --treasury)
+    market, sources, manifest = curve_io.read_curve_set(out)
+    assert market.curve_keys == ("curve", "govt") and sources["curve"] == "q.csv"
+    assert manifest["kind"] == "curve build" and manifest["inputs"]["quotes"]["sha256"]
+    assert manifest["data"]["store"]["rows_sha256"]
+    assert [q.tenor for q in market.curve.quotes] == ["1W", "1M", "6M", "1Y", "2Y", "5Y", "10Y", "30Y"]
+    assert len(pd.read_csv(nodes)) == len(market.curve.quotes) + len(market.govt.quotes)
+    assert cli.main(["curve", "show", "--curve", str(out)]) == 0
+    assert "rebuilt from its quotes and checked against its nodes" in capsys.readouterr().out
+    assert cli.main(["curve", "build", "--quotes", str(quotes), "--asof", "2026-10-19", "--no-treasury", "--out",
+                     str(out)]) == 0  # fmt: skip
+    assert curve_io.read_curve_set(out)[0].govt is None
+    bad = tmp_path / "bad.csv"
+    bad.write_text("curve,instrument,tenor,rate\nLIBOR,OIS,1Y,3.5\n")
+    assert cli.main(["curve", "build", "--quotes", str(bad), "--asof", "2026-10-19"]) == 2
+    assert "use blank/OIS (swap curve), TREASURY or a term index" in capsys.readouterr().err
+
+
+def test_risk_on_a_curve_file_equals_risk_on_the_date(book, tmp_path, capsys):
+    curve = tmp_path / "curve.json"
+    assert cli.main(["curve", "build", "--asof", "2026-10-19", "--out", str(curve)]) == 0
+    capsys.readouterr()
+    reports = []
+    for market in (["--curve", str(curve)], ["--asof", "2026-10-19"]):
+        report = tmp_path / f"risk{len(reports)}.csv"
+        manifest = tmp_path / f"run{len(reports)}.json"
+        code = cli.main(["risk", "--trades", str(book), *market, "--illustrative-vols", "--out", str(report),
+                         "--ladder", str(tmp_path / "ladder.csv"), "--manifest", str(manifest)])  # fmt: skip
+        text = capsys.readouterr().out
+        assert code == 0 and "10 trades priced, 0 skipped" in text and "US10" in text
+        reports.append(pd.read_csv(report))
+        payload = __import__("json").loads(manifest.read_text())
+        assert payload["kind"] == "book risk" and payload["inputs"]["trades"]["rows_valid"] == 10
+        assert payload["model"]["vol_sources"]["cube:OIS"].startswith("ILLUSTRATIVE")
+    assert "curve_file" in __import__("json").loads((tmp_path / "run0.json").read_text())["data"]
+    a, b = reports
+    assert list(a["section"]) == list(b["section"])
+    assert a["value"].to_numpy() == pytest.approx(b["value"].to_numpy(), rel=1e-9, abs=1e-9)
+    total_pv = a[(a["section"] == "pv") & (a["id"] == "TOTAL")]["value"].iloc[0]
+    assert total_pv == pytest.approx(a[(a["section"] == "pv") & (a["id"] != "TOTAL")]["value"].sum(), rel=1e-12)
+    ladder = pd.read_csv(tmp_path / "ladder.csv")
+    assert set(ladder["curve"]) == {"curve", "govt"} and set(ladder["id"]) == {f"US{i}" for i in range(1, 11)}
+
+
+def test_risk_hedge_and_exit_codes(book, tmp_path, capsys):
+    hedge = tmp_path / "hedge.csv"
+    code = cli.main(["risk", "--trades", str(book), "--asof", "2026-10-19", "--illustrative-vols", "--hedge",
+                     "2Y,5Y,10Y,30Y", "--bid-ask", "0.25", "--move", "5", "--hedge-out", str(hedge)])  # fmt: skip
+    text = capsys.readouterr().out
+    assert code == 0 and "hedge: residual risk" in text and "Receive fixed" in text
+    assert set(pd.read_csv(hedge).columns) == {"curve", "quote", "years", "book", "hedge", "residual"}
+    # Without vols the options are skipped with the reason and a hint, and the exit code says so.
+    assert cli.main(["risk", "--trades", str(book), "--asof", "2026-10-19"]) == cli.EXIT_TRADES
+    err = capsys.readouterr().err
+    assert "skipped: US9 (swaption): no swaption vol cube" in err and "--illustrative-vols" in err
+    broken = tmp_path / "broken.csv"
+    broken.write_text(book.read_text().replace("swap,USD,receive", "swap,USD,sideways", 1))
+    assert cli.main(["risk", "--trades", str(broken), "--asof", "2026-10-19", "--illustrative-vols"]) == 3
+    assert "direction 'sideways'" in capsys.readouterr().err
+    assert cli.main(["risk", "--trades", str(book)]) == 2
+    assert "give the market: --curve curve.json or --asof YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_scenario_grid_explain_and_manifest(book, tmp_path, capsys):
+    grid, explain, manifest = tmp_path / "grid.csv", tmp_path / "explain.csv", tmp_path / "run.json"
+    code = cli.main(["scenario", "--trades", str(book), "--asof", "2026-10-19", "--illustrative-vols",
+                     "--shock", "parallel:+25", "--shock", "keyrate:2Y=+10,10Y=-5", "--shock", "pca:1:2",
+                     "--shock", "historical:2022-hiking-cycle", "--out", str(grid), "--explain", str(explain),
+                     "--manifest", str(manifest)])  # fmt: skip
+    text = capsys.readouterr().out
+    assert code == 0 and "Parallel +25bp" in text and "2022 hiking cycle" in text
+    table = pd.read_csv(grid)
+    trades = [c for c in table.columns if c.startswith("US")]
+    assert len(table) == 4 and len(trades) == 10
+    assert table["TOTAL"].to_numpy() == pytest.approx(table[trades].sum(axis=1).to_numpy(), rel=1e-12)
+    rows = pd.read_csv(explain)
+    assert {"scenario", "position", "pnl", "delta", "gamma", "residual", "delta_curve"} <= set(rows.columns)
+    first = rows[rows["scenario"] == "Parallel +25bp"]
+    assert first["pnl"].sum() == pytest.approx(table["TOTAL"].iloc[0], rel=1e-9)
+    payload = __import__("json").loads(manifest.read_text())
+    assert payload["inputs"]["shocks"][0] == "parallel:+25"
+    replay = next(s for s in payload["data"]["scenario_sources"] if s["shock"] == "2022 hiking cycle")
+    assert {src["flag"] for src in replay["sources"]} >= {"real"}
+    assert cli.main(["scenario", "--trades", str(book), "--asof", "2026-10-19", "--shock", "twist:5"]) == 2
+    assert "--shock 'twist:5': missing a field" in capsys.readouterr().err
+    assert cli.main(["scenario", "--trades", str(book), "--asof", "2026-10-19", "--shock", "historical:nope"]) == 2
+    assert "unknown episode 'nope'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "spec, names",
+    [
+        ("parallel:-50", ["Parallel -50bp"]),
+        ("twist:5:-10:+10", ["Twist 5Y pivot -10/+10bp"]),
+        ("fly:5Y:25", ["2s5s10s fly +25/+0bp"]),
+        ("fly:7:20:-5:2:30", ["2s7s30s fly +20/-5bp"]),
+        ("keyrate:2Y=+10,10Y=-5", ["Key rates (2Y +10, 10Y -5)"]),
+        ("pca:2:-1", ["PC2 slope -1 sd"]),
+        ("historical:2023-svb:0.5", ["2023 SVB x0.5"]),
+        ("window:2022-09-21:2022-09-28", ["History 2022-09-21 to 2022-09-28"]),
+    ],
+)
+def test_shock_specs(spec, names):
+    from derivx.rates.examples import example_market
+
+    shocks = cli.parse_shock(spec, example_market(), rh.bundled_store())
+    assert [s.name for s in shocks] == names
+
+
+def test_library_shock_and_book_check(book, tmp_path, capsys):
+    from derivx.rates.examples import example_market
+
+    library = cli.parse_shock("library", example_market(), rh.bundled_store())
+    assert len(library) == 18 and library[-1].name.startswith("PC3")
+    assert cli.main(["book", "check", "--trades", str(book)]) == 0
+    assert "10 valid trades" in capsys.readouterr().out
+    assert cli.main(["book", "example", "--currency", "EUR"]) == 0
+    assert "EURIBOR 3M/EURIBOR 6M" in capsys.readouterr().out
+
+
+def test_risk_runs_as_a_module(book, tmp_path):
+    done = subprocess.run(
+        [sys.executable, "-m", "derivx", "risk", "--trades", str(book), "--asof", "2026-10-19", "--illustrative-vols"],
+        capture_output=True,
+        text=True,
+        env={
+            "PYTHONPATH": str(ROOT / "src"),
+            "PATH": "/usr/bin:/bin",
+            "DERIVX_OFFLINE": "1",
+            "DERIVX_CACHE_DIR": str(tmp_path / "cache"),
+        },  # fmt: skip
+        timeout=300,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "TOTAL" in done.stdout and "key-rate PV01 of the book" in done.stdout
