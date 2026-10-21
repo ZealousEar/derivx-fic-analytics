@@ -1,0 +1,19 @@
+# Streamlit settings for every way the app runs: `streamlit run` from the
+# repository root, the Docker image (WORKDIR /app), Render, Procfile hosts,
+# the devcontainer and Streamlit Community Cloud all read this file.
+# Secrets never go here: they belong in .streamlit/secrets.toml, which
+# .gitignore and .dockerignore keep out of git and out of the image.
+# Per-host settings (port, address) come from the command line or from
+# STREAMLIT_* environment variables, which override this file: the Docker
+# image and render.yaml also set STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type so
+# public viewers see an exception's type, not a traceback with server paths.
+
+[server]
+# Cross-site request forgery and CORS protection stay at Streamlit's safe
+# defaults (on). The app has file uploaders; never turn these off to work
+# around a proxy - open the app in its own browser tab instead.
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false

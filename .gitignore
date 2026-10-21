@@ -20,8 +20,10 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# Streamlit
-.streamlit/
+# Streamlit: only the shared config is committed; secrets.toml and anything
+# else under .streamlit/ stays local.
+.streamlit/*
+!.streamlit/config.toml
 
 # Data outputs
 data/**/*.parquet
