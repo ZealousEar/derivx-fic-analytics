@@ -19,7 +19,7 @@ def _slice(days=30, **kw):
 
 def test_year_fraction_is_act_365_on_dates():
     assert year_fraction("2026-10-19", "2026-11-18") == pytest.approx(30 / 365)
-    assert year_fraction(pd.Timestamp("2026-10-19 16:30", tz="US/Eastern"), "2026-10-19") == 0.0
+    assert year_fraction(pd.Timestamp("2026-10-19 16:30", tz="America/New_York"), "2026-10-19") == 0.0
 
 
 def test_forward_from_put_call_parity_is_insensitive_to_the_assumed_rate():
@@ -210,7 +210,7 @@ def test_min_days_counts_whole_days():
 
 
 def test_timezone_aware_trade_date_keeps_its_local_day():
-    evening = pd.Timestamp("2026-10-19 21:30", tz="US/Eastern")  # already the 20th in UTC
+    evening = pd.Timestamp("2026-10-19 21:30", tz="America/New_York")  # already the 20th in UTC
     assert year_fraction(evening, "2026-10-20") == pytest.approx(1 / 365)
 
 

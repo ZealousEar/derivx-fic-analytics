@@ -1,10 +1,14 @@
--e .
-numpy<2
-scipy
-pandas<2.2
-pyarrow<14
-numexpr>=2.8.5,<3
-plotly
+# Runtime dependencies: the same ranges as [project.dependencies] in
+# pyproject.toml (tests/test_deploy.py fails when the two lists differ).
+# Test, lint and notebook tools are extras: pip install -e ".[dev,notebooks]".
+numpy>=1.26,<2.5
+scipy>=1.11,<2
+pandas>=2.1,<3
+pyarrow>=14
+plotly>=5.22,<8
 streamlit>=1.59,<2
 yfinance>=0.2.66,<0.3
-pytest
+# The derivx package itself, editable so that it reads its bundled sample data
+# from data/examples next to src/ (Streamlit Community Cloud installs this file
+# from the repository root and runs src/derivx/ui/streamlit_app.py).
+-e .

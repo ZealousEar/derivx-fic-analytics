@@ -34,6 +34,7 @@ from pandas.tseries.holiday import (
 EXCHANGE_TZ = "America/New_York"
 
 DateLike = Union[str, dt.date, dt.datetime, pd.Timestamp, np.datetime64]
+ONE_DAY = np.timedelta64(1, "D")  # explicit unit: numpy >= 2.5 deprecates datetime64 + bare int
 
 
 class NyseHolidayCalendar(AbstractHolidayCalendar):
@@ -85,8 +86,8 @@ def trading_days_between(start: DateLike, end: DateLike) -> int:
 
     a, b = _day(start), _day(end)
     if b >= a:
-        return int(np.busday_count(a + 1, b + 1, holidays=_holidays()))
-    return -int(np.busday_count(b + 1, a + 1, holidays=_holidays()))
+        return int(np.busday_count(a + ONE_DAY, b + ONE_DAY, holidays=_holidays()))
+    return -int(np.busday_count(b + ONE_DAY, a + ONE_DAY, holidays=_holidays()))
 
 
 def add_trading_days(start: DateLike, n: int) -> pd.Timestamp:
@@ -109,7 +110,7 @@ def trading_days(start: DateLike, end: DateLike) -> List[pd.Timestamp]:
     a, b = _day(start), _day(end)
     if b < a:
         return []
-    days = np.arange(a, b + 1, dtype="datetime64[D]")
+    days = np.arange(a, b + ONE_DAY, dtype="datetime64[D]")
     return [pd.Timestamp(d) for d in days[np.is_busday(days, holidays=_holidays())]]
 
 
