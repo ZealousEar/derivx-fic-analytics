@@ -36,7 +36,7 @@ from derivx.core.bs import DAYS_PER_YEAR, BSGreeks, bs_greeks, bs_theta_1d, desk
 from derivx.ui import pricer_calc as calc
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes, bound_scene
 from derivx.ui.state import PERSIST
-from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, PNL_COLORS, SERIES, dark_layout
 from derivx.vol.implied import STATUS, implied_vol_bs
 from derivx.vol.svi import svi_iv
 
@@ -70,7 +70,6 @@ SURFACE_COLORS = [
     [0.9, "#FF9E4A"],
     [1.0, "#E5243B"],
 ]
-PNL_COLORS = [[0.0, "#E5243B"], [0.5, "#111111"], [1.0, "#22C55E"]]
 CURRENCIES = ("USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "HKD", "OTHER")
 PRESET_FIELDS = ("spot", "strike", "T", "r", "q", "vol")
 VOL_MAX = 5.0  # VOL.σ input bound (500%)
@@ -378,7 +377,7 @@ def _scenario(spec: ModeSpec, inp: calc.Inputs, position: float, ccy: Optional[s
             y=y_labels,
             text=[[calc.fmt_compact(v) for v in row] for row in grid.pnl],
             texttemplate="%{text}",
-            textfont=dict(family="IBM Plex Mono", size=10),
+            textfont=dict(family="IBM Plex Mono", size=10, color=FOREGROUND),
             colorscale=PNL_COLORS,
             zmid=0.0,
             colorbar=dict(
@@ -553,8 +552,7 @@ def _finish_smile(spec: ModeSpec, fig: go.Figure, xs, ys) -> None:
     fig.update_layout(
         hovermode="x unified",
         dragmode="zoom",
-        legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.0, font=dict(color=FOREGROUND)),
-        margin=dict(l=60, r=20, t=30, b=90),
+        margin=dict(l=60, r=20, t=30, b=60),  # the legend sits below the STRIKE title (theme.LEGEND_BELOW)
     )
     bound_axes(fig, xaxis=axis_limits(xs, floor=0.0), yaxis=axis_limits(ys, pad=0.1, floor=0.0))
     st.plotly_chart(fig, width="stretch", key=_k(spec, "smile_2d"), config=PLOTLY_2D_CONFIG)

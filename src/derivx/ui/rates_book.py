@@ -38,7 +38,7 @@ from derivx.ui import (
     rates_swaption,
 )
 from derivx.ui.plot_limits import axis_limits, bound_axes
-from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, CELL_TEXT, DIVERGING_COLORS, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
 STATE_KEY = "book_state"
 CURRENT_KEY = "book_current"
@@ -300,7 +300,6 @@ def _krd_chart(risk: pf.BookRisk, key: str, unit: str, source: Tuple[str, object
     )
     fig.update_layout(barmode="relative")
     dark_layout(fig, height=460, xtitle="CURVE QUOTE", ytitle=f"PV01 ({unit} PER +1BP)")
-    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.42, x=0.0), margin=dict(b=170))
     rates_data.badge(fig, *source)
     loaded_values = qr.pv01[:, loaded] if loaded else np.zeros((len(labels), 1))
     highs = np.clip(loaded_values, 0.0, None).sum(axis=1)
@@ -321,9 +320,9 @@ def _vega_heatmap(matrix: pd.DataFrame, unit: str, source: Tuple[str, object]) -
     peak = max(float(np.max(np.abs(z))) if z.size else 1.0, 1e-12)
     fig = go.Figure(
         go.Heatmap(
-            z=z, x=list(matrix.columns), y=rows, colorscale=[[0.0, ACCENT], [0.5, "#111111"], [1.0, SERIES[2]]],
+            z=z, x=list(matrix.columns), y=rows, colorscale=DIVERGING_COLORS,
             zmid=0.0, zmin=-peak, zmax=peak, text=[[f"{v:,.0f}" for v in row] for row in z], texttemplate="%{text}",
-            textfont=dict(color=SERIES[0]), hovertemplate="%{y} x %{x}: %{text}<extra></extra>",
+            textfont=CELL_TEXT, hovertemplate="%{y} x %{x}: %{text}<extra></extra>",
             colorbar=dict(title=dict(text=f"{unit}/BP")),
         )
     )  # fmt: skip

@@ -63,7 +63,7 @@ from derivx.models.comparison import (
 )
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.state import PERSIST
-from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, FOREGROUND, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 from derivx.validation.backtest import PREDICTORS, WalkForwardResult, WalkForwardSettings, run_walk_forward
 from derivx.validation.manifest import build_manifest, jsonable, manifest_bytes, results_zip
 from derivx.vol.quotes import REASONS
@@ -111,20 +111,8 @@ LAB_CSS = """
 .dx-lab-stat span { display:block; font-size:0.7rem; font-weight:700; letter-spacing:0.12em; color:#333333; }
 .dx-lab-stat b { display:block; font-size:1.5rem; font-family:'IBM Plex Mono', monospace; white-space:nowrap;
   overflow-x:auto; }
-[data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label { color:#FFFFFF !important; }
-[data-testid="stMain"] [data-testid="stCaptionContainer"], [data-testid="stMain"] [data-testid="stCaptionContainer"] p {
-  color:#C8C8C8 !important; }
-[data-testid="stFileUploaderDropzone"] { background:#000000 !important; border:2px dashed #FFFFFF !important;
-  border-radius:0 !important; }
-[data-testid="stFileUploaderDropzone"] * { color:#E0E0E0 !important; }
-[data-testid="stFileUploaderDropzone"] button { background:#000000 !important; color:#FFFFFF !important;
-  border:2px solid #FFFFFF !important; border-radius:0 !important; }
-[data-testid="stFileUploaderFile"] { background:#000000 !important; border:1px solid #FFFFFF !important; }
-[data-testid="stFileUploaderFile"] * { color:#FFFFFF !important; background:transparent !important; }
-[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * { color:#FFFFFF !important; }
-.stDownloadButton button { background:#000000; color:#FFFFFF; border:2px solid #FFFFFF; border-radius:0;
-  font-weight:700; letter-spacing:0.05em; }
-.stDownloadButton button:hover { background:#FFFFFF; color:#000000; }
+/* labels, captions, uploaders, expanders and buttons come from the app theme (theme.APP_CSS); long lab button
+   labels may wrap */
 [data-testid="stMain"] .stButton button { padding:0.6rem 0.9rem; white-space:normal; }
 </style>
 """
@@ -230,10 +218,10 @@ def _stale_notice(stored: Mapping[str, object], data_key: str, settings_key: str
     return False
 
 
-def _legend(y: float) -> Dict[str, object]:
-    """Horizontal legend below the x-axis title, in the foreground colour."""
+def _legend() -> Dict[str, object]:
+    """Horizontal legend at the bottom of the figure, below the x-axis title, in the foreground colour."""
 
-    return dict(orientation="h", yanchor="top", y=y, x=0.0, font=dict(color=FOREGROUND))
+    return dict(**LEGEND_BELOW, font=dict(color=FOREGROUND))
 
 
 def _stats(items: Sequence[Tuple[str, str]]) -> None:
@@ -727,7 +715,7 @@ def _plot_calibration_smile(slc) -> go.Figure:
         go.Scatter(x=[F], y=[atm], mode="markers", name="ATM-F", marker=dict(size=11, color=SERIES[4], symbol="x"))
     )
     dark_layout(fig, height=400, xtitle="STRIKE", ytitle="IMPLIED VOL (decimal)")
-    fig.update_layout(legend=_legend(-0.3), margin=dict(l=60, r=20, t=30, b=120))
+    fig.update_layout(legend=_legend(), margin=dict(l=60, r=20, t=30, b=60))
     bound_axes(
         fig,
         xaxis=axis_limits(grid, floor=0.0),
@@ -953,7 +941,7 @@ def _plot_walkforward(daily: pd.DataFrame) -> go.Figure:
     )
     values.append(d["noise_bp"].to_numpy(float))
     dark_layout(fig, height=380, xtitle="TARGET DATE", ytitle="RMSE (VOL BP)")
-    fig.update_layout(legend=_legend(-0.45), margin=dict(l=60, r=20, t=30, b=170))
+    fig.update_layout(legend=_legend(), margin=dict(l=60, r=20, t=30, b=60))
     dates = pd.to_datetime(d["target"])
     pad = max((dates.max() - dates.min()) * 0.05, pd.Timedelta(days=1))
     bound_axes(
@@ -1173,7 +1161,7 @@ def _plot_model_comparison(comp: ModelComparison, models: Sequence[str]) -> go.F
             lines.append(y)
             fig.add_trace(go.Scatter(x=grid, y=y, mode="lines", **styles[model]))
     dark_layout(fig, height=400, xtitle="STRIKE", ytitle="IMPLIED VOL (decimal)")
-    fig.update_layout(legend=_legend(-0.3), margin=dict(l=60, r=20, t=30, b=120))
+    fig.update_layout(legend=_legend(), margin=dict(l=60, r=20, t=30, b=60))
     bound_axes(
         fig,
         xaxis=axis_limits(grid, floor=0.0),
