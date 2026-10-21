@@ -39,8 +39,17 @@ P&L of each position in each scenario
     * :func:`full_revaluation_pnl`: curves rebuilt from the moved quotes and
       every position revalued.
 
+Currencies
+    Each position's P&L is in its own currency (swaps and options in the
+    swap curve's, Treasuries in USD). :func:`var_table` with ``currencies``
+    gives the VaR of each currency's positions together (``TOTAL USD``,
+    ``TOTAL EUR``; ``TOTAL`` for a book in one currency) and, with a
+    ``reporting`` currency, of the whole book converted at today's FX spots
+    (``ALL IN <R>``, :mod:`derivx.risk.reporting`). FX spots are held: there
+    is no FX history in the store, so the VaR has no FX risk.
+
 Risk measures (:func:`var_es`, :func:`delta_normal`), losses as positive
-amounts in the book's currency
+amounts in the positions' currency
     * VaR at confidence a: the k-th largest loss of the N scenarios,
       k = ceil(N (1 - a)); it is negative if even that scenario gains.
     * Expected shortfall: the mean loss over the worst N (1 - a) scenarios,
@@ -67,6 +76,7 @@ from scipy.stats import norm
 from derivx.data.rates_history import HistoryStore, dataset_info, user_dataset
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Market
 from derivx.rates.pca import MAX_GAP_DAYS, tenor_map, tenor_years
+from derivx.risk.reporting import Reporting, ordered, total_label
 from derivx.risk.scenarios import GOVT_HISTORY, SWAP_HISTORY, SWAP_PROXIES, QuoteRisk, quoted_levels, shocked_curves
 from derivx.risk.sensitivities import Position
 
@@ -407,38 +417,62 @@ def delta_normal(delta_pnl: Sequence[float], confidence: float) -> DeltaNormal:
     return DeltaNormal(sigma, z * sigma, sigma * float(norm.pdf(z)) / (1.0 - confidence))
 
 
+def book_columns(
+    pnl: np.ndarray,
+    names: Sequence[str],
+    currencies: Optional[Sequence[str]] = None,
+    reporting: Optional[Reporting] = None,
+) -> Dict[str, Tuple[np.ndarray, str]]:
+    """{label: (P&L per scenario, currency)}: each position, then the book
+    per currency (``TOTAL`` or ``TOTAL <CCY>``: P&L summed per scenario over
+    that currency's positions) and, when ``reporting`` is given and some
+    position is in another currency, ``ALL IN <R>`` (every position
+    converted at today's spot). Without ``currencies`` every position is
+    taken to be in one currency (labelled ``""``)."""
+
+    pnl = np.atleast_2d(np.asarray(pnl, dtype=float))
+    ccys = list(currencies) if currencies is not None else [""] * len(names)
+    if len(ccys) != len(names) or pnl.shape[1] != len(names):
+        raise ValueError(f"{pnl.shape[1]} P&L columns, {len(names)} names and {len(ccys)} currencies")
+    out: Dict[str, Tuple[np.ndarray, str]] = {name: (pnl[:, j], ccys[j]) for j, name in enumerate(names)}
+    groups = ordered(ccys) if names else [""]
+    for ccy in groups:
+        picks = [j for j, c in enumerate(ccys) if c == ccy]
+        out[total_label(ccy, len(groups) > 1)] = (pnl[:, picks].sum(axis=1), ccy)
+    if reporting is not None and currencies is not None and reporting.needs_conversion(ccys):
+        out[reporting.label] = ((pnl * reporting.rates(ccys)).sum(axis=1), reporting.currency)
+    return out
+
+
 def var_table(
     pnl: np.ndarray,
     names: Sequence[str],
     confidence: float,
     delta: Optional[np.ndarray] = None,
+    currencies: Optional[Sequence[str]] = None,
+    reporting: Optional[Reporting] = None,
 ) -> pd.DataFrame:
     """One row per position and a ``TOTAL`` row (the book: P&L summed per
     scenario, so its VaR is not the sum of the rows): VaR, ES, worst loss,
     mean and sd of daily P&L; with ``delta`` (first-order P&L) the
-    delta-normal sigma, VaR and ES."""
+    delta-normal sigma, VaR and ES. With ``currencies`` (one per position)
+    the table has a ``currency`` column and a total per currency, and with
+    ``reporting`` the whole book converted (:func:`book_columns`)."""
 
-    pnl = np.atleast_2d(np.asarray(pnl, dtype=float))
-    columns = {name: pnl[:, j] for j, name in enumerate(names)}
-    columns[TOTAL] = pnl.sum(axis=1)
+    columns = book_columns(pnl, names, currencies, reporting)
     first = None
     if delta is not None:
-        delta = np.atleast_2d(np.asarray(delta, dtype=float))
-        first = {name: delta[:, j] for j, name in enumerate(names)}
-        first[TOTAL] = delta.sum(axis=1)
+        first = book_columns(delta, names, currencies, reporting)
     rows = []
-    for name, values in columns.items():
+    for name, (values, ccy) in columns.items():
         var, es = var_es(values, confidence)
-        row = {
-            "position": name,
-            "var": var,
-            "es": es,
-            "worst_loss": float(-values.min()),
-            "mean_pnl": float(values.mean()),
-            "sd_pnl": float(values.std(ddof=1)),
-        }
+        row: Dict[str, object] = {"position": name}
+        if currencies is not None:
+            row["currency"] = ccy
+        row.update(var=var, es=es, worst_loss=float(-values.min()), mean_pnl=float(values.mean()),
+                   sd_pnl=float(values.std(ddof=1)))  # fmt: skip
         if first is not None:
-            dn = delta_normal(first[name], confidence)
+            dn = delta_normal(first[name][0], confidence)
             row.update(dn_sigma=dn.sigma, dn_var=dn.var, dn_es=dn.es)
         rows.append(row)
     return pd.DataFrame(rows)
@@ -467,33 +501,42 @@ def risk_report(
     table: pd.DataFrame,
     vegas: Optional[Sequence[float]] = None,
     vol_models: Optional[Sequence[Optional[str]]] = None,
+    currencies: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """One long table of the book's risk, for export: ``section``
     (``pv01``, ``gamma``, ``vega``, ``var``), ``position``, ``curve``,
-    ``item`` (quote label or measure), ``value`` and ``unit``. PV01 is P&L
-    per +1bp of one curve quote, gamma per (1bp)^2, vega per +1bp normal vol
-    or +1 lognormal vol point; the VaR rows are ``var_table``'s columns."""
+    ``item`` (quote label or measure), ``value``, ``unit`` and ``currency``
+    (of ``value``; ``currencies`` gives each position's). PV01 is P&L per
+    +1bp of one curve quote, gamma per (1bp)^2, vega per +1bp normal vol or
+    +1 lognormal vol point (the vol shift the position's model takes). The
+    VaR rows are ``var_table``'s columns, in the currency of their row."""
 
+    ccys = list(currencies) if currencies is not None else [""] * len(names)
+    if len(ccys) != len(names):
+        raise ValueError(f"{len(names)} positions but {len(ccys)} currencies")
     rows: List[Dict[str, object]] = []
     for key, qr in risk.items():
         for i, label in enumerate(qr.labels):
             for j, name in enumerate(names):
                 rows.append({"section": "pv01", "position": name, "curve": key, "item": label,
-                             "value": float(qr.pv01[i, j]), "unit": "P&L per +1bp"})  # fmt: skip
+                             "value": float(qr.pv01[i, j]), "unit": "P&L per +1bp", "currency": ccys[j]})  # fmt: skip
                 rows.append({"section": "gamma", "position": name, "curve": key, "item": label,
-                             "value": float(qr.gamma[i, j]), "unit": "P&L per (1bp)^2"})  # fmt: skip
+                             "value": float(qr.gamma[i, j]), "unit": "P&L per (1bp)^2",
+                             "currency": ccys[j]})  # fmt: skip
     if vegas is not None:
         models = list(vol_models or [None] * len(names))
-        for name, vega, model in zip(names, vegas, models):
+        for name, vega, model, ccy in zip(names, vegas, models, ccys):
             if model is None:
                 continue
             unit = "P&L per +1bp normal vol" if model == "normal" else "P&L per +1 lognormal vol point"
             rows.append({"section": "vega", "position": name, "curve": "", "item": f"{model} vol",
-                         "value": float(vega), "unit": unit})  # fmt: skip
+                         "value": float(vega), "unit": unit, "currency": ccy})  # fmt: skip
+    by_position = dict(zip(names, ccys))
     for _, row in table.iterrows():
+        ccy = str(row["currency"]) if "currency" in row.index else by_position.get(str(row["position"]), "")
         for column, value in row.items():
-            if column == "position":
+            if column in ("position", "currency"):
                 continue
             rows.append({"section": "var", "position": row["position"], "curve": "", "item": column,
-                         "value": float(value), "unit": "currency (losses positive)"})  # fmt: skip
-    return pd.DataFrame(rows, columns=["section", "position", "curve", "item", "value", "unit"])
+                         "value": float(value), "unit": "losses positive", "currency": ccy})  # fmt: skip
+    return pd.DataFrame(rows, columns=["section", "position", "curve", "item", "value", "unit", "currency"])

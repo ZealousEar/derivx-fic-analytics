@@ -24,13 +24,26 @@ whatever ``pull`` cached)::
     derivx book example --currency USD --out trades.csv
     derivx risk --trades trades.csv --curve curve.json --illustrative-vols --out risk.csv --manifest run.json
     derivx risk --trades trades.csv --asof 2026-10-19 --hedge 2Y,5Y,10Y,30Y --bid-ask 0.25 --move 5
+    derivx risk --trades mixed.csv --asof 2026-10-19 --conventions all --report-ccy EUR --illustrative-vols
     derivx scenario --trades trades.csv --asof 2026-10-19 --shock parallel:+25 --shock historical:2022-hiking-cycle
+    derivx scenario --trades mixed.csv --asof 2026-10-19 --conventions all --shock fx:EURUSD=+10
 
 ``curve build`` writes the curve set as JSON (quotes, nodes and a run
 manifest); ``risk`` and ``scenario`` rebuild it from its quotes and refuse a
 file whose quotes no longer give its nodes. Exit codes: 0 ok, 1 a data
 source failed, 2 bad arguments, 3 some blotter rows or trades were left out
 (the rest were priced).
+
+Currencies: every trade's numbers are in its currency (US Treasuries in
+USD, the rest in the swap curve's). ``risk`` and ``scenario`` total each
+currency and add the whole book converted into ``--report-ccy`` (default
+USD; ``ALL IN USD``) at the ECB euro reference rates of the bundled snapshot
+(the latest day on or before the valuation date) or at ``--fx`` rates,
+printing the rates used. ``--conventions all`` (with ``--asof``) prices each
+currency's trades on that currency's market (USD SOFR, EUR ESTR, GBP SONIA;
+Treasuries on the US Treasury curve), so one blotter can hold all three.
+Hedges and key-rate ladders stay per currency. FX spots are held unless a
+shock moves them (``fx:EURUSD=+10``, ``--fx-move``).
 
 Each subcommand registers itself with :func:`command`.
 """
@@ -40,6 +53,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -271,16 +285,124 @@ def _hw(text: str):
         raise argparse.ArgumentTypeError(f"{text!r}: give MEAN_REVERSION_PCT,SIGMA_BP (e.g. 3,85): {exc}") from None
 
 
+ALL_MARKETS = "all"
+
+
+def _fx_quotes(text: str) -> Dict[str, float]:
+    """``EURUSD=1.08,GBPUSD=1.27`` -> ``{pair: rate}`` (USD per 1 EUR and
+    per 1 GBP)."""
+
+    out: Dict[str, float] = {}
+    for part in _list(text):
+        pair, sep, value = part.partition("=")
+        code = pair.strip().upper().replace("/", "")
+        try:
+            rate = float(value)
+        except ValueError:
+            rate = float("nan")
+        if not sep or code not in ("EURUSD", "GBPUSD") or not rate > 0:
+            raise argparse.ArgumentTypeError(f"{part!r}: write EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP)")
+        out[code] = rate
+    if set(out) != {"EURUSD", "GBPUSD"}:
+        raise argparse.ArgumentTypeError("give both EURUSD and GBPUSD, e.g. EURUSD=1.08,GBPUSD=1.27")
+    return out
+
+
+def _fx_moves(text: str) -> Dict[str, float]:
+    """``EURUSD=+10,GBPUSD=-5`` -> ``{pair: % move}``."""
+
+    out: Dict[str, float] = {}
+    for part in _list(text):
+        pair, sep, value = part.partition("=")
+        code = pair.strip().upper().replace("/", "")
+        try:
+            pct = float(value)
+        except ValueError:
+            pct = float("nan")
+        if not sep or code not in ("EURUSD", "GBPUSD") or not pct > -100.0:
+            raise argparse.ArgumentTypeError(f"{part!r}: write EURUSD=+10 or GBPUSD=-5 (% moves, above -100)")
+        out[code] = pct
+    return out
+
+
 def _market_options(parser: argparse.ArgumentParser, curve_file: bool = True) -> None:
     group = parser.add_argument_group("market")
     if curve_file:
         group.add_argument("--curve", type=Path, help="curve set JSON from 'derivx curve build'")
     group.add_argument("--asof", type=_date, help="valuation date: build the market the app starts from that day")
-    group.add_argument("--conventions", default="USD SOFR", choices=["USD SOFR", "EUR ESTR", "GBP SONIA"],
-                       help="swap curve (with --asof)")  # fmt: skip
+    group.add_argument("--conventions", default="USD SOFR", choices=["USD SOFR", "EUR ESTR", "GBP SONIA", ALL_MARKETS],
+                       help="swap curve (with --asof); 'all' prices each currency's trades on its own market "
+                       "(USD SOFR, EUR ESTR, GBP SONIA), Treasuries on the US Treasury curve")  # fmt: skip
     group.add_argument("--interp", default="loglinear", help="loglinear, linear_zero or monotone_convex (with --asof)")
     group.add_argument("--hw", type=_hw, help="futures convexity: Hull-White MEAN_REVERSION_PCT,SIGMA_BP (3,85)")
     group.add_argument("--cache", type=Path, help="download cache directory (default data/cache or $DERIVX_CACHE_DIR)")
+    rep = parser.add_argument_group("reporting currency")
+    rep.add_argument("--report-ccy", default="USD", choices=["USD", "EUR", "GBP"],
+                     help="convert book totals into this currency (totals stay per currency too)")  # fmt: skip
+    rep.add_argument("--fx", type=_fx_quotes,
+                     help="FX spots EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP); default: the bundled ECB "
+                     "euro reference rates of the latest day on or before the valuation date")  # fmt: skip
+
+
+@dataclass
+class _Book:
+    """Trades priced on one market: ``currency`` is that market's when the
+    blotter is split by currency (``--conventions all``), else None."""
+
+    currency: Optional[str]
+    market: object
+    sources: Dict[str, str]
+    data: Dict[str, object]
+    notes: List[str]
+    trades: list
+
+
+def _books(args: argparse.Namespace, trades) -> List[_Book]:
+    """The market(s) to price ``trades`` on: the one of --curve or
+    --asof/--conventions, or one per currency with ``--conventions all``."""
+
+    if args.conventions != ALL_MARKETS:
+        market, sources, data, notes = _market(args)
+        return [_Book(None, market, sources, data, notes, list(trades))]
+    if getattr(args, "curve", None) is not None or args.asof is None:
+        raise ValueError("--conventions all builds each currency's market for a date: give --asof, not --curve")
+    from derivx.rates import curve_io
+    from derivx.rates.manifest import market_record
+    from derivx.rates.portfolio import OIS_CONVENTIONS
+    from derivx.risk.reporting import ordered
+
+    store = _store(args.cache)
+    by_ccy: Dict[str, list] = {}
+    for trade in trades:
+        by_ccy.setdefault("USD" if trade.type == "bond" else trade.currency, []).append(trade)
+    out = []
+    for ccy in ordered(list(by_ccy)):
+        market, sources, notes = curve_io.default_market(store, args.asof, OIS_CONVENTIONS[ccy], args.interp,
+                                                         args.hw or curve_io.HW_DEFAULT)  # fmt: skip
+        out.append(_Book(ccy, market, sources, market_record(market, sources, store), notes, by_ccy[ccy]))
+    if not out:
+        raise ValueError("the blotter has no valid trades")
+    return out
+
+
+def _reporting(args: argparse.Namespace, asof: dt.date):
+    """The reporting currency and the FX spots that convert into it."""
+
+    from derivx.risk.reporting import Reporting, default_reporting, entered_spots
+
+    if args.fx is not None:
+        return Reporting(args.report_ccy, entered_spots(args.fx, None, "FX rates given with --fx"))
+    return default_reporting(asof, args.report_ccy)
+
+
+def _print_fx(reporting, currencies, asof: dt.date) -> None:
+    if not reporting.needs_conversion(currencies):
+        return
+    print(f"FX: {reporting.label} converts at {reporting.describe(currencies)}; FX spots held unless a shock moves "
+          "them")  # fmt: skip
+    if reporting.fx.asof is not None and reporting.fx.asof != asof:
+        print(f"  note: the FX spots are of {reporting.fx.asof}, not of the valuation date {asof} (pass --fx for "
+              "rates of that date)")  # fmt: skip
 
 
 def _market(args: argparse.Namespace):
@@ -508,7 +630,8 @@ def _skipped(risk) -> None:
             hint = " (or pass --swaption-vols / --cap-vols / --illustrative-vols)"
         elif "switch the swap curve to" in reason:
             conventions = reason.rsplit("switch the swap curve to ", 1)[1].split(" to price it")[0]
-            hint = f" (here: --asof with --conventions {conventions!r}, or a curve set built with them)"
+            hint = (f" (here: --asof with --conventions {conventions!r}, or --conventions all to price every "
+                    "currency on its own market, or a curve set built with them)")  # fmt: skip
         print(f"skipped: {trade.id} ({trade.type}): {reason}{hint}", file=sys.stderr)
     for note in risk.notes:
         print(f"  note: priced beyond the market data: {note}")
@@ -524,28 +647,41 @@ def _risk(args: argparse.Namespace) -> int:
     from derivx.rates.manifest import run_manifest, sha256_bytes
 
     trades, bad_rows = _trades(args.trades)
-    market, sources, data, notes = _market(args)
-    for note in notes:
-        print(f"  note: {note}")
-    vols, vol_inputs = _vols(args, market, trades)
-    risk = pf.price_book(trades, market, vols)
-    _skipped(risk)
-    summary = risk.summary()
+    books = _books(args, trades)
+    priced = []
+    for book in books:
+        where = f" ({book.currency} market)" if book.currency else ""
+        for note in book.notes:
+            print(f"  note{where}: {note}")
+        vols, vol_inputs = _vols(args, book.market, book.trades)
+        risk = pf.price_book(book.trades, book.market, vols)
+        _skipped(risk)
+        priced.append((book, risk, vols, vol_inputs))
+    asof = books[0].market.asof
+    reporting = _reporting(args, asof)
+    risks = [risk for _, risk, _, _ in priced]
+    currencies = [c for risk in risks for c in risk.currencies]
+    summary = pf.summary_table(risks, reporting)
     shown = summary.copy()
     for column in ("pv", "pv01", "gamma", "vega"):
         shown[column] = shown[column].map(_money)
-    print(f"book on {market.asof}: {len(risk.trades)} trades priced, {len(risk.skipped)} skipped; values in each "
-          "trade's currency, signed to the holder; PV01 and gamma for +1bp on every rate quote of every curve, vega "
+    n_priced, n_skipped = sum(len(r.trades) for r in risks), sum(len(r.skipped) for r in risks)
+    print(f"book on {asof}: {n_priced} trades priced, {n_skipped} skipped; values in each trade's currency, signed "
+          "to the holder, with a TOTAL per currency; PV01 and gamma for +1bp on every rate quote of every curve, vega "
           "per +1bp normal vol")  # fmt: skip
+    _print_fx(reporting, currencies, asof)
     print(shown.to_string(index=False))
-    totals = risk.ladder_totals()
-    if args.ladder_all:
-        print(totals.to_string(index=False))
-    else:
-        loaded = totals[totals["pv01"].abs() > 0.005]
-        print("key-rate PV01 of the book (P&L per +1bp of one quote; buckets under half a cent left out):")
-        print(loaded.assign(pv01=loaded["pv01"].map(_money)).drop(columns=["gamma"]).to_string(index=False))
-    hedge = None
+    for book, risk, _, _ in priced:
+        totals = risk.ladder_totals()
+        where = f" ({book.currency} market)" if book.currency else ""
+        if args.ladder_all:
+            print(totals.to_string(index=False))
+        else:
+            loaded = totals[totals["pv01"].abs() > 0.005]
+            print(f"key-rate PV01 of the book{where} (P&L per +1bp of one quote, in the curve's currency; buckets "
+                  "under half a cent left out):")  # fmt: skip
+            print(loaded.assign(pv01=loaded["pv01"].map(_money)).drop(columns=["gamma"]).to_string(index=False))
+    hedges = []
     move = args.move
     if args.hedge:
         if args.bid_ask is not None and move is None:
@@ -555,36 +691,58 @@ def _risk(args: argparse.Namespace) -> int:
         elif args.bid_ask is None and move is not None:
             print("  note: --move only sizes the cost penalty, and there is none without --bid-ask: least-squares "
                   "hedge")  # fmt: skip
-        bench = {key: list(args.hedge) for key in pf.default_benchmarks(risk, market)}
-        costs = {k: args.bid_ask for k in pf.assumed_bid_ask(market, bench)} if args.bid_ask is not None else {}
-        instruments = pf.hedge_instruments(market, bench, bid_ask_bp=costs)
-        hedge = pf.hedge_book(risk, market, instruments, move)
-        table = hedge.table[hedge.table["notional"] != 0.0].copy()
-        for column in ("notional", "cost", "pv01"):
-            table[column] = table[column].map(_money)
-        table["par"] = table["par"].map(lambda v: f"{100 * v:.4f}%")  # par rate, basis spread or coupon
-        print(f"hedge: residual risk {_money(hedge.risk_after)} vs {_money(hedge.risk_before)} per bp (root sum of "
-              f"squares of the key-rate ladder, {100 * hedge.risk_removed:.2f}% of its square removed), bid/ask cost "
-              f"{_money(hedge.cost)}; notional > 0 receives fixed, receives the spread leg or buys the bond; pv01 per "
-              "+1bp on every quote")  # fmt: skip
-        print(table.to_string(index=False))
-    report = exports.risk_report(risk)
+        for book, risk, _, _ in priced:
+            bench = {key: list(args.hedge) for key in pf.default_benchmarks(risk, book.market)}
+            if not bench:
+                continue
+            costs = {}
+            if args.bid_ask is not None:
+                costs = {k: args.bid_ask for k in pf.assumed_bid_ask(book.market, bench)}
+            instruments = pf.hedge_instruments(book.market, bench, bid_ask_bp=costs)
+            hedge = pf.hedge_book(risk, book.market, instruments, move)
+            hedges.append(hedge)
+            for ccy, part in hedge.by_currency.items():
+                label = "hedge" if len(hedge.by_currency) == 1 and len(priced) == 1 else f"hedge, {ccy} curves"
+                print(f"{label}: residual risk {_money(part.risk_after)} vs {_money(part.risk_before)} {ccy} per bp "
+                      f"(root sum of squares of the key-rate ladder, {100 * part.risk_removed:.2f}% of its square "
+                      f"removed), bid/ask cost {_money(part.cost)} {ccy}; notional > 0 receives fixed, receives the "
+                      "spread leg or buys the bond; pv01 per +1bp on every quote")  # fmt: skip
+            table = hedge.table[hedge.table["notional"] != 0.0].copy()
+            for column in ("notional", "cost", "pv01"):
+                table[column] = table[column].map(_money)
+            table["par"] = table["par"].map(lambda v: f"{100 * v:.4f}%")  # par rate, basis spread or coupon
+            print(table.to_string(index=False))
+    report = exports.risk_report(risks, reporting=reporting)
     _write_table(report, args.out, "risk report")
-    _write_table(risk.ladder(), args.ladder, "key-rate ladder by trade")
-    if hedge is not None:
-        _write_table(hedge.ladder, args.hedge_out, "hedge ladder")
+    _write_table(pd.concat([r.ladder() for r in risks], ignore_index=True), args.ladder, "key-rate ladder by trade")
+    if hedges:
+        _write_table(pd.concat([h.ladder for h in hedges], ignore_index=True), args.hedge_out, "hedge ladder")
+    data = books[0].data if len(books) == 1 else {"markets": {b.currency: b.data for b in books}}
+    vol_inputs = priced[0][3] if len(priced) == 1 else {b.currency: v for b, _, _, v in priced}
+    vol_sources = dict(priced[0][2].sources) if len(priced) == 1 else {b.currency: dict(v.sources)
+                                                                       for b, _, v, _ in priced}  # fmt: skip
     manifest = run_manifest(
         "book risk",
         {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes()),
-                    "rows_valid": len(trades)}, "vols": vol_inputs,
-         "hedge": None if hedge is None else {"tenors": list(args.hedge), "move_bp": move,
-                                              "bid_ask_bp": args.bid_ask}},
+                    "rows_valid": len(trades)}, "vols": vol_inputs, "reporting": _reporting_record(reporting,
+                                                                                                    currencies),
+         "markets": "one per currency" if len(books) > 1 or books[0].currency else "one",
+         "hedge": None if not hedges else {"tenors": list(args.hedge), "move_bp": move, "bid_ask_bp": args.bid_ask}},
         data,
         {"bump_bp": pf.BP, "risk": "central differences on full revaluation, curves rebuilt",
-         "vol_sources": dict(vols.sources)},
+         "vol_sources": vol_sources, "fx": "spots held; totals per currency and converted at the stated spots"},
     )  # fmt: skip
     _write_manifest(manifest, args.manifest)
-    return EXIT_TRADES if bad_rows or risk.skipped else 0
+    return EXIT_TRADES if bad_rows or n_skipped else 0
+
+
+def _reporting_record(reporting, currencies) -> Dict[str, object]:
+    from derivx.risk.reporting import ordered
+
+    return {"reporting_currency": reporting.currency, "position_currencies": ordered(currencies),
+            "fx": {p: reporting.fx.quote(p) for p in ("EURUSD", "GBPUSD", "EURGBP")},
+            "fx_source": reporting.fx.source, "fx_asof": reporting.fx.asof,
+            "converted": reporting.needs_conversion(currencies)}  # fmt: skip
 
 
 def _shock_years(text: str) -> float:
@@ -640,13 +798,15 @@ def parse_shock(spec: str, market, store) -> List[object]:
             return [sc.ibor_ois_basis(float(parts[0]))]
         if kind == "tenorbasis":
             return [sc.tenor_basis(float(parts[0]))]
+        if kind == "fx":
+            return [sc.fx_spot(_fx_moves(rest))]
         if kind == "library":
             shocks = sc.standard_library(store)
             if market.is_multi_curve:
                 shocks += [sc.ibor_ois_basis(10.0), sc.tenor_basis(5.0)]
             return shocks + sc.pca_library(store, end=market.asof)
-    except (IndexError, ValueError) as exc:
-        detail = str(exc) if isinstance(exc, ValueError) else "missing a field"
+    except (IndexError, ValueError, argparse.ArgumentTypeError) as exc:
+        detail = str(exc) if isinstance(exc, (ValueError, argparse.ArgumentTypeError)) else "missing a field"
         raise ValueError(f"--shock {spec!r}: {detail} (see derivx scenario --help)") from None
     raise ValueError(f"--shock {spec!r}: unknown shock type {kind!r} (see derivx scenario --help)")
 
@@ -660,7 +820,11 @@ SHOCK_HELP = """shock specs (bp unless stated; tenors as years or 2Y/10Y):
   historical:NAME[:SCALE]             a named episode, e.g. historical:2022-hiking-cycle
   window:START:END[:SCALE]            the curve changes between two dates of the history store
   basis:BP / tenorbasis:BP            IBOR-OIS basis / tenor basis spreads (multi-curve markets)
-  library                             the app's scenario library (parallel, twists, fly, episodes, PCA)"""
+  fx:EURUSD=+10[,GBPUSD=-5]           FX spots only, % moves (moves only totals converted to --report-ccy)
+  library                             the app's scenario library (parallel, twists, fly, episodes, PCA)
+
+Each trade's P&L is in its currency; TOTAL columns add one currency's trades, ALL IN <CCY> converts the book
+into --report-ccy (plus the FX translation of FX moves)."""
 
 
 def _scenario(args: argparse.Namespace) -> int:
@@ -668,60 +832,117 @@ def _scenario(args: argparse.Namespace) -> int:
 
     from derivx.rates import portfolio as pf
     from derivx.rates.manifest import run_manifest, sha256_bytes
+    from derivx.risk import reporting as rp
     from derivx.risk import scenarios as sc
 
     trades, bad_rows = _trades(args.trades)
-    market, sources, data, notes = _market(args)
-    for note in notes:
-        print(f"  note: {note}")
+    books = _books(args, trades)
+    for book in books:
+        where = f" ({book.currency} market)" if book.currency else ""
+        for note in book.notes:
+            print(f"  note{where}: {note}")
     store = _store(args.cache)
-    shocks = [s for spec in args.shock for s in parse_shock(spec, market, store)]
+    parse_on = next((b.market for b in books if b.market.is_multi_curve), books[0].market)
+    shocks = [s for spec in args.shock for s in parse_shock(spec, parse_on, store)]
     if not shocks:
         raise ValueError("give at least one --shock (see derivx scenario --help)")
-    settings = {"horizon_days": args.horizon, "normal_vol_bp": args.vol_normal, "lognormal_vol_pts": args.vol_lognormal}
-    if market.govt is None:
-        settings["govt"] = False
+    settings: Dict[str, object] = {"horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
+                                   "lognormal_vol_pts": args.vol_lognormal}  # fmt: skip
+    if args.fx_move:
+        settings["fx"] = tuple(args.fx_move.items())
     shocks = [dc_replace(s, **settings) for s in shocks]
-    vols, vol_inputs = _vols(args, market, trades)
-    risk = pf.price_book(trades, market, vols, vega=False)
-    _skipped(risk)
-    positions = list(risk.positions)
-    if not positions:
+    asof = books[0].market.asof
+    reporting = _reporting(args, asof)
+    parts, failed, skipped, vol_inputs, vol_sources = [], {}, 0, {}, {}
+    for book in books:
+        vols, inputs = _vols(args, book.market, book.trades)
+        vol_inputs[book.currency or ""] = inputs
+        vol_sources[book.currency or ""] = dict(vols.sources)
+        risk = pf.price_book(book.trades, book.market, vols, vega=False)
+        _skipped(risk)
+        skipped += len(risk.skipped)
+        positions = list(risk.positions)
+        if not positions:
+            continue
+        rows = {}
+        for shock in shocks:
+            moved = dc_replace(shock, govt=False) if book.market.govt is None else shock
+            try:
+                rows[shock.name] = sc.scenario_grid(positions, book.market, [moved]).iloc[0, : len(positions)]
+            except ValueError as exc:
+                failed.setdefault(shock.name, f"{shock.name}: {exc}")
+        base = [float(p.pv(book.market)) for p in positions]
+        parts.append((book, positions, rows, base, list(risk.currencies)))
+    if not parts:
         raise ValueError("no trade could be priced")
-    rows, failed = [], []
-    for shock in shocks:
-        try:
-            rows.append(sc.scenario_grid(positions, market, [shock]))
-        except ValueError as exc:
-            failed.append(f"{shock.name}: {exc}")
-    for reason in failed:
+    for reason in failed.values():
         print(f"not revalued: {reason}", file=sys.stderr)
-    grid = pd.concat(rows) if rows else pd.DataFrame()
+    kept = [s for s in shocks if s.name not in failed]
+    names = sc._unique([s.name for s in kept])
+    local = pd.concat([pd.DataFrame([rows[s.name] for s in kept], index=names) for _, _, rows, _, _ in parts], axis=1)
+    currencies = [c for *_, ccys in parts for c in ccys]
+    base = [v for _, _, _, values, _ in parts for v in values]
+    grid = rp.add_total_columns(local, currencies, reporting, base, [s.fx for s in kept]) if kept else local
+    grid.index.name = "scenario"
     if not grid.empty:
-        print(f"full-revaluation P&L on {market.asof} (value at the horizon + cash - value today, each trade's "
-              f"currency, signed to the holder; horizon {args.horizon} days):")  # fmt: skip
+        print(f"full-revaluation P&L on {asof} (value at the horizon + cash - value today, each trade's currency, "
+              f"signed to the holder, a TOTAL per currency; horizon {args.horizon} days):")  # fmt: skip
+        _print_fx(reporting, currencies, asof)
+        if any(s.moves_fx for s in kept) and not reporting.needs_conversion(currencies):
+            print(f"  note: every amount is in {reporting.currency}: FX moves change nothing")
         print(grid.map(_money).to_string())
     _write_table(grid.rename_axis("scenario").reset_index(), args.out, "scenario grid")
     if args.explain is not None:
         explain = []
-        for shock in shocks:
-            try:
-                for row in sc.run_scenario(positions, market, shock):
-                    by_curve = row.pop("delta_by_curve")
-                    explain.append({"scenario": shock.name, **row, **{f"delta_{k}": v for k, v in by_curve.items()}})
-            except ValueError as exc:
-                print(f"no explain for {shock.name}: {exc}", file=sys.stderr)
+        for shock in kept:
+            rows = []
+            for book, positions, _, _, _ in parts:
+                moved = dc_replace(shock, govt=False) if book.market.govt is None else shock
+                try:
+                    rows += sc.run_scenario(positions, book.market, moved)
+                except ValueError as exc:
+                    print(f"no explain for {shock.name}: {exc}", file=sys.stderr)
+            explain += _explain_rows(shock, rows, reporting)
         _write_table(pd.DataFrame(explain), args.explain, "P&L explain")
+    markets = books[0].data if len(books) == 1 else {"markets": {b.currency: b.data for b in books}}
     manifest = run_manifest(
         "scenario grid",
         {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes())},
          "shocks": list(args.shock), "horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
-         "lognormal_vol_pts": args.vol_lognormal, "vols": vol_inputs},
-        {**data, "scenario_sources": [{"shock": s.name, "sources": [vars(x) for x in s.sources]} for s in shocks]},
-        {"revaluation": "quotes shocked, curves rebuilt, every trade revalued", "vol_sources": dict(vols.sources)},
+         "lognormal_vol_pts": args.vol_lognormal, "fx_move_pct": args.fx_move or {},
+         "vols": vol_inputs if len(books) > 1 else next(iter(vol_inputs.values())),
+         "reporting": _reporting_record(reporting, currencies)},
+        {**markets, "scenario_sources": [{"shock": s.name, "sources": [vars(x) for x in s.sources]} for s in shocks]},
+        {"revaluation": "quotes shocked, curves rebuilt, every trade revalued",
+         "vol_sources": vol_sources if len(books) > 1 else next(iter(vol_sources.values())),
+         "fx": "local P&L does not move with FX; converted totals at today's spots plus the FX translation"},
     )  # fmt: skip
     _write_manifest(manifest, args.manifest)
-    return EXIT_TRADES if bad_rows or risk.skipped or failed else 0
+    return EXIT_TRADES if bad_rows or skipped or failed else 0
+
+
+def _explain_rows(shock, rows: List[Dict[str, object]], reporting) -> List[Dict[str, object]]:
+    """Explain rows of one scenario as CSV records: per trade, a total per
+    currency and the book converted (with the FX translation of FX moves)."""
+
+    from derivx.risk import reporting as rp
+    from derivx.risk.scenarios import EXPLAIN_COLUMNS
+
+    if not rows:
+        return []
+    by_curve = [r.get("delta_by_curve", {}) for r in rows]
+    frame = pd.DataFrame([{k: v for k, v in r.items() if k != "delta_by_curve"} for r in rows])
+    for k in sorted({k for d in by_curve for k in d}):
+        frame[f"delta_{k}"] = [d.get(k, 0.0) for d in by_curve]
+    currencies = [str(c) for c in frame["currency"]]
+    extra = None
+    if shock.moves_fx and reporting.needs_conversion(currencies):
+        frame["fx"] = float("nan")
+        extra = rp.explain_fx(frame["shocked_pv"], frame["cash"], currencies, reporting, shock.fx)
+    values = ["base_pv", "shocked_pv", "cash", "pnl", *EXPLAIN_COLUMNS] + [c for c in frame if c.startswith("delta_")]
+    table = rp.add_total_rows(frame, values, "position", "currency", reporting, extra)
+    table.insert(0, "scenario", shock.name)
+    return table.to_dict("records")
 
 
 def _book_example(args: argparse.Namespace) -> int:
@@ -786,6 +1007,9 @@ def _register_scenario(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--horizon", type=int, default=0, help="calendar days to roll the market forward first")
     parser.add_argument("--vol-normal", type=float, default=0.0, help="normal vol shock (bp)")
     parser.add_argument("--vol-lognormal", type=float, default=0.0, help="lognormal vol shock (vol points)")
+    parser.add_argument("--fx-move", type=_fx_moves,
+                        help="FX moves added to every shock, e.g. EURUSD=+10,GBPUSD=-5 (%%; only converted totals "
+                        "move)")  # fmt: skip
     _market_options(parser)
     _vol_options(parser)
     parser.add_argument("--out", type=Path, help="write the scenario grid CSV (scenarios x trades)")

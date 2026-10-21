@@ -10,6 +10,7 @@ from derivx.ui import (
     rates_book,
     rates_capfloor,
     rates_curve,
+    rates_fx,
     rates_research,
     rates_scenarios,
     rates_swap,
@@ -48,6 +49,7 @@ elif mode == "RATES":
             with tab:
                 st.info("Fix the quotes on the CURVE tab to price instruments.")
     else:
+        reporting = rates_fx.sidebar(market)  # one reporting currency for the BOOK, SCENARIOS and RESEARCH totals
         tab_trades = []
         with tabs[1]:
             tab_trades += rates_swap.render(market)
@@ -58,12 +60,12 @@ elif mode == "RATES":
         with tabs[4]:
             tab_trades += rates_bonds.render(market)
         with tabs[5]:
-            book = rates_book.render(market)
+            book = rates_book.render(market, reporting)
         positions, scope = rates_book.risk_scope(book, tab_trades)  # one position set for SCENARIOS and RESEARCH
         with tabs[6]:
-            rates_scenarios.render(market, positions, scope)
+            rates_scenarios.render(market, positions, scope, reporting)
         with tabs[7]:
-            rates_research.render(market, positions, scope)
+            rates_research.render(market, positions, scope, reporting)
 elif mode == "ANALYTICS":
     analytics_lab.render()
 

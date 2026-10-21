@@ -8,6 +8,12 @@ says which history and dates its numbers come from. Statistics use daily
 data only: each view starts where the chosen history's most recent daily
 stretch begins (the bundled history is daily for US Treasuries from 2015,
 for the ECB AAA and BoE OIS curves only from 2026-08-19, month ends before).
+
+Currencies: factor risk and VaR are per position in its own currency (US
+Treasuries in USD, the rest in the swap curve's), totalled per currency
+and, when the positions hold a currency other than the sidebar's REPORTING
+CURRENCY, for the whole book converted at the stated FX spots (``ALL IN
+<R>``). FX spots are held: the VaR has no FX risk (no FX history).
 """
 
 from __future__ import annotations
@@ -27,10 +33,11 @@ from derivx.rates import pca as pca_mod
 from derivx.rates.conventions import parse_tenor
 from derivx.rates.curves import Market
 from derivx.risk import var as var_mod
+from derivx.risk.reporting import Reporting, add_total_rows
 from derivx.risk.scenarios import factor_risk as position_factor_risk
 from derivx.risk.scenarios import vegas as position_vegas
 from derivx.risk.sensitivities import Position
-from derivx.ui import rates_data, rates_exports, rates_risk, rates_scenarios
+from derivx.ui import rates_data, rates_exports, rates_fx, rates_risk, rates_scenarios
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -739,11 +746,17 @@ def _heatmap(rolling: pca_mod.RollingPCA, factor: str) -> go.Figure:
 
 
 def _factor_risk(
-    positions: Sequence[Position], market: Market, result: pca_mod.PCAResult, store: rh.HistoryStore
+    positions: Sequence[Position],
+    market: Market,
+    result: pca_mod.PCAResult,
+    store: rh.HistoryStore,
+    rep: Optional[Reporting] = None,
 ) -> Optional[pd.DataFrame]:
     """P&L per +1 sd daily move of each factor, every curve's rate quotes
     moving along the loadings (the book's key-rate PV01s x loadings; basis
-    spread quotes held, as in the PCA factor shock and the VaR)."""
+    spread quotes held, as in the PCA factor shock and the VaR), per
+    position in its currency (CCY), totalled per currency and, with ``rep``,
+    for the whole book converted (``ALL IN <R>``)."""
 
     if not positions:
         return None
@@ -751,13 +764,16 @@ def _factor_risk(
     k = min(3, len(result.tenors))
     per_sd = position_factor_risk(market, risk, result, k) * result.sigma_bp[:k, None]
     names = _unique([p.name for p in positions])
-    frame = pd.DataFrame(per_sd.T, columns=[f"{pca_mod.factor_name(j)} +1 SD" for j in range(k)])
+    columns = [f"{pca_mod.factor_name(j)} +1 SD" for j in range(k)]
+    frame = pd.DataFrame(per_sd.T, columns=columns)
+    frame.insert(0, "CCY", rates_fx.currencies(positions, market))
     frame.insert(0, "POSITION", names)
-    frame.loc[len(frame)] = ["TOTAL", *per_sd.sum(axis=1)]
-    return frame
+    return add_total_rows(frame, columns, "POSITION", "CCY", rep)
 
 
-def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Position]) -> None:
+def _render_pca(
+    store: rh.HistoryStore, market: Market, positions: Sequence[Position], rep: Optional[Reporting] = None
+) -> None:
     datasets = _datasets(store)
     if not datasets:
         st.info("The history store has no curve history.")
@@ -855,11 +871,16 @@ def _render_pca(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
             key="rs_pca_rolling_csv",
         )  # fmt: skip
     st.caption(f"RMS error = RMS over the dates of each tenor's daily change minus its {k}-factor reconstruction (bp).")
-    _render_factor_risk(positions, market, result, store, dataset)
+    _render_factor_risk(positions, market, result, store, dataset, rep)
 
 
 def _render_factor_risk(
-    positions: Sequence[Position], market: Market, result: pca_mod.PCAResult, store: rh.HistoryStore, dataset: str
+    positions: Sequence[Position],
+    market: Market,
+    result: pca_mod.PCAResult,
+    store: rh.HistoryStore,
+    dataset: str,
+    rep: Optional[Reporting] = None,
 ) -> None:
     st.markdown("#### / FACTOR RISK OF THE BOOK")
     if not positions:
@@ -867,26 +888,28 @@ def _render_factor_risk(
             "No positions: add trades to the BOOK (or pick the tab trades under RISK SCOPE) to see their factor risk."
         )
         return
+    rep = rep if rep is not None else rates_fx.reporting(market)
     try:
         frame = _cached(
             "factor_risk",
-            (rates_scenarios.book_risk(positions, market)[0], result.tenors, result.start, result.end, dataset),
-            lambda: _factor_risk(positions, market, result, store),
+            (rates_scenarios.book_risk(positions, market)[0], result.tenors, result.start, result.end, dataset, rep),
+            lambda: _factor_risk(positions, market, result, store, rep),
         )
     except ValueError as exc:
         st.error(f"Cannot compute factor risk: {exc}")
         return
-    c, mixed = rates_scenarios.book_currency(positions, market)
-    shown = frame.rename(columns={col: f"{col} ({c})" for col in frame.columns[1:]})
-    st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[1:]})
+    currencies = rates_fx.currencies(positions, market)
+    c = rates_fx.table_unit(frame["CCY"])
+    shown = frame.rename(columns={col: f"{col} ({c})" for col in frame.columns[2:]}) if c else frame
+    st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[2:]})
     _download("Download factor risk CSV", _csv(shown), file_name="pca_factor_risk.csv", key="rs_pca_risk_csv")
     sd = ", ".join(f"{pca_mod.factor_name(j)} {result.sigma_bp[j]:.2f}bp" for j in range(min(3, len(result.tenors))))
     st.caption(
         f"P&L for a +1 sd daily move of each factor ({sd} a day) on every curve of the book: key-rate PV01s (P&L per "
         "+1bp of each curve quote) times the loadings read at each quote's maturity (linear between the PCA tenors, "
         f"flat beyond); basis spread quotes held, as in the PCA factor shock on SCENARIOS. Every curve moves with this "
-        f"{rh.dataset_info(dataset).title} factor: for the swap curve that is a proxy (swap spreads held). Vols held."
-        + (" Totals add amounts in different currencies without FX conversion." if mixed else "")
+        f"{rh.dataset_info(dataset).title} factor: for the swap curve that is a proxy (swap spreads held). Vols held. "
+        "Amounts in each position's currency (CCY)." + rates_fx.conversion_note(currencies, rep, market.asof)
     )
 
 
@@ -931,7 +954,9 @@ def var_scenarios(market: Market, store: rh.HistoryStore, lookback: int) -> Tupl
     return _scenarios(market, store, lookback)
 
 
-def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Position]) -> None:
+def _render_var(
+    store: rh.HistoryStore, market: Market, positions: Sequence[Position], rep: Optional[Reporting] = None
+) -> None:
     if not positions:
         st.info(
             "No positions yet: add trades to the BOOK, or price a swap, swaption, cap/floor or bond on the other "
@@ -957,17 +982,22 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
             "valuation date for the full window."
         )
     names = _unique([p.name for p in positions])
-    c, mixed = rates_scenarios.book_currency(positions, market)
-    if mixed:
-        st.warning(f"The book mixes currencies ({c}): book totals add them without FX conversion.")
+    rep = rep if rep is not None else rates_fx.reporting(market)
+    currencies = rates_fx.currencies(positions, market)
+    headline, c = rates_fx.headline(currencies, rep)
+    if headline is None:
+        st.warning(
+            f"The positions are in {' and '.join(sorted(set(currencies)))} and there are no FX spots to convert "
+            "them: the VaR is per currency only (TOTAL rows below). Enter rates under REPORTING CURRENCY."
+        )
 
     def measures():
         pnl = var_mod.sensitivity_pnl(scen, risk)
         delta = var_mod.sensitivity_pnl(scen, risk, gamma=False)
-        return pnl, delta, var_mod.var_table(pnl, names, float(confidence), delta)
+        return pnl, delta, var_mod.var_table(pnl, names, float(confidence), delta, currencies, rep)
 
     try:
-        pnl, delta, table = _cached("var_measures", (key, scen_key, float(confidence)), measures)
+        pnl, delta, table = _cached("var_measures", (key, scen_key, float(confidence), rep), measures)
     except ValueError as exc:
         st.error(f"Cannot compute VaR: {exc}")
         return
@@ -992,44 +1022,52 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
                 full_store.pop(next(iter(full_store)))
             full_store[full_key] = result
     full = full_store.get(full_key)
-    total = table.iloc[-1]
+    rows = table.set_index("position")
+    total = rows.loc[headline] if headline is not None else None
     level = f"{100 * confidence:g}%"
     m = st.columns(3) + st.columns(3)  # three cards a row: four wrap next to the sidebar
-    m[0].metric(f"HIST VAR {level} ({c})", _num(total["var"], 0))
-    m[1].metric(f"HIST ES {level} ({c})", _num(total["es"], 0))
-    m[2].metric(f"DELTA-NORMAL VAR ({c})", _num(total["dn_var"], 0))
-    full_var, full_es = var_mod.var_es(full.sum(axis=1), float(confidence)) if full is not None else (None, None)
+    m[0].metric(f"HIST VAR {level} ({c})", "per currency" if total is None else _num(total["var"], 0))
+    m[1].metric(f"HIST ES {level} ({c})", "per currency" if total is None else _num(total["es"], 0))
+    m[2].metric(f"DELTA-NORMAL VAR ({c})", "per currency" if total is None else _num(total["dn_var"], 0))
+    columns = var_mod.book_columns(full, names, currencies, rep) if full is not None else None
+    full_var, full_es = (var_mod.var_es(columns[headline][0], float(confidence))
+                         if columns is not None and headline is not None else (None, None))  # fmt: skip
     m[3].metric(f"FULL-REVAL VAR ({c})", "not run" if full_var is None else _num(full_var, 0))
     m[4].metric(f"FULL-REVAL ES ({c})", "not run" if full_es is None else _num(full_es, 0))
     m[5].metric("SCENARIO DAYS", f"{scen.n:,}")
     shown_pnl, label = (full, "FULL REVALUATION") if full is not None else (pnl, "DELTA + GAMMA")
-    book = shown_pnl.sum(axis=1)
+    book_columns = var_mod.book_columns(shown_pnl, names, currencies, rep)
+    book_label = headline if headline is not None else next(k for k in book_columns if k.startswith("TOTAL"))
+    book, book_ccy = book_columns[book_label]
+    book_unit = c if headline is not None else rates_fx.symbol(book_ccy).strip()
     v, e = var_mod.var_es(book, float(confidence))
-    hist_key = (key, scen_key, float(confidence), label, c)
-    _chart("var_hist", hist_key, lambda: _histogram(book, v, e, c, label), "rs_var_hist")
+    hist_key = (key, scen_key, float(confidence), label, book_unit, rep)
+    _chart("var_hist", hist_key, lambda: _histogram(book, v, e, book_unit, label), "rs_var_hist")
+    unit = rates_fx.table_unit(table["currency"])
+    u = f" ({unit})" if unit else ""
     labels = {
-        "position": "POSITION", "var": f"HIST VAR ({c})", "es": f"HIST ES ({c})", "worst_loss": f"WORST LOSS ({c})",
-        "mean_pnl": f"MEAN P&L ({c})", "sd_pnl": f"SD P&L ({c})", "dn_sigma": f"DELTA-NORMAL SD ({c})",
-        "dn_var": f"DELTA-NORMAL VAR ({c})", "dn_es": f"DELTA-NORMAL ES ({c})",
+        "position": "POSITION", "currency": "CCY", "var": f"HIST VAR{u}", "es": f"HIST ES{u}",
+        "worst_loss": f"WORST LOSS{u}", "mean_pnl": f"MEAN P&L{u}", "sd_pnl": f"SD P&L{u}",
+        "dn_sigma": f"DELTA-NORMAL SD{u}", "dn_var": f"DELTA-NORMAL VAR{u}", "dn_es": f"DELTA-NORMAL ES{u}",
     }  # fmt: skip
     shown = table.rename(columns=labels)
     if full is not None:
-        full_table = var_mod.var_table(full, names, float(confidence))
-        shown[f"FULL-REVAL VAR ({c})"] = full_table["var"].to_numpy()
-        shown[f"FULL-REVAL ES ({c})"] = full_table["es"].to_numpy()
-    st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[1:]})
+        full_table = var_mod.var_table(full, names, float(confidence), None, currencies, rep)
+        shown[f"FULL-REVAL VAR{u}"] = full_table["var"].to_numpy()
+        shown[f"FULL-REVAL ES{u}"] = full_table["es"].to_numpy()
+    st.dataframe(shown, hide_index=True, width="stretch", column_config={col: MONEY for col in shown.columns[2:]})
     _download("Download VaR table CSV", _csv(shown), file_name="var_table.csv", key="rs_var_csv")
     try:
         vegas = _cached("vegas", key, lambda: position_vegas(positions, market))
     except ValueError:
         vegas = None
-    report = var_mod.risk_report(names, risk, table, vegas, [p.vol_model for p in positions])
+    report = var_mod.risk_report(names, risk, table, vegas, [p.vol_model for p in positions], currencies)
     _download(
         "Download risk report CSV (key-rate PV01, gamma, vega, VaR)", _csv(report), file_name="risk_report.csv",
         key="rs_var_report_csv",
     )  # fmt: skip
     worst = var_mod.worst_days(scen, book, 10)
-    names_by_column = {"pnl": f"BOOK P&L ({c})", "date": "DATE", "from": "FROM"}
+    names_by_column = {"pnl": f"BOOK P&L ({book_unit})", "date": "DATE", "from": "FROM"}
     for curve_key in scen.bumps:
         title = rates_risk.curve_title(market, curve_key)
         names_by_column[f"{curve_key} max move (bp)"] = f"{title}: LARGEST QUOTE MOVE (BP)"
@@ -1040,15 +1078,18 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
     worst_format = {col: (MONEY if col.startswith("BOOK P&L") else one_dp) for col in worst.columns if "(BP)" in col
                     or col.startswith("BOOK P&L")}  # fmt: skip
     st.dataframe(worst, hide_index=True, width="stretch", column_config=worst_format)
-    scenario_frame = pd.DataFrame(shown_pnl, columns=names)
+    mixed = len(set(currencies)) > 1 or (rep is not None and rep.needs_conversion(currencies))
+    scenario_frame = pd.DataFrame({(f"{n} ({ccy})" if mixed else n): values
+                                   for n, (values, ccy) in book_columns.items()})  # fmt: skip
     scenario_frame.insert(0, "from", list(scen.previous))
     scenario_frame.insert(0, "date", list(scen.dates))
-    scenario_frame[var_mod.TOTAL] = book
     _download("Download scenario P&L CSV", _csv(scenario_frame), file_name="var_scenario_pnl.csv", key="rs_var_pnl_csv")
     rates_exports.export_row(
         "value at risk", market, {"var_table": shown, "scenario_pnl": scenario_frame, "risk_report": report,
                                   "worst_days": worst, "history_sources": sources},
-        {"positions": [{"name": p.name, "kind": p.kind, "details": repr(p.details)} for p in positions],
+        {"positions": [{"name": p.name, "kind": p.kind, "currency": ccy, "details": repr(p.details)}
+                       for p, ccy in zip(positions, currencies)],
+         "reporting": rates_fx.record(rep, currencies),
          "lookback_days": int(lookback), "confidence": float(confidence), "full_revaluation": full is not None},
         {"scenarios": "historical daily quote moves of each curve's own history or a flagged proxy, applied to "
          "today's curves", "pnl": label, "vols": "held", "var": "ceil(n (1 - confidence))-th largest loss",
@@ -1063,7 +1104,9 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
         "move^2; FULL REVALUATION rebuilds the curves and reprices every position. VaR = the ceil(n x (1 - "
         "confidence))-th largest loss; ES = average loss beyond it (Acerbi-Tasche). Delta-normal: z x sd of the "
         "first-order P&L, mean taken as zero. Vols are held (no free vol history); no carry over the day. Losses "
-        "are positive numbers."
+        "are positive numbers, in each row's currency (CCY): a TOTAL row adds the P&L of one currency's positions "
+        "per scenario." + rates_fx.conversion_note(currencies, rep, market.asof) + " FX spots are held: no FX risk "
+        "(the store has no FX history)."
     )
 
 
@@ -1072,9 +1115,10 @@ def _render_var(store: rh.HistoryStore, market: Market, positions: Sequence[Posi
 # --------------------------------------------------------------------------
 
 
-def render(market: Market, positions: List[Position], scope: str = "") -> None:
+def render(market: Market, positions: List[Position], scope: str = "", reporting: Optional[Reporting] = None) -> None:
     """The RESEARCH tab: RV, carry and roll-down, PCA and VaR sub-tabs (PCA
-    factor risk and VaR on the positions in scope)."""
+    factor risk and VaR on the positions in scope, totalled per currency and
+    in the ``reporting`` currency; default: the sidebar's)."""
 
     st.markdown("### / RESEARCH")
     if scope:
@@ -1087,6 +1131,6 @@ def render(market: Market, positions: List[Position], scope: str = "") -> None:
     with tabs[1]:
         _render_carry(store, market)
     with tabs[2]:
-        _render_pca(store, market, positions)
+        _render_pca(store, market, positions, reporting)
     with tabs[3]:
-        _render_var(store, market, positions)
+        _render_var(store, market, positions, reporting)

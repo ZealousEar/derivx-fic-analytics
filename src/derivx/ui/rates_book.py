@@ -9,6 +9,13 @@ floors without one on caplet vols stripped from the CAP-FLOOR tab's cap
 quotes (ILLUSTRATIVE unless you entered your own). The book's positions are
 what SCENARIOS and RESEARCH run on by default (RISK SCOPE in the sidebar):
 one set of positions, the trades priced on the other tabs still available.
+
+Currencies: every trade's numbers are in its currency (US Treasuries in USD,
+the rest in the swap curve's). Totals, scenario P&L and VaR are per
+currency, plus the whole book in the sidebar's REPORTING CURRENCY at the
+stated FX spots when it holds another currency (``ALL IN <R>``); key-rate
+ladders, vega buckets and hedges stay per currency (a curve's ladder is in
+its currency, and each currency's curves are hedged on their own).
 """
 
 from __future__ import annotations
@@ -27,11 +34,13 @@ from derivx.rates.curves import GOVT_KEY, Market
 from derivx.rates.exports import book_cashflows, market_tables, risk_report
 from derivx.rates.indices import HullWhite
 from derivx.risk import var as var_mod
+from derivx.risk.reporting import Reporting
 from derivx.risk.sensitivities import Position
 from derivx.ui import (
     rates_capfloor,
     rates_data,
     rates_exports,
+    rates_fx,
     rates_research,
     rates_risk,
     rates_scenarios,
@@ -364,15 +373,15 @@ def _symbol(currency: str) -> str:
     return SYMBOLS.get(currency, currency + " ")
 
 
-def _summary(risk: pf.BookRisk) -> pd.DataFrame:
-    table = risk.summary()
+def _summary(risk: pf.BookRisk, rep: Optional[Reporting] = None) -> pd.DataFrame:
+    table = risk.summary(rep)
     cols = {"id": "ID", "type": "TYPE", "description": "DESCRIPTION", "currency": "CCY", "pv": "PV", "pv01": "PV01",
             "gamma": "GAMMA", "vega": "VEGA (NORMAL BP)", "vol_source": "VOL"}  # fmt: skip
     return table.rename(columns=cols)
 
 
-def _show_summary(risk: pf.BookRisk) -> pd.DataFrame:
-    for ccy in sorted(set(risk.currencies)):
+def _show_summary(risk: pf.BookRisk, rep: Optional[Reporting] = None) -> pd.DataFrame:
+    for ccy in rates_fx.ordered(risk.currencies):
         picks = [k for k, c in enumerate(risk.currencies) if c == ccy]
         c = _symbol(ccy)
         cells = [
@@ -382,12 +391,17 @@ def _show_summary(risk: pf.BookRisk) -> pd.DataFrame:
         ]
         for col, (label, value) in zip(st.columns(3), cells):
             col.metric(label, value)
-    if risk.mixed:
-        st.warning(
-            "The book holds trades in more than one currency (US Treasuries are in dollars): totals are per "
-            "currency, and the scenario, VaR and hedge totals below add them without FX conversion."
-        )
-    table = _summary(risk)
+    if rep is not None and rep.needs_conversion(risk.currencies):
+        rates = rep.rates(risk.currencies)
+        r = rep.symbol.strip()
+        cells = [
+            (f"BOOK PV (IN {r})", _num(float(np.sum(risk.pv * rates)))),
+            (f"BOOK PV01 (IN {r}/BP)", _num(float(np.sum(risk.pv01 * rates)))),
+            (f"BOOK VEGA (IN {r}/BP)", _num(float(np.sum(risk.vega * rates)))),
+        ]
+        for col, (label, value) in zip(st.columns(3), cells):
+            col.metric(label, value)
+    table = _summary(risk, rep)
     st.dataframe(table, hide_index=True, width="stretch",
                  column_config={k: MONEY for k in ("PV", "PV01", "GAMMA", "VEGA (NORMAL BP)")})  # fmt: skip
     st.caption(
@@ -396,7 +410,10 @@ def _show_summary(risk: pf.BookRisk) -> pd.DataFrame:
         "P&L per (1bp)^2 of that move; VEGA = P&L per +1bp of normal vol (Black-model trades: of the normal vol "
         "with the same price). VOL: cube = the SWAPTION tab's SABR cube at the trade's strike, stripped = caplet "
         "vols stripped from cap quotes, flat = the trade's own vol. TOTAL rows add the trades of one currency."
-    )
+        + rates_fx.conversion_note(risk.currencies, rep, risk.asof)
+        + (" The converted PV01 and vega are the book's P&L in that currency for +1bp on every curve (of normal vol), "
+           "FX held." if rep is not None and rep.needs_conversion(risk.currencies) else "")
+    )  # fmt: skip
     for trade, reason in risk.skipped:
         st.warning(f"{trade.id} ({trade.type}) not priced: {reason}")
     if risk.notes:
@@ -420,10 +437,12 @@ def _show_krd(risk: pf.BookRisk, market: Market) -> pd.DataFrame:
     st.caption(
         f"P&L for +1bp on one quote of the {rates_risk.curve_title(market, which)} at a time (central difference, "
         "the curve and the curves built on it rebuilt), stacked by trade; the diamonds are the book. The buckets "
-        f"sum to {unit}{_num(rate_sum, 2)}. Buckets under half a cent are rebuild noise and drawn as zero."
+        f"sum to {unit}{_num(rate_sum, 2)}. Buckets under half a cent are rebuild noise and drawn as zero. Each "
+        "curve's ladder is in its currency (the Treasury curve's in USD), never converted."
     )
     ladder = risk.ladder()
-    wide = ladder.pivot_table(index=["curve", "quote", "years"], columns="id", values="pv01", sort=False).reset_index()
+    wide = ladder.pivot_table(index=["curve", "currency", "quote", "years"], columns="id", values="pv01",
+                              sort=False).reset_index()  # fmt: skip
     wide["BOOK"] = wide[[t.id for t in risk.trades]].sum(axis=1) if risk.trades else 0.0
     st.download_button("DOWNLOAD KEY-RATE LADDER CSV (EVERY CURVE, BY TRADE)", wide.to_csv(index=False),
                        file_name="book_key_rates.csv", mime="text/csv", key="book_krd_csv",
@@ -452,11 +471,11 @@ def _show_vega(risk: pf.BookRisk, market: Market, vols: pf.VolSet) -> pd.DataFra
     return matrix.rename_axis("expiry").reset_index()
 
 
-def _show_scenarios(risk: pf.BookRisk, market: Market, store) -> pd.DataFrame:
+def _show_scenarios(risk: pf.BookRisk, market: Market, store, rep: Optional[Reporting] = None) -> pd.DataFrame:
     st.markdown("### / SCENARIO P&L OF THE BOOK")
     positions = list(risk.positions)
     try:
-        grid, failed, _ = rates_scenarios.library_grid(positions, market, store)
+        grid, failed, library = rates_scenarios.library_grid(positions, market, store, rep)
     except ValueError as exc:
         st.error(f"Cannot revalue the book under the scenario library: {exc}")
         return pd.DataFrame()
@@ -464,55 +483,67 @@ def _show_scenarios(risk: pf.BookRisk, market: Market, store) -> pd.DataFrame:
         st.warning("Not revalued: " + "; ".join(failed))
     if grid.empty:
         return pd.DataFrame()
-    ccy = "/".join(sorted(set(risk.currencies)))
-    unit = _symbol(ccy) if not risk.mixed else ccy + " "
+    headline, unit = rates_fx.headline(risk.currencies, rep)
+    column = headline if headline is not None else next(c for c in grid.columns if str(c).startswith("TOTAL"))
+    if headline is None:
+        unit = _symbol(column.split()[-1]).strip()
     source = (rates_data.badge_for("curve") or ("curves of the CURVE tab", market.asof))[0]
-    st.plotly_chart(_scenario_chart(grid[rates_scenarios.TOTAL], unit.strip(), (source, market.asof)),
+    st.plotly_chart(_scenario_chart(grid[column], unit, (source, market.asof)),
                     width="stretch", config=PLOTLY_2D_CONFIG, key="book_scenario_chart")  # fmt: skip
-    table = grid.rename_axis("SCENARIO").reset_index()
+    table = rates_scenarios.grid_table(grid, list(risk.currencies))
     with st.expander("SCENARIO P&L BY TRADE"):
         st.dataframe(table, hide_index=True, width="stretch", column_config={c: MONEY for c in table.columns[1:]})
     st.download_button("DOWNLOAD BOOK SCENARIO GRID CSV", table.to_csv(index=False), file_name="book_scenarios.csv",
                        mime="text/csv", key="book_scenario_csv", on_click="ignore")  # fmt: skip
     st.caption(
-        "Full revaluation of every trade (value after the shock minus value today, quotes shocked and curves "
-        "rebuilt). " + rates_scenarios.library_caption(store, market) + " Custom shocks, horizons and the P&L "
-        "explain by trade: SCENARIOS tab with RISK SCOPE = BOOK."
-    )
+        f"Full revaluation of every trade (value after the shock minus value today, quotes shocked and curves "
+        f"rebuilt); the chart shows {column} ({unit}), the table every trade in its own currency and a TOTAL per "
+        "currency." + rates_fx.conversion_note(risk.currencies, rep, market.asof)
+        + (" FX rows move one FX spot by +/-10% and nothing else: local P&L is zero, the converted total is the FX "
+           "translation of the book's value." if any(s.moves_fx for s in library) else "") + " "
+        + rates_scenarios.library_caption(store, market) + " Custom shocks, horizons and the P&L explain by trade: "
+        "SCENARIOS tab with RISK SCOPE = BOOK."
+    )  # fmt: skip
     return table
 
 
-def _show_var(risk: pf.BookRisk, market: Market, store) -> pd.DataFrame:
+def _show_var(risk: pf.BookRisk, market: Market, store, rep: Optional[Reporting] = None) -> pd.DataFrame:
     st.markdown("### / VALUE AT RISK OF THE BOOK (99%, 1 DAY)")
     try:
         _, scen = rates_research.var_scenarios(market, store, VAR_LOOKBACK)
         pnl = var_mod.sensitivity_pnl(scen, risk.risk)
         delta = var_mod.sensitivity_pnl(scen, risk.risk, gamma=False)
-        table = var_mod.var_table(pnl, risk.ids, VAR_CONFIDENCE, delta)
+        table = var_mod.var_table(pnl, risk.ids, VAR_CONFIDENCE, delta, list(risk.currencies), rep)
     except ValueError as exc:
         st.warning(f"No VaR on {market.asof}: {exc}")
         return pd.DataFrame()
-    total = table.iloc[-1]
-    unit = _symbol(risk.currencies[0]) if risk.currencies and not risk.mixed else ""
-    cells = [(f"HIST VAR 1D ({unit or 'mixed'})", _num(total["var"])),
-             (f"HIST ES 1D ({unit or 'mixed'})", _num(total["es"])),
-             (f"D-NORMAL VAR ({unit or 'mixed'})", _num(total["dn_var"]))]  # fmt: skip
-    for col, (label, value) in zip(st.columns(3), cells):
-        col.metric(label, value)
+    headline, unit = rates_fx.headline(risk.currencies, rep)
+    rows = table.set_index("position")
+    labels = [headline] if headline is not None else [k for k in rows.index if str(k).startswith("TOTAL")]
+    for label in labels:
+        total = rows.loc[label]
+        u = unit if headline is not None else _symbol(str(total["currency"])).strip()
+        cells = [(f"HIST VAR 1D ({u})", _num(total["var"])), (f"HIST ES 1D ({u})", _num(total["es"])),
+                 (f"D-NORMAL VAR ({u})", _num(total["dn_var"]))]  # fmt: skip
+        for col, (name, value) in zip(st.columns(3), cells):
+            col.metric(name, value)
     if scen.short:
         st.warning(f"The daily history before {market.asof} holds only {scen.n} daily changes, not {VAR_LOOKBACK}.")
-    shown = table.rename(columns={"position": "ID", "var": "HIST VAR", "es": "HIST ES", "worst_loss": "WORST LOSS",
-                                  "mean_pnl": "MEAN P&L", "sd_pnl": "SD P&L", "dn_sigma": "DELTA-NORMAL SD",
-                                  "dn_var": "DELTA-NORMAL VAR", "dn_es": "DELTA-NORMAL ES"})  # fmt: skip
+    shown = table.rename(columns={"position": "ID", "currency": "CCY", "var": "HIST VAR", "es": "HIST ES",
+                                  "worst_loss": "WORST LOSS", "mean_pnl": "MEAN P&L", "sd_pnl": "SD P&L",
+                                  "dn_sigma": "DELTA-NORMAL SD", "dn_var": "DELTA-NORMAL VAR",
+                                  "dn_es": "DELTA-NORMAL ES"})  # fmt: skip
     with st.expander("VAR BY TRADE"):
-        st.dataframe(shown, hide_index=True, width="stretch", column_config={c: MONEY for c in shown.columns[1:]})
+        st.dataframe(shown, hide_index=True, width="stretch", column_config={c: MONEY for c in shown.columns[2:]})
     st.caption(
         f"One-day 99% value at risk of the book from {scen.n} daily changes ({scen.previous[0]} to {scen.dates[-1]}) "
         "of each curve's own history or a flagged proxy, applied to today's quotes: P&L = key-rate PV01 x move + "
-        "1/2 diagonal gamma x move^2 (the book's ladders above). Losses are positive; the book's VaR is not the sum "
-        "of the trades'. Vols held. Lookback, confidence, full revaluation and the history used per curve: RESEARCH "
-        "> VAR with RISK SCOPE = BOOK."
-    )
+        "1/2 diagonal gamma x move^2 (the book's ladders above). Losses are positive, in each row's currency (CCY); "
+        "a book's VaR is not the sum of the trades'. Vols and FX spots held (no FX risk)."
+        + rates_fx.conversion_note(risk.currencies, rep, market.asof)
+        + " Lookback, confidence, full revaluation and the history used per curve: RESEARCH > VAR with RISK SCOPE = "
+        "BOOK."
+    )  # fmt: skip
     return shown
 
 
@@ -580,17 +611,18 @@ def _show_hedge(risk: pf.BookRisk, market: Market) -> Tuple[List[Position], pd.D
     except ValueError as exc:
         st.error(f"Cannot size hedges: {exc}")
         return [], pd.DataFrame(), pd.DataFrame()
-    unit = _symbol(risk.currencies[0]) if risk.currencies and not risk.mixed else ""
-    cells = [  # short labels and plain numbers: a card at 1280px holds about 20 characters
-        (f"RESIDUAL RISK ({unit}/BP)" if unit else "RESIDUAL (MIXED/BP)", _num(result.risk_after)),
-        (f"UNHEDGED RISK ({unit}/BP)" if unit else "UNHEDGED (MIXED/BP)", _num(result.risk_before)),
-        (f"BID/ASK COST ({unit or 'MIXED'})", _num(result.cost)),
-    ]
-    for col, (label, value) in zip(st.columns(3), cells):
-        col.metric(label, value)
-    table = result.table.rename(columns={"curve": "CURVE", "instrument": "HEDGE", "notional": "NOTIONAL",
-                                         "direction": "DIRECTION", "par": "PAR", "bid_ask_bp": "BID/ASK (BP)",
-                                         "cost": "COST", "pv01": "PV01"})  # fmt: skip
+    for ccy, part in result.by_currency.items():
+        unit = _symbol(ccy).strip()
+        cells = [  # short labels and plain numbers: a card at 1280px holds about 20 characters
+            (f"RESIDUAL RISK ({unit}/BP)", _num(part.risk_after)),
+            (f"UNHEDGED RISK ({unit}/BP)", _num(part.risk_before)),
+            (f"BID/ASK COST ({unit})", _num(part.cost)),
+        ]
+        for col, (label, value) in zip(st.columns(3), cells):
+            col.metric(label, value)
+    table = result.table.rename(columns={"curve": "CURVE", "currency": "CCY", "instrument": "HEDGE",
+                                         "notional": "NOTIONAL", "direction": "DIRECTION", "par": "PAR",
+                                         "bid_ask_bp": "BID/ASK (BP)", "cost": "COST", "pv01": "PV01"})  # fmt: skip
     table["CURVE"] = [rates_risk.curve_title(market, k) for k in table["CURVE"]]
     table["PAR"] = table["PAR"] * 100.0
     table = table.rename(columns={"PAR": "PAR (%)"})
@@ -598,19 +630,26 @@ def _show_hedge(risk: pf.BookRisk, market: Market) -> Tuple[List[Position], pd.D
                  column_config={"NOTIONAL": MONEY, "COST": MONEY, "PV01": MONEY,
                                 "PAR (%)": st.column_config.NumberColumn(format="%.4f")})  # fmt: skip
     rule = ""
-    if result.move_bp is not None:
+    penalised = [(c, r) for c, r in result.by_currency.items() if r.move_bp is not None]
+    if penalised:
+        losses = "; ".join(f"{c} {_symbol(c).strip()}{_num(r.worst_before)} unhedged, {_symbol(c).strip()}"
+                           f"{_num(r.worst_after)} hedged" for c, r in penalised)  # fmt: skip
         rule = (f" With the cost penalty the hedge minimises the worst first-order loss on a {result.move_bp:g}bp "
-                f"curve move ({_num(result.worst_before)} unhedged, {_num(result.worst_after)} hedged: the move size "
-                "x the root-sum-square ladder) plus the bid/ask crossed, so a hedge is only added where the risk it "
-                "takes out is worth its cost.")  # fmt: skip
+                f"curve move ({losses}: the move size x the root-sum-square ladder) plus the bid/ask crossed, so a "
+                "hedge is only added where the risk it takes out is worth its cost.")  # fmt: skip
+    removed = ", ".join(f"{100 * r.risk_removed:.2f}% in {c}" for c, r in result.by_currency.items())
+    per_ccy = (" Each currency's curves are hedged on their own, in that currency (no risk or cost is added across "
+               "currencies): " + ", ".join(f"{c} on {', '.join(rates_risk.curve_title(market, k) for k in r.curves)}"
+                                           for c, r in result.by_currency.items()) + "."
+               if len(result.by_currency) > 1 else "")  # fmt: skip
     st.caption(
         "Par instruments traded today, sized to flatten the book's stacked key-rate ladder (every quote of every "
         "curve): OIS swaps on the discount curve, swaps or tenor basis swaps on a projection curve, par Treasuries "
         "on the Treasury curve; NOTIONAL > 0 receives fixed, receives the spread leg or buys the bond. RESIDUAL RISK "
         "is the root sum of squares of the ladder left (currency per bp), UNHEDGED RISK the same for the book: "
-        f"{100 * result.risk_removed:.2f}% of the squared risk is removed. Buckets between hedge tenors cannot be "
-        "taken out exactly, and a mix of hedges whose ladders almost cancel (a 15Y bond between the 10Y and 20Y "
-        f"quotes, say) is not traded: it would take out next to no risk with huge offsetting notionals.{rule}"
+        f"{removed} of the squared risk is removed.{per_ccy} Buckets between hedge tenors cannot be taken out "
+        "exactly, and a mix of hedges whose ladders almost cancel (a 15Y bond between the 10Y and 20Y quotes, say) is "
+        f"not traded: it would take out next to no risk with huge offsetting notionals.{rule}"
     )
     rows = result.ladder.copy()
     rows["curve"] = [rates_risk.curve_title(market, k) for k in rows["curve"]]
@@ -637,11 +676,13 @@ def _show_hedge(risk: pf.BookRisk, market: Market) -> Tuple[List[Position], pd.D
 # --------------------------------------------------------------------------
 
 
-def render(market: Market) -> List[Position]:
+def render(market: Market, reporting: Optional[Reporting] = None) -> List[Position]:
     """Draw the BOOK tab; returns the book's positions (and the hedges, if
-    added)."""
+    added). Totals are per currency and, for a book holding another
+    currency, in ``reporting``'s (default: the sidebar's)."""
 
     st.markdown("### / BOOK")
+    rep = reporting if reporting is not None else rates_fx.reporting(market)
     conv = market.curve.conventions
     currency = conv.currency if conv is not None else "USD"
     edited, source = _blotter(currency)
@@ -669,24 +710,25 @@ def render(market: Market) -> List[Position]:
         rates_scenarios.seed_risk(positions, market, risk.risk)
     except ValueError:
         pass
-    summary = _show_summary(risk)
+    summary = _show_summary(risk, rep)
     ladder = _show_krd(risk, market)
     vega = _show_vega(risk, market, vols)
     store = rates_scenarios.history_store(market)
-    scenarios = _show_scenarios(risk, market, store)
-    var_table = _show_var(risk, market, store)
+    scenarios = _show_scenarios(risk, market, store, rep)
+    var_table = _show_var(risk, market, store, rep)
     hedges, hedge_table, hedge_ladder = _show_hedge(risk, market)
     st.markdown("### / EXPORT")
     tables = {"blotter": _text_table(edited), "book_summary": summary, "key_rates_by_trade": ladder,
               "vega_buckets": risk.vega_buckets, "vega_matrix": vega, "cashflows": book_cashflows(risk, market),
               "scenario_grid": scenarios, "var_table": var_table, "hedges": hedge_table, "hedge_ladder": hedge_ladder,
-              "risk_report": risk_report(risk), **market_tables(market), **calibration}  # fmt: skip
+              "risk_report": risk_report(risk, reporting=rep), **market_tables(market), **calibration}  # fmt: skip
     blotter_bytes = _text_table(edited).to_csv(index=False).encode("utf-8")
     rates_exports.export_row(
         "book", market, tables,
         {"blotter": {"source": source, "sha256": hashlib.sha256(blotter_bytes).hexdigest(),
                      "trades": [t.to_row() for t in risk.trades]},
          "skipped": [{"id": t.id, "reason": r} for t, r in risk.skipped],
+         "reporting": rates_fx.record(rep, risk.currencies),
          "hedge": {"added_to_positions": bool(hedges)}},
         {"risk": "central differences on full revaluation, +/-1bp per quote, curves rebuilt",
          "vols": dict(vols.sources),

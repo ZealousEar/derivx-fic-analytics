@@ -37,6 +37,14 @@ England's OIS curve for GBP, or the user's uploaded history), otherwise by a
 flagged proxy (government yield changes, i.e. swap spreads held). Each shock
 records the data behind every curve in ``Shock.sources``.
 
+FX spot shocks (``Shock.fx``, :func:`fx_spot`, :func:`fx_library`) move
+EURUSD and GBPUSD by a percentage. They move no curve or vol, so every
+position's P&L in its own currency is unchanged; they move the book's
+totals converted to a reporting currency
+(:func:`~derivx.risk.reporting.add_total_columns`, ``scenario_grid(...,
+reporting=...)``: the FX translation of each position's value after the
+scenario). Without an FX shock, FX spots are held.
+
 Multi-curve markets: a shock moves the discount curve (``curve``), the
 projection curves (``projections``, e.g. EURIBOR 3M/6M) and the Treasury
 curve (``govt``) independently, each projection rebuilt on the moved
@@ -70,6 +78,7 @@ from derivx.rates import pca as pca_mod
 from derivx.rates.conventions import Date, parse_tenor
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Curve, Market
 from derivx.rates.indices import CURRENCY_INDICES
+from derivx.risk.reporting import SHOCK_PAIRS, Reporting, add_total_columns, ordered, position_currencies
 from derivx.risk.sensitivities import Position
 
 NORMAL_VOL_UNIT = 1e-4  # 1bp of normal vol
@@ -131,6 +140,8 @@ class Shock:
     (rate levels, ``BASIS`` spreads). ``normal_vol_bp`` is added to normal vols (bp) and
     ``lognormal_vol_pts`` to lognormal vols (vol points). ``horizon_days``
     rolls the market forward (calendar days, adjusted to a business day).
+    ``fx`` is ``((pair, % move), ...)`` of FX spots (EURUSD, GBPUSD): it moves
+    only totals converted between currencies (see the module docstring).
     """
 
     name: str
@@ -148,6 +159,7 @@ class Shock:
     projections: Optional[bool] = None
     rates: bool = True
     spreads: bool = False
+    fx: Tuple[Tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profile", _clean_profile(self.profile))
@@ -169,6 +181,20 @@ class Shock:
         if not (math.isfinite(days) and days >= 0 and int(days) == days):
             raise ValueError("horizon_days must be a whole number of days >= 0")
         object.__setattr__(self, "horizon_days", int(days))
+        object.__setattr__(self, "fx", _clean_fx(self.fx))
+
+    @property
+    def moves_fx(self) -> bool:
+        """True if the shock moves an FX spot."""
+
+        return any(pct != 0.0 for _, pct in self.fx)
+
+    @property
+    def moves_local(self) -> bool:
+        """True if the shock can change a position's value in its own
+        currency (quotes, vols or the horizon move)."""
+
+        return bool(self.moves_rates or self.normal_vol_bp or self.lognormal_vol_pts or self.horizon_days)
 
     def profile_for(self, which: Optional[str] = None, currency: Optional[str] = None) -> Profile:
         """The profile for one curve: ``profiles["<which>:<currency>"]``,
@@ -265,6 +291,26 @@ class Shock:
         return curves and (self.rates or self.spreads) and any(b != 0.0 for b in moves)
 
 
+def _clean_fx(fx: object) -> Tuple[Tuple[str, float], ...]:
+    """``((pair, % move), ...)`` of :data:`~derivx.risk.reporting.SHOCK_PAIRS`
+    (a mapping works too), pairs upper case and distinct, moves above -100%."""
+
+    items = list(fx.items()) if isinstance(fx, Mapping) else list(fx)
+    out: Dict[str, float] = {}
+    for item in items:
+        pair, pct = item
+        code = str(pair).strip().upper().replace("/", "")
+        if code not in SHOCK_PAIRS:
+            raise ValueError(f"FX shock pair {pair!r}: use {' or '.join(SHOCK_PAIRS)} (moves against the dollar)")
+        if code in out:
+            raise ValueError(f"FX shock moves {code} twice")
+        value = float(pct)
+        if not (math.isfinite(value) and value > -100.0):
+            raise ValueError(f"the {code} move must be a finite % above -100%, got {pct!r}")
+        out[code] = value
+    return tuple((p, out[p]) for p in SHOCK_PAIRS if p in out)
+
+
 def _clean_profile(profile: Sequence[Tuple[float, float]]) -> Profile:
     points = tuple(sorted((float(y), float(b)) for y, b in profile))
     years = [y for y, _ in points]
@@ -349,6 +395,30 @@ def butterfly(
 
 def _years(tenor: Union[str, float]) -> float:
     return float(tenor) if isinstance(tenor, (int, float)) else parse_tenor(str(tenor)).years
+
+
+def fx_spot(moves: Mapping[str, float], **settings) -> Shock:
+    """FX spots move by ``moves`` (``{"EURUSD": 10}`` = the euro worth 10%
+    more dollars), curves and vols unchanged: only totals converted to a
+    reporting currency move."""
+
+    fx = _clean_fx(moves)
+    if not fx:
+        raise ValueError("give at least one FX move (EURUSD or GBPUSD, in %)")
+    text = ", ".join(f"{p} {m:+g}%" for p, m in fx)
+    return _shock(f"FX {text}", [], settings, description=f"FX spot {text}; curves and vols unchanged", curve=False,
+                  govt=False, projections=False, fx=fx)  # fmt: skip
+
+
+def fx_library(currencies: Sequence[str], reporting: str, pct: float = 10.0) -> List[Shock]:
+    """+/-``pct`` % moves of each FX spot that converts ``currencies`` to
+    ``reporting`` (EURUSD for euros or a euro reporting currency, GBPUSD for
+    pounds); none when every amount is in the reporting currency."""
+
+    if all(c == reporting for c in currencies):
+        return []
+    pairs = [f"{c}USD" for c in ordered(list(currencies) + [reporting]) if c != "USD"]
+    return [fx_spot({pair: sign * pct}) for pair in pairs for sign in (1.0, -1.0)]
 
 
 def ibor_ois_basis(bp: float, indices: Optional[Sequence[str]] = None, **settings) -> Shock:
@@ -915,8 +985,11 @@ def run_scenario(
     docstring): one row per position with ``position``, ``kind``,
     ``base_pv``, ``shocked_pv`` (value at the horizon), ``cash`` (paid in the
     window), ``pnl``, the explain columns ``delta``, ``gamma``,
-    ``cross_gamma``, ``vol``, ``carry``, ``residual`` and ``delta_by_curve``
-    ({curve key: delta from that curve's quote moves}, summing to ``delta``).
+    ``cross_gamma``, ``vol``, ``carry``, ``residual``, ``delta_by_curve``
+    ({curve key: delta from that curve's quote moves}, summing to ``delta``)
+    and ``currency`` (that of every amount of the row,
+    :func:`~derivx.risk.reporting.position_currency`). The FX moves of the
+    shock change no local amount (see the module docstring).
 
     ``risk`` ({curve field: :func:`quote_risk`}) reuses key-rate risk
     precomputed on the market the shock hits (``market`` itself, or
@@ -968,10 +1041,12 @@ def run_scenario(
     pnl = shocked_pv + cash - base
     residual = pnl - (carry + delta + gamma + cross + vol)
     columns = (base, shocked_pv, cash, pnl, delta, gamma, cross, vol, carry, residual)
+    currencies = position_currencies(positions, market)
     return [
         {
             "position": p.name,
             "kind": p.kind,
+            "currency": currencies[k],
             **dict(zip(ROW_COLUMNS[2:], (float(c[k]) for c in columns))),
             "delta_by_curve": {which: float(v[k]) for which, v in delta_by_curve.items()},
         }
@@ -988,18 +1063,36 @@ def _unique(names: Sequence[str]) -> List[str]:
     return out
 
 
-def scenario_grid(positions: Sequence[Position], market: Market, shocks: Sequence[Shock]) -> pd.DataFrame:
+def scenario_grid(
+    positions: Sequence[Position],
+    market: Market,
+    shocks: Sequence[Shock],
+    reporting: Optional[Reporting] = None,
+) -> pd.DataFrame:
     """Full-revaluation P&L (value at the horizon + cash - value today):
-    rows = shocks, columns = positions and ``TOTAL``."""
+    rows = shocks, columns = positions (each in its currency,
+    :func:`~derivx.risk.reporting.position_currency`), then a total per
+    currency (``TOTAL``, or ``TOTAL USD``, ``TOTAL EUR``... for a book in
+    several) and, with ``reporting`` when some position is in another
+    currency, ``ALL IN <R>``: the P&L converted at today's spots plus the FX
+    translation of FX shocks. A shock that moves no quote, vol or horizon
+    (an FX shock) leaves every local value unchanged, without revaluing."""
 
     positions = list(positions)
     base = _pvs(positions, market)
     columns = _unique([p.name for p in positions])
     rows = []
     for shock in shocks:
+        if not shock.moves_local:
+            rows.append(np.zeros(len(positions)))
+            continue
         pv, cash = _revalue(positions, market, shocked_market(market, shock))
         rows.append(pv + cash - base)
-    table = pd.DataFrame(rows, index=_unique([s.name for s in shocks]), columns=columns)
-    table[TOTAL] = table.sum(axis=1)
+    table = pd.DataFrame(rows, index=_unique([s.name for s in shocks]), columns=columns, dtype=float)
+    if not positions:
+        table[TOTAL] = 0.0
+    else:
+        table = add_total_columns(table, position_currencies(positions, market), reporting, base,
+                                  [s.fx for s in shocks])  # fmt: skip
     table.index.name = "scenario"
     return table

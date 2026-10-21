@@ -6,7 +6,15 @@ exists and say per curve which data they used.
 
 On a multi-curve market the shock moves the discount and projection curves
 separately (MOVE PROJECTION CURVES), the IBOR-OIS and tenor basis shocks
-move only the EURIBOR curves, and the explain splits delta by curve."""
+move only the EURIBOR curves, and the explain splits delta by curve.
+
+Currencies: each position's P&L is in its own currency (US Treasuries in
+USD, the rest in the swap curve's). Tables total each currency and, when
+the positions hold a currency other than the sidebar's REPORTING CURRENCY,
+the whole book converted into it (``ALL IN <R>``) at the stated FX spots.
+FX SHOCK moves EURUSD / GBPUSD: local P&L is unchanged and the converted
+total gains the FX translation (an FX column of the explain); the scenario
+grid adds +/-10% FX rows for such books."""
 
 from __future__ import annotations
 
@@ -24,16 +32,17 @@ import streamlit as st
 
 from derivx.data import rates_history as rh
 from derivx.rates.curves import Curve, Market
+from derivx.risk.reporting import Reporting, add_total_rows, explain_fx, ordered
 from derivx.risk.scenarios import (
     EPISODES,
     EXPLAIN_COLUMNS,
     LOGNORMAL_VOL_UNIT,
     NORMAL_VOL_UNIT,
-    TOTAL,
     QuoteRisk,
     Shock,
     butterfly,
     carry_market,
+    fx_library,
     historical,
     historical_episodes,
     historical_sources,
@@ -53,7 +62,7 @@ from derivx.risk.scenarios import (
     twist,
 )
 from derivx.risk.sensitivities import Position
-from derivx.ui import rates_data, rates_exports, rates_risk
+from derivx.ui import rates_data, rates_exports, rates_fx, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -73,6 +82,7 @@ KEY_TENORS = ("3M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y")
 BP_LIMIT = 500.0
 NORMAL_VOL_LIMIT = 200.0  # bp of normal vol
 LOGNORMAL_VOL_LIMIT = 50.0  # lognormal vol points
+FX_LIMIT = 50.0  # % move of an FX spot
 MAX_HORIZON_DAYS = 730
 CACHE_ENTRIES = 4
 CURVE_LABELS = {"curve": "SWAP CURVE", "govt": "TREASURY CURVE"}
@@ -83,37 +93,29 @@ EXPLAIN_LABELS = {
     "vol": "VOL",
     "carry": "CARRY",
     "residual": "RESIDUAL",
+    "fx": "FX",
 }
 MONEY = st.column_config.NumberColumn(format="%,.2f")
 
 
-def _table_labels(c: str = "$") -> Dict[str, str]:
-    """Explain table columns, amounts in currency ``c``."""
+def _table_labels(c: Optional[str] = "$", fx: bool = False) -> Dict[str, str]:
+    """Explain table columns, amounts in currency ``c`` (None: each row in
+    its CCY, headers without a currency); ``fx`` adds the FX column."""
 
-    return {
+    unit = f" ({c})" if c else ""
+    labels = {
         "position": "POSITION",
         "kind": "KIND",
-        "base_pv": f"BASE PV ({c})",
-        "shocked_pv": f"HORIZON PV ({c})",
-        "cash": f"CASH ({c})",
-        "pnl": f"TOTAL P&L ({c})",
-        **{k: f"{v} ({c})" for k, v in EXPLAIN_LABELS.items()},
+        "currency": "CCY",
+        "base_pv": f"BASE PV{unit}",
+        "shocked_pv": f"HORIZON PV{unit}",
+        "cash": f"CASH{unit}",
+        "pnl": f"TOTAL P&L{unit}",
+        **{k: f"{v}{unit}" for k, v in EXPLAIN_LABELS.items() if k != "fx"},
     }
-
-
-def _book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
-    """(currency label of the book's values, whether it mixes currencies):
-    Treasury bonds are in dollars, swaps and caps in the swap curve's
-    currency. Values are added without FX conversion."""
-
-    symbols = sorted({rates_risk.money(market, "govt" if p.kind == "bond" else "curve") for p in positions})
-    return (symbols[0], False) if len(symbols) == 1 else (" + ".join(symbols), True)
-
-
-def book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
-    """(currency label of the book's values, whether it mixes currencies)."""
-
-    return _book_currency(positions, market)
+    if fx:
+        labels["fx"] = f"FX{unit}"
+    return labels
 
 
 T = TypeVar("T")
@@ -367,7 +369,42 @@ def _sources_table(shock: Shock, market: Market) -> None:
     )
 
 
-def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
+def _fx_pairs(currencies: Sequence[str], rep: Optional[Reporting]) -> List[str]:
+    """FX spots whose shock moves the converted totals of positions in
+    ``currencies`` reported in ``rep``: each non-USD currency's xxxUSD."""
+
+    if rep is None or not rep.needs_conversion(currencies):
+        return []
+    return [f"{c}USD" for c in ordered(list(currencies) + [rep.currency]) if c != "USD"]
+
+
+def _fx_inputs(currencies: Sequence[str], rep: Optional[Reporting]) -> Tuple[Tuple[str, float], ...]:
+    """FX SHOCK inputs (% of each relevant spot); () when no total converts."""
+
+    pairs = _fx_pairs(currencies, rep)
+    if not pairs:
+        return ()
+    cols = st.columns(len(pairs) + 1)
+    moves = []
+    for col, pair in zip(cols, pairs):
+        pct = col.number_input(
+            f"FX SHOCK {pair} (%)", min_value=-FX_LIMIT, max_value=FX_LIMIT, value=0.0, step=1.0, format="%.2f",
+            key=f"scn_fx_{pair.lower()}",
+            help=f"Moves {pair} by this % ({pair[:3]} worth that much more in USD). Local-currency P&L does not move; "
+            f"the totals converted to {rep.currency} gain the FX translation.",
+        )  # fmt: skip
+        if pct:
+            moves.append((pair, float(pct)))
+    cols[-1].caption(
+        f"FX: today's {', '.join(pairs)} unless shocked here ({rep.fx.dated}). FX spots are not rolled over a horizon "
+        "(no FX carry or forwards)."
+    )
+    return tuple(moves)
+
+
+def _shock_inputs(
+    market: Market, store: rh.HistoryStore, currencies: Sequence[str] = (), rep: Optional[Reporting] = None
+) -> Optional[Shock]:
     """Read the shock builder; None (with the reason shown) if invalid."""
 
     c1, c2, c3 = st.columns(3)
@@ -420,18 +457,23 @@ def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
         help="Calendar days to roll the market forward; the shock hits at the horizon.",
     )
     curves = {} if basis else dict(curve=move_curve, govt=move_govt and has_govt, projections=move_proj)
+    fx = _fx_inputs(currencies, rep)
     shock = replace(
         shock,
         **curves,
         normal_vol_bp=float(normal),
         lognormal_vol_pts=float(lognormal),
         horizon_days=int(horizon),
+        fx=fx,
     )
-    st.caption(f"{shock.name}: {shock.description}.")
+    fx_text = ("; FX " + ", ".join(f"{p} {m:+g}%" for p, m in shock.fx)) if shock.fx else ""
+    st.caption(f"{shock.name}: {shock.description}{fx_text}.")
     if kind in ("Historical", "History window", "PCA factor"):
         _sources_table(shock, market)
-    if not (shock.moves_rates or normal or lognormal or horizon):
-        st.warning("This scenario moves nothing: pick a curve, a non-zero shock, a vol shock or a horizon.")
+    if not (shock.moves_local or shock.moves_fx):
+        st.warning(
+            "This scenario moves nothing: pick a curve, a non-zero shock, a vol shock, a horizon or an FX shock."
+        )
     return shock
 
 
@@ -511,13 +553,14 @@ def _curve_chart(
 
 
 def _waterfall(total: Dict[str, float], c: str = "$") -> go.Figure:
-    labels = [EXPLAIN_LABELS[c] for c in EXPLAIN_COLUMNS] + ["TOTAL P&L"]
-    values = [total[c] for c in EXPLAIN_COLUMNS] + [total["pnl"]]
+    parts = list(EXPLAIN_COLUMNS) + (["fx"] if total.get("fx") is not None else [])
+    labels = [EXPLAIN_LABELS[k] for k in parts] + ["TOTAL P&L"]
+    values = [float(total[k]) for k in parts] + [total["pnl"]]
     fig = go.Figure(
         go.Waterfall(
             x=labels,
             y=values,
-            measure=["relative"] * len(EXPLAIN_COLUMNS) + ["total"],
+            measure=["relative"] * len(parts) + ["total"],
             increasing=dict(marker=dict(color=SERIES[4])),
             decreasing=dict(marker=dict(color=ACCENT)),
             totals=dict(marker=dict(color=SERIES[2])),
@@ -534,21 +577,44 @@ def _waterfall(total: Dict[str, float], c: str = "$") -> go.Figure:
     )
 
 
-def _explain_table(rows: List[Dict[str, object]], c: str = "$") -> pd.DataFrame:
+AMOUNTS = ("base_pv", "shocked_pv", "cash", "pnl") + EXPLAIN_COLUMNS
+
+
+def explain_frame(rows: List[Dict[str, object]], rep: Optional[Reporting], shock: Shock) -> pd.DataFrame:
+    """The explain rows (each in its position's ``currency``) with a total
+    per currency and, when some position is in another currency than the
+    reporting one, ``ALL IN <R>``: every amount converted at today's spots,
+    plus an FX shock's translation (column ``fx``, also in its P&L and
+    horizon value; see :func:`~derivx.risk.reporting.explain_fx`)."""
+
     frame = pd.DataFrame(rows).drop(columns=["delta_by_curve"], errors="ignore")
-    total = {"position": TOTAL, "kind": "", **frame.drop(columns=["position", "kind"]).sum().to_dict()}
-    frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
-    labels = _table_labels(c)
+    currencies = [str(c) for c in frame["currency"]]
+    convert = rep is not None and rep.needs_conversion(currencies)
+    extra = None
+    if convert and shock.moves_fx:
+        frame["fx"] = np.nan  # an FX move changes no local amount: its translation is in the converted total only
+        extra = explain_fx(frame["shocked_pv"], frame["cash"], currencies, rep, shock.fx)
+    table = add_total_rows(frame, AMOUNTS, "position", "currency", rep if convert else None, extra)
+    table["kind"] = table["kind"].fillna("")
+    return table
+
+
+def _explain_table(frame: pd.DataFrame) -> pd.DataFrame:
+    labels = _table_labels(rates_fx.table_unit(frame["currency"]), "fx" in frame.columns)
     return frame[list(labels)].rename(columns=labels)
 
 
-def scenario_library(market: Market, store: rh.HistoryStore) -> Tuple[List[Shock], List[str]]:
+def scenario_library(
+    market: Market, store: rh.HistoryStore, currencies: Sequence[str] = (), rep: Optional[Reporting] = None
+) -> Tuple[List[Shock], List[str]]:
     """The scenario grid's shocks: :func:`standard_library` (parallel, 2s10s
     twists, 2s5s10s fly, historical episodes), the IBOR-OIS and tenor basis
-    shocks on a multi-curve market, and +/-2 sd one-day moves of PC1-PC3 of
-    the daily US Treasury changes up to the valuation date. Shocks leave the
-    Treasury curve alone when the market has none. Returns (shocks, notes
-    on any left out)."""
+    shocks on a multi-curve market, +/-2 sd one-day moves of PC1-PC3 of
+    the daily US Treasury changes up to the valuation date and, when
+    positions in ``currencies`` convert to the reporting currency of
+    ``rep``, +/-10% moves of each FX spot used (:func:`fx_library`). Shocks
+    leave the Treasury curve alone when the market has none. Returns
+    (shocks, notes on any left out)."""
 
     library = standard_library(store)
     notes: List[str] = []
@@ -560,6 +626,8 @@ def scenario_library(market: Market, store: rh.HistoryStore) -> Tuple[List[Shock
         notes.append(f"PCA shocks: {exc}")
     if not _has_quotes(market.govt):
         library = [replace(s, govt=False) for s in library]
+    if rep is not None:
+        library += fx_library(currencies, rep.currency)
     return library, notes
 
 
@@ -580,30 +648,46 @@ def seed_risk(positions: Sequence[Position], market: Market, risk: Mapping[str, 
 
 
 def library_grid(
-    positions: Sequence[Position], market: Market, store: rh.HistoryStore
+    positions: Sequence[Position], market: Market, store: rh.HistoryStore, rep: Optional[Reporting] = None
 ) -> Tuple[pd.DataFrame, List[str], List[Shock]]:
-    """(grid of :func:`scenario_library` shocks x positions with a TOTAL
-    column, reasons for shocks not revalued, the shocks), cached on the
-    market, the positions and the shocks (the BOOK and SCENARIOS tabs share
-    it)."""
+    """(grid of :func:`scenario_library` shocks x positions, with a total
+    column per currency and, when some position is in another currency
+    than ``rep``'s, ``ALL IN <R>``; reasons for shocks not revalued; the
+    shocks), cached on the market, the positions, the shocks and the
+    reporting currency and spots (the BOOK and SCENARIOS tabs share it)."""
 
-    library, notes = scenario_library(market, store)
-    key = ((_market_key(market), _positions_key(positions, market)), tuple(library))
-    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
+    currencies = rates_fx.currencies(positions, market)
+    library, notes = scenario_library(market, store, currencies, rep)
+    key = ((_market_key(market), _positions_key(positions, market)), tuple(library), rep)
+    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library, rep))
     return grid, notes + failed, library
 
 
-def _grid(positions: Sequence[Position], market: Market, shocks: Sequence[Shock]) -> Tuple[pd.DataFrame, List[str]]:
+def _grid(
+    positions: Sequence[Position], market: Market, shocks: Sequence[Shock], rep: Optional[Reporting] = None
+) -> Tuple[pd.DataFrame, List[str]]:
     """Scenario grid rows for the shocks that revalue, and the reasons the
     others do not (e.g. a Black cap pushed to negative rates)."""
 
     tables, failed = [], []
     for shock in shocks:
         try:
-            tables.append(scenario_grid(positions, market, [shock]))
+            tables.append(scenario_grid(positions, market, [shock], rep))
         except ValueError as exc:
             failed.append(f"{shock.name}: {exc}")
     return (pd.concat(tables) if tables else pd.DataFrame()), failed
+
+
+def grid_table(grid: pd.DataFrame, currencies: Sequence[str]) -> pd.DataFrame:
+    """A scenario grid for display: a SCENARIO column, and each position's
+    currency in its column name when the positions are in several (or the
+    converted total is shown)."""
+
+    table = grid.rename_axis("SCENARIO").reset_index()
+    names = list(grid.columns[: len(currencies)])
+    if len(set(currencies)) > 1 or len(grid.columns) > len(currencies) + 1:
+        table = table.rename(columns={n: f"{n} ({c})" for n, c in zip(names, currencies)})
+    return table
 
 
 # --------------------------------------------------------------------------
@@ -658,32 +742,43 @@ def _show_curves(market: Market, shock: Shock) -> None:
 
 
 def _show_explain(
-    rows: List[Dict[str, object]], market: Market, shock: Shock, positions: Sequence[Position] = ()
+    rows: List[Dict[str, object]],
+    market: Market,
+    shock: Shock,
+    positions: Sequence[Position] = (),
+    rep: Optional[Reporting] = None,
 ) -> pd.DataFrame:
-    c, mixed = _book_currency(positions, market) if positions else (rates_risk.money(market), False)
-    if mixed:
-        st.warning(
-            f"The book holds {market.curve.conventions.currency} swaps or caps and US Treasury bonds: totals add "
-            f"amounts in {c} without FX conversion. Read the P&L per position, or keep one currency in the book."
-        )
-    table = _explain_table(rows, c)
-    total = {k: float(sum(r[k] for r in rows)) for k in ("pnl", *EXPLAIN_COLUMNS)}
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(f"TOTAL P&L ({c})", _num(total["pnl"]))
-    m2.metric(f"EXPLAINED ({c})", _num(total["pnl"] - total["residual"]))
-    m3.metric(f"RESIDUAL ({c})", _num(total["residual"]))
-    share = abs(total["residual"]) / abs(total["pnl"]) * 100.0 if abs(total["pnl"]) > 1e-9 else None
-    m4.metric("RESIDUAL (% OF P&L)", "n/a" if share is None else f"{share:.3f}")
-    st.plotly_chart(_waterfall(total, c), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
+    frame = explain_frame(rows, rep, shock)
+    currencies = [str(r["currency"]) for r in rows]
+    label, unit = rates_fx.headline(currencies, rep)
+    table = _explain_table(frame)
+    if label is not None:
+        head = frame[frame["position"] == label].iloc[-1]
+        total = {k: float(head[k]) for k in ("pnl", *EXPLAIN_COLUMNS)}
+        if "fx" in frame.columns:
+            total["fx"] = float(head["fx"])
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"TOTAL P&L ({unit})", _num(total["pnl"]))
+        m2.metric(f"EXPLAINED ({unit})", _num(total["pnl"] - total["residual"]))
+        m3.metric(f"RESIDUAL ({unit})", _num(total["residual"]))
+        share = abs(total["residual"]) / abs(total["pnl"]) * 100.0 if abs(total["pnl"]) > 1e-9 else None
+        m4.metric("RESIDUAL (% OF P&L)", "n/a" if share is None else f"{share:.3f}")
+        st.plotly_chart(_waterfall(total, unit), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
+    else:
+        st.info("The positions are in " + " and ".join(ordered(currencies)) + ": the explain is totalled per currency "
+                "in the table below (no FX spots to convert them; enter rates under REPORTING CURRENCY).")  # fmt: skip
     horizon = horizon_date(market, shock.horizon_days)
     st.caption(
         f"Horizon {horizon} ({shock.horizon_days} days). P&L = value at the horizon + cash received - value today, "
-        "signed to you. Carry = value with today's quotes rebuilt at the horizon + cash - value today (fixings and "
-        "cash before the horizon follow today's curve). The shock then hits the rolled market and is explained by "
-        "its Greeks: delta = key-rate PV01 x quote move; gamma = 1/2 diagonal key-rate gamma x move^2; cross gamma "
-        "= the rest of the second-order term along the shock; vol = vega x vol shock."
-    )
-    money = {label: MONEY for label in list(_table_labels(c).values())[2:]}
+        "signed to you, in each position's currency (CCY). Carry = value with today's quotes rebuilt at the horizon + "
+        "cash - value today (fixings and cash before the horizon follow today's curve). The shock then hits the "
+        "rolled market and is explained by its Greeks: delta = key-rate PV01 x quote move; gamma = 1/2 diagonal "
+        "key-rate gamma x move^2; cross gamma = the rest of the second-order term along the shock; vol = vega x vol "
+        "shock." + rates_fx.conversion_note(currencies, rep, market.asof)
+        + (" FX = the FX shock's translation of each position's horizon value and cash (in the converted total "
+           "only: local amounts do not move with FX)." if "fx" in frame.columns else "")
+    )  # fmt: skip
+    money = {name: MONEY for name in table.columns[3:]}
     st.dataframe(table, hide_index=True, width="stretch", column_config=money)
     st.download_button("Download P&L explain CSV", _csv(table), file_name="scenario_explain.csv", key="scn_explain_csv")
     curves = sorted({k for r in rows for k in r.get("delta_by_curve", {})}, key=list(market.curve_keys).index)
@@ -695,7 +790,8 @@ def _show_explain(
         )  # fmt: skip
         st.dataframe(by_curve, hide_index=True, width="stretch",
                      column_config={c: MONEY for c in by_curve.columns[1:]})  # fmt: skip
-        st.caption("The delta column split by the curve whose quotes moved (key-rate PV01 x quote move, per curve).")
+        st.caption("The delta column split by the curve whose quotes moved (key-rate PV01 x quote move, per curve), "
+                   "in the curve's currency.")  # fmt: skip
     return table
 
 
@@ -714,25 +810,35 @@ def _episode_flags(store: rh.HistoryStore, market: Market) -> str:
 
 
 def _show_grid(
-    positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple, store: rh.HistoryStore
+    positions: Sequence[Position],
+    market: Market,
+    shock: Optional[Shock],
+    key: tuple,
+    store: rh.HistoryStore,
+    rep: Optional[Reporting] = None,
 ) -> pd.DataFrame:
     """Standard library grid, headed by the custom ``shock`` when given."""
 
     st.markdown("### / SCENARIO GRID")
-    grid, failed, library = library_grid(positions, market, store)
+    grid, failed, library = library_grid(positions, market, store, rep)
     if shock is not None:
-        custom, _ = _cached("custom", (key, tuple(library), shock), lambda: _grid(positions, market, [shock]))
+        custom, _ = _cached("custom", (key, tuple(library), shock, rep), lambda: _grid(positions, market, [shock], rep))
         grid = pd.concat([custom.rename(index=lambda name: f"CUSTOM: {name}"), grid])
     if failed:
         st.warning("Not revalued: " + "; ".join(failed))
     if grid.empty:
         return pd.DataFrame()
-    table = grid.rename_axis("SCENARIO").reset_index()
-    c, _ = _book_currency(positions, market)
+    currencies = rates_fx.currencies(positions, market)
+    table = grid_table(grid, currencies)
     st.dataframe(table, hide_index=True, width="stretch", column_config={c: MONEY for c in table.columns[1:]})
     st.download_button("Download scenario grid CSV", _csv(table), file_name="scenario_grid.csv", key="scn_grid_csv")
+    unit = rates_fx.table_unit(currencies)
     st.caption(
-        f"Full-revaluation P&L in {c} per position. " + library_caption(store, market)
+        ("Full-revaluation P&L per position, in " + (unit if unit else "each position's currency (in its column name)")
+         + "; TOTAL columns add the positions of one currency." + rates_fx.conversion_note(currencies, rep, market.asof)
+         + (" FX rows move one FX spot by +/-10% and nothing else: local P&L is zero, the converted total is the FX "
+            "translation of the book's value." if any(s.moves_fx for s in library) else "") + " ")
+        + library_caption(store, market)
     )  # fmt: skip
     return table
 
@@ -752,10 +858,11 @@ def library_caption(store: rh.HistoryStore, market: Market) -> str:
     )  # fmt: skip
 
 
-def render(market: Market, positions: List[Position], scope: str = "") -> None:
+def render(market: Market, positions: List[Position], scope: str = "", reporting: Optional[Reporting] = None) -> None:
     """Scenario tab: shock builder, P&L explain and scenario grid on the
     positions in scope (``scope`` names them: the book, the tab trades or
-    both)."""
+    both), totals per currency and in the ``reporting`` currency (default:
+    the sidebar's, :func:`derivx.ui.rates_fx.reporting`)."""
 
     st.markdown("### / SCENARIOS")
     if scope:
@@ -763,9 +870,10 @@ def render(market: Market, positions: List[Position], scope: str = "") -> None:
     if not market.curve.quotes:
         st.error("Scenarios shock curve quotes: the swap curve must be bootstrapped from quotes.")
         return
+    rep = reporting if reporting is not None else rates_fx.reporting(market)
     _history_upload(market)
     store = _history_store(market)
-    shock = _shock_inputs(market, store)
+    shock = _shock_inputs(market, store, rates_fx.currencies(positions, market), rep)
     if shock is None:
         return
     try:
@@ -798,17 +906,20 @@ def render(market: Market, positions: List[Position], scope: str = "") -> None:
     except ValueError as exc:
         st.error(f"Cannot revalue the portfolio under this scenario: {exc}")
         rows = None
-    explain = _show_explain(rows, market, shock, positions) if rows is not None else pd.DataFrame()
-    grid = _show_grid(positions, market, shock if rows is not None else None, key, store)
+    explain = _show_explain(rows, market, shock, positions, rep) if rows is not None else pd.DataFrame()
+    grid = _show_grid(positions, market, shock if rows is not None else None, key, store, rep)
+    currencies = rates_fx.currencies(positions, market)
     rates_exports.export_row(
         "scenarios", market, {"pnl_explain": explain, "scenario_grid": grid},
-        {"positions": [{"name": p.name, "kind": p.kind, "details": repr(p.details)} for p in positions],
-         "scope": scope, "shock": {"name": shock.name, "description": shock.description,
-                                   "profile": shock.profile, "profiles": shock.profiles,
-                                   "curve": shock.curve, "govt": shock.govt, "projections": shock.projections,
-                                   "normal_vol_bp": shock.normal_vol_bp, "lognormal_vol_pts": shock.lognormal_vol_pts,
-                                   "horizon_days": shock.horizon_days,
-                                   "sources": [vars(src) for src in shock.sources]}},
+        {"positions": [{"name": p.name, "kind": p.kind, "currency": c, "details": repr(p.details)}
+                       for p, c in zip(positions, currencies)],
+         "scope": scope, "reporting": rates_fx.record(rep, currencies),
+         "shock": {"name": shock.name, "description": shock.description,
+                   "profile": shock.profile, "profiles": shock.profiles,
+                   "curve": shock.curve, "govt": shock.govt, "projections": shock.projections,
+                   "normal_vol_bp": shock.normal_vol_bp, "lognormal_vol_pts": shock.lognormal_vol_pts,
+                   "horizon_days": shock.horizon_days, "fx_pct": dict(shock.fx),
+                   "sources": [vars(src) for src in shock.sources]}},
         {"revaluation": "quotes shocked, curves rebuilt, positions revalued", "explain": "key-rate PV01 and gamma "
          "(+/-1bp central differences), cross gamma along the shock, vega x vol shock, carry"},
         key="scn_export", store=store,

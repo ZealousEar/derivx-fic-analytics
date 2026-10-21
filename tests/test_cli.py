@@ -217,7 +217,7 @@ def test_risk_hedge_and_exit_codes(book, tmp_path, capsys):
                      "2Y,5Y,10Y,30Y", "--bid-ask", "0.25", "--move", "5", "--hedge-out", str(hedge)])  # fmt: skip
     text = capsys.readouterr().out
     assert code == 0 and "hedge: residual risk" in text and "Receive fixed" in text
-    assert set(pd.read_csv(hedge).columns) == {"curve", "quote", "years", "book", "hedge", "residual"}
+    assert set(pd.read_csv(hedge).columns) == {"curve", "currency", "quote", "years", "book", "hedge", "residual"}
     # Without vols the options are skipped with the reason and a hint, and the exit code says so.
     assert cli.main(["risk", "--trades", str(book), "--asof", "2026-10-19"]) == cli.EXIT_TRADES
     err = capsys.readouterr().err
@@ -243,9 +243,12 @@ def test_scenario_grid_explain_and_manifest(book, tmp_path, capsys):
     assert len(table) == 4 and len(trades) == 10
     assert table["TOTAL"].to_numpy() == pytest.approx(table[trades].sum(axis=1).to_numpy(), rel=1e-12)
     rows = pd.read_csv(explain)
-    assert {"scenario", "position", "pnl", "delta", "gamma", "residual", "delta_curve"} <= set(rows.columns)
+    assert {"scenario", "position", "currency", "pnl", "delta", "gamma", "residual", "delta_curve"} <= set(rows.columns)
     first = rows[rows["scenario"] == "Parallel +25bp"]
-    assert first["pnl"].sum() == pytest.approx(table["TOTAL"].iloc[0], rel=1e-9)
+    trades_only = first[first["position"] != "TOTAL"]
+    assert set(trades_only["currency"]) == {"USD"} and len(trades_only) == 10
+    assert trades_only["pnl"].sum() == pytest.approx(table["TOTAL"].iloc[0], rel=1e-9)
+    assert first[first["position"] == "TOTAL"]["pnl"].iloc[0] == pytest.approx(table["TOTAL"].iloc[0], rel=1e-9)
     payload = __import__("json").loads(manifest.read_text())
     assert payload["inputs"]["shocks"][0] == "parallel:+25"
     replay = next(s for s in payload["data"]["scenario_sources"] if s["shock"] == "2022 hiking cycle")
@@ -362,4 +365,7 @@ def test_trades_in_another_currency_say_how_to_build_their_market(book, tmp_path
     assert cli.main(["scenario", "--trades", str(book), "--curve", str(curve), "--shock", "parallel:10"]) == 3
     err = capsys.readouterr().err
     assert "skipped: US1 (swap): a USD swap: the market is EUR ESTR" in err
-    assert "(here: --asof with --conventions 'USD SOFR', or a curve set built with them)" in err
+    assert (
+        "(here: --asof with --conventions 'USD SOFR', or --conventions all to price every currency on its own "
+        "market, or a curve set built with them)" in err
+    )
