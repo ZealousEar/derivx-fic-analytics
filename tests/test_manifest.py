@@ -53,12 +53,13 @@ def test_results_zip_is_deterministic_and_holds_manifest_and_csvs():
 
 
 def test_outside_a_checkout_the_commit_comes_from_the_image_environment(monkeypatch):
+    from derivx import provenance
     from derivx.validation import manifest
 
     def no_git(*args, **kwargs):
         raise FileNotFoundError("git")  # the Docker image has neither git nor .git
 
-    monkeypatch.setattr(manifest.subprocess, "run", no_git)
+    monkeypatch.setattr(provenance.subprocess, "run", no_git)
     try:
         for value, expected in [
             ("0A1751437A7BC779B670DD3ACCBFBFE0A0AEEB2C", "0a1751437a7bc779b670dd3accbfbfe0a0aeeb2c"),
@@ -73,3 +74,29 @@ def test_outside_a_checkout_the_commit_comes_from_the_image_environment(monkeypa
         assert manifest.git_revision() == {"sha": "unknown", "dirty": None}
     finally:
         manifest.git_revision.cache_clear()
+
+
+def test_rates_and_lab_manifests_record_the_same_commit_outside_a_checkout(monkeypatch):
+    """The Rates tabs and the CLI write their own manifests (derivx.rates.manifest). They used to keep a copy of
+    git_revision without the DERIVX_GIT_SHA fallback, so in the Docker image a Rates export recorded the commit
+    as 'unknown' while a lab export from the same image recorded it."""
+
+    from derivx import provenance
+    from derivx.rates import manifest as rates_manifest
+    from derivx.validation import manifest as lab_manifest
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    sha = "0a1751437a7bc779b670dd3accbfbfe0a0aeeb2c"
+    monkeypatch.setattr(provenance.subprocess, "run", no_git)
+    monkeypatch.setenv(provenance.GIT_SHA_ENV, sha)
+    provenance.git_revision.cache_clear()
+    try:
+        rates = rates_manifest.run_manifest("risk", inputs={"trades": 1}).to_dict()
+        lab = build_manifest("calibration", inputs={}, data={}, model={})
+        assert rates["code"] == {"sha": sha, "dirty": None}
+        assert lab["code"]["sha"] == sha and lab["code"]["dirty"] is None
+        assert rates_manifest.git_revision is lab_manifest.git_revision is provenance.git_revision
+    finally:
+        provenance.git_revision.cache_clear()
