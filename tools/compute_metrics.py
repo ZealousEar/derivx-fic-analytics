@@ -13,7 +13,13 @@ Per snapshot (trade date):
    any fit: expired / too-short expiries, IV placeholders, zero bids,
    crossed and stale quotes and ITM options dropped (one OTM quote per
    strike), put-call-parity forwards, vols re-inverted from bid/ask mids
-   with discount rate ``--rate``.
+   discounted per ``--discount``: ``curve`` (default) - the US Treasury
+   curve of each trade date from the committed rates snapshot (the latest
+   published on or before it, bootstrapped); ``parity`` - the put-call
+   parity DF per expiry where it passes its gates (European options only),
+   else that curve; ``rate`` - the flat cc rate ``--rate``
+   (:mod:`derivx.vol.discounting`). A trade date without a Treasury curve
+   within a week uses ``--rate`` and the summary says so.
 2. Model comparison per expiry (``derivx.models.comparison.
    compare_models_by_expiry``): SVI (5 params), SABR with fixed beta
    (``--sabr-beta``, 3 params) and a natural cubic spline of IV in ln(K/F),
@@ -47,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from derivx.calibration.production import calibrate_chain
+from derivx.data import rates_history as rh
 from derivx.data.chain_schema import ChainDataset, ChainSchemaError, load_chain_file, merge_datasets
 from derivx.data.market_data import apply_liquidity_filters
 from derivx.data.samples import SAMPLE_CHAIN, load_sample_chain
@@ -60,6 +67,7 @@ from derivx.models.comparison import (
 )
 from derivx.validation.backtest import run_walk_forward
 from derivx.validation.manifest import build_manifest, jsonable, manifest_bytes
+from derivx.vol.discounting import Discounting, european_style, treasury_discounting
 
 LABEL = MODEL_LABELS
 
@@ -80,10 +88,23 @@ def load_inputs(chains: Sequence[Path], chain_dir: Optional[Path]) -> ChainDatas
     return merge_datasets(datasets, source=f"{len(paths)} file(s)")
 
 
+def discounting_for(ds: ChainDataset, mode: str = "curve", rate: float = 0.0) -> Discounting:
+    """The :class:`Discounting` of ``mode`` for the trade dates of ``ds``
+    (Treasury curves from the committed rates snapshot; no network)."""
+
+    if mode == "rate":
+        return Discounting.flat(rate)
+    try:
+        return treasury_discounting(rh.bundled_store(), ds.trade_dates, mode=mode, rate=rate)
+    except ValueError:  # no curve for any trade date: every slice uses the flat rate (and says so)
+        return Discounting("parity" if mode == "parity" else "rate", rate)
+
+
 def compute(
     ds: ChainDataset,
     *,
     rate: float = 0.0,
+    discount: Optional[Discounting] = None,
     min_volume: int = 10,
     min_mid: float = 0.10,
     max_spread: Optional[float] = 0.40,
@@ -94,8 +115,10 @@ def compute(
     calibration: bool = True,
     expiries: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    """All tables and the summary for ``ds`` (see the module docs)."""
+    """All tables and the summary for ``ds`` (see the module docs).
+    ``discount`` defaults to the Treasury curve of each trade date."""
 
+    discount = discount if discount is not None else discounting_for(ds, "curve", rate)
     scores, skipped, calib = [], [], []
     filtered: Dict[pd.Timestamp, pd.DataFrame] = {}
     for td, chain in sorted(ds.chains.items()):
@@ -104,12 +127,12 @@ def compute(
             f = f[pd.to_datetime(f["expiry"]).dt.strftime("%Y-%m-%d").isin(set(expiries))]
         filtered[td] = f
         s, k = compare_models_by_expiry(
-            f, MODELS, rate=rate, min_days=min_days, max_days=max_days, sabr_beta=sabr_beta, folds=folds
+            f, MODELS, discount=discount, min_days=min_days, max_days=max_days, sabr_beta=sabr_beta, folds=folds
         )
         scores.append(s)
         skipped.append(k)
         if calibration:
-            cal = calibrate_chain(f, rate=rate, min_days=min_days, cv_folds=0, enforce_arbitrage=True)
+            cal = calibrate_chain(f, discount=discount, min_days=min_days, cv_folds=0, enforce_arbitrage=True)
             table = cal.table()
             if max_days is not None and not table.empty:
                 table = table[(pd.to_datetime(table["expiry"]) - td).dt.days <= max_days]
@@ -139,7 +162,7 @@ def compute(
         "data": ds.provenance(),
         "filters": {"min_volume": min_volume, "min_mid": min_mid, "max_spread": max_spread},
         "settings": {
-            "rate_cc": rate,
+            "discounting": discount.describe(),
             "min_days": min_days,
             "max_days": max_days,
             "sabr_beta": sabr_beta,
@@ -162,7 +185,7 @@ def compute(
     }
     if calibration:
         summary["calibration"] = _calibration_summary(calib_df)
-    summary["walk_forward"] = _walk_forward(filtered, rate=rate, max_days=max_days)
+    summary["walk_forward"] = _walk_forward(filtered, discount=discount, max_days=max_days)
     return {"scores": scores_df, "skipped": skipped_df, "calibration": calib_df, "summary": summary}
 
 
@@ -182,7 +205,7 @@ def _calibration_summary(table: pd.DataFrame) -> Dict[str, object]:
 
 
 def _walk_forward(
-    filtered: Dict[pd.Timestamp, pd.DataFrame], rate: float, max_days: Optional[float]
+    filtered: Dict[pd.Timestamp, pd.DataFrame], discount: Discounting, max_days: Optional[float]
 ) -> Dict[str, object]:
     if len(filtered) < 2:
         return {
@@ -190,7 +213,9 @@ def _walk_forward(
             "reason": f"{len(filtered)} snapshot(s): a walk-forward test needs daily snapshots one trading day apart. "
             "Yahoo has no history; collect one snapshot per trading day with tools/download_spy_chains.py.",
         }
-    result = run_walk_forward(filtered, rate=rate, max_days=max_days if max_days is not None else 120.0)
+    result = run_walk_forward(
+        filtered, rate=discount.rate, discount=discount, max_days=max_days if max_days is not None else 120.0
+    )
     if result.empty:
         reasons = sorted(set(result.skipped["reason"].astype(str)))[:3]
         return {"status": "no scores", "reason": "; ".join(reasons)}
@@ -200,6 +225,16 @@ def _walk_forward(
         "summary": result.summary.drop(columns=["description"]).to_dict(orient="records"),
         "by_regime": result.by_regime.to_dict(orient="records"),
     }
+
+
+def _discount_text(desc: Dict[str, object]) -> str:
+    mode = desc.get("mode", "rate")
+    curves = desc.get("curves") or {}
+    labels = sorted({str(c.get("label")) for c in curves.values()})
+    if mode == "rate" or not curves:
+        return f"flat rate {float(desc.get('flat_rate_cc', 0.0)):.2%} cc (an input, not market data)"
+    head = "put-call parity per expiry where it passes its gates, else " if mode == "parity" else ""
+    return head + "; ".join(labels) + f" (trade date to expiry; {len(curves)} trade date(s))"
 
 
 def report_markdown(summary: Dict[str, object]) -> str:
@@ -212,7 +247,20 @@ def report_markdown(summary: Dict[str, object]) -> str:
         "",
         f"Data: {data['source']}; ticker {data['ticker']}; trade date(s) {', '.join(data['trade_dates'])}; "
         f"fetched {data['fetched_at_utc']}; {data['rows']:,} rows; sha256 {data['data_sha256']}.",
-        f"Filters: {summary['filters']}. Settings: {summary['settings']}.",
+        f"Filters: {summary['filters']}. Settings: "
+        f"{ {k: v for k, v in summary['settings'].items() if k != 'discounting'} }.",
+        f"Discounting: {_discount_text(summary['settings'].get('discounting') or {})}.",
+        *(
+            []
+            if european_style(data.get("ticker"))
+            else [
+                "",
+                f"{data.get('ticker') or 'These'} options are American-style; vols are re-inverted from mids with "
+                "European Black-76. At a real discount rate the early-exercise premium of the out-of-the-money puts "
+                "(largest at long expiries) reads as extra put vol below the forward, a kink the smiles cannot fit; "
+                "with r = 0 that premium mostly vanished, but every vol was biased low (30-50 vol bp at one year).",
+            ]
+        ),
         "",
         "## Model comparison (one row per expiry, out-of-sample k-fold CV RMSE, vol bp)",
         "",
@@ -309,7 +357,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--chain-dir", type=Path, default=None, help="directory of snapshot files")
     parser.add_argument("--outdir", type=Path, default=Path("data/metrics"), help="output directory")
-    parser.add_argument("--rate", type=float, default=0.0, help="discount rate, cc decimal (default 0)")
+    parser.add_argument(
+        "--discount",
+        choices=["curve", "parity", "rate"],
+        default="curve",
+        help="curve: US Treasury curve of each trade date (default); parity: put-call parity DF per expiry "
+        "(European options), else the curve; rate: the flat --rate",
+    )
+    parser.add_argument("--rate", type=float, default=0.0, help="flat / fallback discount rate, cc decimal")
     parser.add_argument("--min-volume", type=int, default=10)
     parser.add_argument("--min-mid", type=float, default=0.10)
     parser.add_argument("--max-spread", type=float, default=0.40)
@@ -334,6 +389,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = compute(
             ds,
             rate=args.rate,
+            discount=discounting_for(ds, args.discount, args.rate),
             min_volume=args.min_volume,
             min_mid=args.min_mid,
             max_spread=args.max_spread,

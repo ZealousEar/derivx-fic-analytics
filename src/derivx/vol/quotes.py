@@ -15,16 +15,20 @@ compounded per-annum decimals; forward log-moneyness ``k = ln(K / F)``.
 
 Implied vols: by default (``recompute_iv='auto'``) a slice with ``bid``,
 ``ask`` and ``option_type`` columns is re-inverted from its mids with
-Black-76 on the parity forward and ``df = exp(-rate tau)``; the quoted
+Black-76 on the parity forward and the slice's discount factor; the quoted
 ``implied_vol`` is used only when there are no executable quotes. Yahoo's
 quoted vols come from the last trade with its own rate and dividend
 assumptions and disagree between the call and the put at the same strike
 (on a real SPY chain by 1 vol point at 1 month and 7-10 vol points beyond 6
 months), which a smile fit cannot absorb. Recomputed vol levels depend on
-the discount rate: pass the real ``rate`` (with ``rate=0`` the prices are
-read about ``rate * tau`` too low in relative terms, which on a real SPY
-chain put the vols 35-55 vol bp low at 1 year for a 4% rate, under 5 vol bp
-within 2 months).
+the discount factor (with ``rate=0`` the prices are read about ``rate *
+tau`` too low in relative terms, which on a real SPY chain put the vols
+35-55 vol bp low at 1 year for a 4% rate, under 5 vol bp within 2 months).
+The discount factor is, in order: ``discount_factor`` when given, else the
+choice of ``discount`` (:class:`derivx.vol.discounting.Discounting`: the
+trade date's Treasury curve, or put-call parity per expiry for European
+options), else ``exp(-rate tau)``; :class:`CleanSlice` records which
+(``discount_method``, ``discount_source``) and the effective cc ``rate``.
 
 :func:`clean_option_slice` drops, with a reason per row (see
 :data:`REASONS`): expired or same-day expiries, non-finite or non-positive
@@ -46,6 +50,7 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
+from derivx.vol.discounting import Discounting
 from derivx.vol.implied import implied_black_vol
 
 REASONS: Dict[str, str] = {
@@ -212,7 +217,12 @@ class CleanSlice:
     :data:`REASONS`). ``forward_method`` is 'parity', 'carry' or 'given'
     (:func:`derivx.calibration.production.calibrate_chain` relabels a
     forward it interpolated from other expiries 'interpolated');
-    ``iv_source`` is 'mid' (recomputed from bid/ask mids) or 'quoted'."""
+    ``iv_source`` is 'mid' (recomputed from bid/ask mids) or 'quoted'.
+    ``discount_factor`` discounts from the trade date to the expiry;
+    ``discount_method`` is 'rate', 'curve', 'parity' or 'given' (see
+    :mod:`derivx.vol.discounting`), ``discount_source`` labels it, ``rate``
+    is the effective cc rate ``-ln(DF) / tau`` and ``parity`` holds the
+    parity-regression details when it was run."""
 
     trade_date: pd.Timestamp
     expiry: pd.Timestamp
@@ -228,6 +238,9 @@ class CleanSlice:
     forward_method: str = "parity"
     iv_source: str = "quoted"
     rate: float = 0.0
+    discount_method: str = "rate"
+    discount_source: str = ""
+    parity: Dict[str, object] = field(default_factory=dict)
 
     @property
     def days(self) -> int:
@@ -249,6 +262,10 @@ class CleanSlice:
             "spot": self.spot,
             "forward": self.forward,
             "forward_source": self.forward_source,
+            "discount_factor": self.discount_factor,
+            "rate": self.rate,
+            "discount_method": self.discount_method,
+            "discount_source": self.discount_source,
             "iv_source": self.iv_source,
             "n_input": self.n_input,
             "n_kept": int(len(self.quotes)),
@@ -279,6 +296,9 @@ def clean_option_slice(
     recompute_iv: Union[bool, str] = "auto",
     forward: Optional[float] = None,
     forward_source: Optional[str] = None,
+    discount: Optional[Discounting] = None,
+    discount_factor: Optional[float] = None,
+    discount_source: Optional[str] = None,
 ) -> CleanSlice:
     """Clean one (trade_date, expiry) slice; see the module docs.
 
@@ -302,6 +322,12 @@ def clean_option_slice(
     ``forward`` (with an optional ``forward_source`` label) replaces the
     put-call-parity inference, e.g. when the caller interpolated it from
     the other expiries of the chain.
+
+    Discounting (trade date to expiry): ``discount_factor`` (with an
+    optional ``discount_source`` label) when given; else ``discount``'s
+    choice for this expiry (a curve DF, or the parity-regression DF and
+    forward where the regression passes its gates); else ``exp(-rate
+    tau)``. ``div_yield`` only shapes the carry-forward fallback.
 
     Raises ``ValueError`` when the slice mixes several trade dates,
     expiries or spots, or misses required columns."""
@@ -367,18 +393,42 @@ def clean_option_slice(
     ]
     reason = _first_reason(masks)
     good = reason == ""
-    disc = float(np.exp(-rate * max(tau, 0.0)))
+    parity: Dict[str, object] = {}
+    parity_forward: Optional[float] = None
+    if discount_factor is not None:
+        disc = float(discount_factor)
+        if not np.isfinite(disc) or disc <= 0:
+            raise ValueError(f"discount_factor must be > 0, got {discount_factor}")
+        disc_method, disc_source = "given", discount_source or "given by the caller"
+    elif discount is not None:
+        centre = spot
+        if good.any() and tau > 0:
+            df_ref = discount.reference(trade_date, expiry, tau)[0]
+            centre = infer_forward(df[good], spot, tau, -np.log(df_ref) / tau, div_yield)[0]
+        choice = discount.choose(df[good], trade_date, expiry, tau, spot, centre)
+        disc, disc_method, disc_source = choice.discount_factor, choice.method, choice.source
+        parity, parity_forward = dict(choice.parity), choice.forward
+    else:
+        disc = float(np.exp(-rate * max(tau, 0.0)))
+        disc_method, disc_source = "rate", f"flat rate {rate:.4%} cc"
+    if disc_method == "rate":  # a flat rate is reported as given (not round-tripped through the DF)
+        eff_rate = float(rate if discount is None else discount.rate)
+    else:
+        eff_rate = float(-np.log(disc) / tau) if tau > 0 else float(rate)
     notes = []
     if forward is not None:
         forward = float(forward)
         if not np.isfinite(forward) or forward <= 0:
             raise ValueError(f"forward must be > 0, got {forward}")
         source, method = forward_source or "given by the caller", "given"
+    elif parity_forward is not None:
+        forward, method = float(parity_forward), "parity"
+        source = f"put-call parity regression (forward and discount factor jointly, {parity.get('parity_pairs')} pairs)"
     elif good.any() and tau > 0:
-        forward, source, n_used = infer_forward(df[good], spot, tau, rate, div_yield)
+        forward, source, n_used = infer_forward(df[good], spot, tau, eff_rate, div_yield)
         method = "parity" if n_used else "carry"
     else:
-        forward, source = float(spot * np.exp((rate - div_yield) * max(tau, 0.0))), "carry (no valid quotes)"
+        forward, source = float(spot * np.exp((eff_rate - div_yield) * max(tau, 0.0))), "carry (no valid quotes)"
         method = "carry"
     iv_bid = iv_ask = None
     iv_source = "quoted"
@@ -393,7 +443,10 @@ def clean_option_slice(
             )
             iv_ask = np.asarray(implied_black_vol(ask, forward, strike, tau, is_call, disc).vol)
         iv_source = "mid"
-        notes.append(f"implied vols recomputed from mids (Black-76 on the forward, rate {rate:.4%} cc)")
+        notes.append(
+            f"implied vols recomputed from mids (Black-76 on the forward, DF {disc:.6f} = {eff_rate:.4%} cc: "
+            f"{disc_source})"
+        )
     iv_masks = [
         ("iv_missing", ~np.isfinite(iv)),
         ("iv_placeholder", np.isfinite(iv) & ((iv <= iv_min) | (iv > iv_max))),
@@ -456,7 +509,10 @@ def clean_option_slice(
         notes=notes,
         forward_method=method,
         iv_source=iv_source,
-        rate=float(rate),
+        rate=eff_rate,
+        discount_method=disc_method,
+        discount_source=disc_source,
+        parity=parity,
     )
 
 
@@ -498,4 +554,7 @@ def apply_std_band(clean: CleanSlice, n_std: float = 3.0) -> CleanSlice:
         forward_method=clean.forward_method,
         iv_source=clean.iv_source,
         rate=clean.rate,
+        discount_method=clean.discount_method,
+        discount_source=clean.discount_source,
+        parity=dict(clean.parity),
     )

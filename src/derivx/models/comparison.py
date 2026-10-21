@@ -15,7 +15,9 @@ Models (:data:`MODELS`):
 Every model is scored on the same quotes: the slice is cleaned with
 :func:`derivx.vol.quotes.clean_option_slice` (expired/same-day expiries
 rejected, OTM quotes only, one quote per strike, put-call-parity forward,
-vols recomputed from bid/ask mids when the slice has them)
+vols recomputed from bid/ask mids when the slice has them, discounted with
+``discount`` - the trade date's Treasury curve or put-call parity, see
+:mod:`derivx.vol.discounting` - or the flat ``rate``)
 and restricted to ``|k| <= std_band * atm_vol * sqrt(tau)``. Scores are
 decimal vols (``*_bp`` columns: vol bp): ``rmse`` in sample and
 ``rmse_cv`` from k-fold cross-validation on interior strikes, which is the
@@ -32,6 +34,7 @@ import pandas as pd
 from scipy.interpolate import CubicSpline
 
 from derivx.calibration.production import CV_STARTS, kfold_errors, spline_predict
+from derivx.vol.discounting import Discounting
 from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice, day_count
 from derivx.vol.sabr import calibrate_sabr_smile, hagan_sabr_iv
 from derivx.vol.svi import fit_svi_strike_slice
@@ -103,6 +106,7 @@ def prepare_slice(
     std_band: Optional[float] = 3.0,
     min_points: int = 8,
     hygiene: Optional[dict] = None,
+    discount: Optional[Discounting] = None,
 ) -> CleanSlice:
     """Clean one expiry slice for model comparison (see module docs);
     raises ``ValueError`` (with what was removed) if it is expired, closer
@@ -110,9 +114,10 @@ def prepare_slice(
 
     if chain is None or chain.empty:
         raise ValueError("chain must contain strike/implied_vol data")
-    clean = clean_option_slice(
-        chain, trade_date=trade_date, rate=rate, div_yield=div_yield, min_days=min_days, **(hygiene or {})
-    )
+    hyg = dict(hygiene or {})
+    if "discount_factor" not in hyg:
+        hyg["discount"] = discount
+    clean = clean_option_slice(chain, trade_date=trade_date, rate=rate, div_yield=div_yield, min_days=min_days, **hyg)
     if clean.days < min_days:
         raise ValueError(
             f"expiry {clean.expiry.date()} is {clean.days} day(s) after the trade date "
@@ -210,6 +215,9 @@ def fit_models(
         tau=T,
         forward=F,
         forward_source=clean.forward_source,
+        discount_factor=clean.discount_factor,
+        rate=clean.rate,
+        discount_source=clean.discount_source,
         removed=clean.counts,
     )
     return ModelComparison(table=table, clean=clean, fits=fits)
@@ -254,12 +262,14 @@ def compare_models_by_expiry(
     folds: int = 5,
     std_band: Optional[float] = 3.0,
     min_points: int = 8,
+    discount: Optional[Discounting] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """:func:`fit_models` on every (trade_date, expiry) slice of ``chain``
     with ``min_days <= days to expiry <= max_days``. Forwards come from
     :func:`derivx.calibration.production.clean_chain` (put-call parity, or
     interpolated from the other expiries' parity forwards when parity
-    fails), so they match the calibration tab. Returns ``(scores,
+    fails), and so do the discount factors (``discount``, else the flat
+    ``rate``), so they match the calibration tab. Returns ``(scores,
     skipped)``: one row per (slice, model) with the table columns of
     :func:`fit_models` plus ``trade_date``, ``expiry``, ``days``, ``tau``,
     ``forward``, ``forward_method``; and one row per skipped slice with the
@@ -268,7 +278,7 @@ def compare_models_by_expiry(
     from derivx.calibration.production import clean_chain
 
     models = _check_models(models)
-    cleaned, bad = clean_chain(chain, rate=rate, min_days=min_days)
+    cleaned, bad = clean_chain(chain, rate=rate, min_days=min_days, discount=discount)
     skipped = [{"trade_date": s.trade_date, "expiry": s.expiry, "reason": s.reason} for s in bad]
     frames = []
     for td, exp, group, clean in cleaned:
@@ -290,7 +300,12 @@ def compare_models_by_expiry(
                 min_days=min_days,
                 std_band=std_band,
                 min_points=min_points,
-                hygiene={"forward": clean.forward, "forward_source": clean.forward_source},
+                hygiene={
+                    "forward": clean.forward,
+                    "forward_source": clean.forward_source,
+                    "discount_factor": clean.discount_factor,
+                    "discount_source": clean.discount_source,
+                },
             )
         except ValueError as exc:
             skipped.append({**base, "reason": str(exc)})
@@ -303,11 +318,13 @@ def compare_models_by_expiry(
                 tau=clean.tau,
                 forward=clean.forward,
                 forward_method=clean.forward_method,
+                rate_pct=100.0 * clean.rate,
+                discount_method=clean.discount_method,
             )
         )
     scores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not scores.empty:
-        lead = ["trade_date", "expiry", "days", "tau", "forward", "forward_method"]
+        lead = ["trade_date", "expiry", "days", "tau", "forward", "forward_method", "rate_pct", "discount_method"]
         scores = scores[lead + [c for c in scores.columns if c not in lead]]
     return scores, pd.DataFrame(skipped, columns=["trade_date", "expiry", "reason"])
 
@@ -365,20 +382,30 @@ def pairwise_wins(scores: pd.DataFrame, a: str, b: str, metric: str = "rmse_cv_b
 MODEL_LABELS = {"svi": "SVI", "sabr": "SABR", "spline": "IV spline"}
 
 
-def describe_pairwise(a: str, b: str, res: Dict[str, object]) -> str:
+def describe_pairwise(
+    a: str,
+    b: str,
+    res: Dict[str, object],
+    labels: Optional[Dict[str, str]] = None,
+    items: str = "expiries",
+    unit: str = "vol bp",
+) -> str:
     """One sentence on :func:`pairwise_wins` ``res``, worded by its sign
-    (never 'A outperforms B' when A is worse)."""
+    (never 'A outperforms B' when A is worse). ``labels`` name the models
+    (default :data:`MODEL_LABELS`); ``items`` are what was scored (expiries,
+    dates, points) and ``unit`` the RMSE unit."""
 
-    la, lb = MODEL_LABELS.get(a, a), MODEL_LABELS.get(b, b)
+    names = MODEL_LABELS if labels is None else labels
+    la, lb = names.get(a, a), names.get(b, b)
     n = int(res.get("slices", 0))
     if not n:
-        return f"{la} vs {lb}: no expiry was scored by both."
+        return f"{la} vs {lb}: nothing was scored by both."
     wins_a, wins_b, d = int(res["a_better"]), int(res["b_better"]), float(res["median_diff"])
     if wins_a > wins_b:
-        lead = f"{la} has the lower out-of-sample RMSE on {wins_a} of {n} expiries"
+        lead = f"{la} has the lower out-of-sample RMSE on {wins_a} of {n} {items}"
     elif wins_b > wins_a:
-        lead = f"{lb} has the lower out-of-sample RMSE on {wins_b} of {n} expiries"
+        lead = f"{lb} has the lower out-of-sample RMSE on {wins_b} of {n} {items}"
     else:
-        lead = f"{la} and {lb} each have the lower out-of-sample RMSE on {wins_a} of {n} expiries"
+        lead = f"{la} and {lb} each have the lower out-of-sample RMSE on {wins_a} of {n} {items}"
     who = la if d < 0 else lb if d > 0 else "neither"
-    return f"{lead} (median {la} - {lb} = {d:+.1f} vol bp; {who} better at the median)."
+    return f"{lead} (median {la} - {lb} = {d:+.1f} {unit}; {who} better at the median)."

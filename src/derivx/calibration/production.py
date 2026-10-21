@@ -11,7 +11,10 @@ Pipeline per (trade_date, expiry) group:
    otherwise). When parity fails for an expiry, its forward is
    interpolated (ln F linear in T) from the parity forwards of the other
    expiries of the same trade date, and only without any parity forward
-   does it fall back to ``spot exp((rate - div_yield) T)``.
+   does it fall back to ``spot exp((rate - div_yield) T)``. Premiums are
+   discounted with ``discount`` (:class:`derivx.vol.discounting.Discounting`:
+   the trade date's Treasury curve, or put-call parity per expiry for
+   European options) when given, else at the flat ``rate``.
 2. Keep strikes within a standardised moneyness band ``|k| <= std_band *
    atm_vol * sqrt(tau)`` (same width in standard deviations at every
    maturity; ``k = ln(K/F)``), and optionally a forward-moneyness band
@@ -41,6 +44,7 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 
+from derivx.vol.discounting import Discounting
 from derivx.vol.quotes import CleanSlice, apply_std_band, clean_option_slice, interpolate_forward
 from derivx.vol.svi import SviFit, check_calendar, fit_svi_strike_slice, svi_iv
 
@@ -103,6 +107,8 @@ class ChainCalibration:
                     "tau": s.tau,
                     "forward": s.forward,
                     "forward_method": d.get("forward_method"),
+                    "rate_pct": 100.0 * float(d.get("rate", np.nan)),
+                    "discount_method": d.get("discount_method"),
                     "iv_source": d.get("iv_source"),
                     "points": s.n_points,
                     "rmse_bp": d.get("rmse_bp"),
@@ -174,6 +180,7 @@ def clean_chain(
     div_yield: float = 0.0,
     min_days: float = 1.0,
     hygiene: Optional[Dict[str, object]] = None,
+    discount: Optional[Discounting] = None,
 ) -> Tuple[List[Tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame, CleanSlice]], List[SkippedSlice]]:
     """Step 1 of the module pipeline for every (trade_date, expiry) group:
     :func:`clean_option_slice`, then, for a slice whose put-call parity
@@ -181,7 +188,9 @@ def clean_chain(
     forwards of the same trade date. Returns ``[(trade_date, expiry, rows,
     clean)]`` and the groups that could not be cleaned (with the reason).
     Expired and too-short slices are returned (``clean.days < min_days``)
-    for the caller to report."""
+    for the caller to report. ``discount`` (else the flat ``rate``) sets
+    each slice's discount factor; a slice whose forward is interpolated
+    keeps the discount factor of its first cleaning."""
 
     if chain is None or chain.empty:
         return [], []
@@ -192,7 +201,9 @@ def clean_chain(
     cleaned = []
     for (td, exp), group in _groups(chain, trade_date):
         try:
-            clean = clean_option_slice(group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, **hyg)
+            clean = clean_option_slice(
+                group, trade_date=td, rate=rate, div_yield=div_yield, min_days=min_days, discount=discount, **hyg
+            )
         except ValueError as exc:
             skipped.append(SkippedSlice(td, exp, str(exc), len(group)))
             continue
@@ -213,6 +224,8 @@ def clean_chain(
             f"interpolated from {len(known)} parity forward(s) of this trade date (ln F linear in T); "
             f"parity here: {clean.forward_source}"
         )
+        first = clean
+        given_df = {} if "discount_factor" in hyg else {"discount_factor": first.discount_factor}
         clean = clean_option_slice(
             group,
             trade_date=td,
@@ -221,9 +234,13 @@ def clean_chain(
             min_days=min_days,
             forward=fwd,
             forward_source=source,
+            **given_df,
             **hyg,
         )
         clean.forward_method = "interpolated"
+        if given_df:  # the discount factor of the first cleaning, with its own label
+            clean.discount_method, clean.discount_source = first.discount_method, first.discount_source
+            clean.parity = dict(first.parity)
         cleaned[i] = (td, exp, group, clean)
     return cleaned, skipped
 
@@ -245,14 +262,16 @@ def calibrate_chain(
     f_scale: float = 0.005,
     cv_folds: int = 5,
     hygiene: Optional[Dict[str, object]] = None,
+    discount: Optional[Discounting] = None,
 ) -> ChainCalibration:
     """Calibrate SVI to every (trade_date, expiry) slice of ``chain``.
 
-    ``rate`` / ``div_yield`` (continuously compounded) set the discount
-    factor used in put-call parity and for vols recomputed from mids (the
-    default whenever the chain has bid, ask and option_type; pass
-    ``hygiene={'recompute_iv': False}`` to fit the quoted vols), and the
-    carry-forward fallback. ``weights``: None (equal), 'vega', or 'spread'
+    ``discount`` (:class:`derivx.vol.discounting.Discounting`), else the
+    flat ``rate`` (continuously compounded), sets the discount factor used
+    in put-call parity and for vols recomputed from mids (the default
+    whenever the chain has bid, ask and option_type; pass
+    ``hygiene={'recompute_iv': False}`` to fit the quoted vols);
+    ``div_yield`` shapes the carry-forward fallback. ``weights``: None (equal), 'vega', or 'spread'
     (1 / bid-ask width in vol; needs vols recomputed from bid/ask).
     ``min_points`` must exceed the 5 SVI parameters. ``hygiene`` passes
     extra keyword arguments to :func:`clean_option_slice` (e.g.
@@ -273,7 +292,13 @@ def calibrate_chain(
         raise ValueError("Chain must contain 'expiry' column")
     slices: List[CalibratedSlice] = []
     cleaned, skipped = clean_chain(
-        chain, trade_date=trade_date, rate=rate, div_yield=div_yield, min_days=min_days, hygiene=hygiene
+        chain,
+        trade_date=trade_date,
+        rate=rate,
+        div_yield=div_yield,
+        min_days=min_days,
+        hygiene=hygiene,
+        discount=discount,
     )
     for td, exp, group, clean in cleaned:
         if clean.days < min_days:
@@ -319,6 +344,9 @@ def calibrate_chain(
             "forward_method": clean.forward_method,
             "iv_source": clean.iv_source,
             "rate": clean.rate,
+            "discount_factor": clean.discount_factor,
+            "discount_method": clean.discount_method,
+            "discount_source": clean.discount_source,
             "spot": clean.spot,
             "n_input": clean.n_input,
             "removed": clean.counts,
