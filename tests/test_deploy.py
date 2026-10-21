@@ -79,6 +79,9 @@ def test_committed_streamlit_config_keeps_protection_on_and_uses_known_options()
     assert keys and set(keys) <= known, f"unknown Streamlit options: {set(keys) - known}"
     assert cfg["server"]["enableXsrfProtection"] is True
     assert cfg["server"]["enableCORS"] is True
+    # the app paints itself black (ui/theme.py): a light base theme left a white header band and
+    # #31333F labels on black (UIE-08)
+    assert cfg["theme"]["base"] == "dark" and cfg["theme"]["backgroundColor"] == "#000000"
     for key in keys:
         assert not re.search(r"secret|password|token|apikey|api_key", key, re.IGNORECASE)
 

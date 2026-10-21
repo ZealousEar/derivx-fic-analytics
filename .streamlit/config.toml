@@ -17,3 +17,13 @@ enableCORS = true
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+# The app is drawn black on purpose (src/derivx/ui/theme.py). Without a dark
+# base theme Streamlit keeps its light theme underneath: a white 60px header
+# band and #31333F widget labels on black (UIE-08).
+base = "dark"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#1A1A1A"
+textColor = "#FFFFFF"
+primaryColor = "#FF4444"
