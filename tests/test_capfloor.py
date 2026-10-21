@@ -883,7 +883,7 @@ def test_tab_renders_and_returns_the_position():
     at = _app()
     positions = at.session_state["cap_test_positions"]
     assert len(positions) == 1 and positions[0].kind == "cap"
-    assert [m.label for m in at.metric][:2] == ["PV", "PREMIUM (BP RUNNING)"]
+    assert [m.label for m in at.metric][:2] == ["PV ($)", "PREMIUM (BP RUNNING)"]  # amounts name their currency
     assert not at.error
     pv = float(at.metric[0].value.replace(",", ""))
     assert pv == pytest.approx(positions[0].pv(example_market()), abs=0.01)
@@ -892,8 +892,8 @@ def test_tab_renders_and_returns_the_position():
     assert downloads == ["cap_caplets_csv", "cap_ladder_csv", "cap_export_zip", "cap_export_manifest"]
     assert not at.warning
     labels = [m.label for m in at.metric]
-    assert {"GAMMA (/BP²)", "THETA (1 BUS. DAY)", "VEGA (/1BP)", "PV01 (/BP)"} <= set(labels)
-    theta = float(next(m.value for m in at.metric if m.label == "THETA (1 BUS. DAY)").replace(",", ""))
+    assert {"GAMMA ($/BP²)", "THETA ($, 1 BUS. DAY)", "VEGA ($/1BP)", "PV01 ($/BP)"} <= set(labels)
+    theta = float(next(m.value for m in at.metric if m.label == "THETA ($, 1 BUS. DAY)").replace(",", ""))
     assert theta < 0  # a long cap loses time value
 
 
@@ -989,7 +989,7 @@ def test_stripped_vols_need_the_normal_model_and_show_quote_vegas():
     at.checkbox(key="cap_quote_vega").check().run()
     _assert_tab_contract(at)
     vegas = next(d.value for d in at.dataframe if "QUOTED CAP" in d.value.columns)
-    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    total = float(next(m.value for m in at.metric if m.label == "VEGA ($/1BP)").replace(",", ""))
     five = vegas.loc[vegas["QUOTED CAP"] == "5Y", "VEGA (PER +1BP FLAT VOL)"].iloc[0]
     assert five == pytest.approx(total, rel=0.01)  # the 5Y ATM cap is the 5Y quote: its vega sits on that quote
     _set(at, "cap_model", "Black (%)")
@@ -1041,7 +1041,7 @@ def test_a_forward_start_trade_strips_the_spot_start_cap_quotes(index):
     # The 2Y x 5Y cap's caplets fix by 7Y (its last one within days of the 7Y quote's): quotes from 12Y on
     # cannot move it, and +1bp on every quote moves every caplet vol by about 1bp.
     assert by_quote["7Y"] > 0.0 and by_quote["12Y":].abs().max() < 1e-6
-    total = float(next(m.value for m in at.metric if m.label == "VEGA (/1BP)").replace(",", ""))
+    total = float(next(m.value for m in at.metric if m.label == "VEGA ($/1BP)").replace(",", ""))
     assert by_quote.sum() == pytest.approx(total, rel=0.02)
 
 
@@ -1155,8 +1155,8 @@ def test_tab_prices_a_collar_as_long_cap_short_floor():
     pv = float(at.metric[0].value.replace(",", ""))
     assert pv == pytest.approx(cap - floor, abs=0.01)
     caplets = next(d.value for d in at.dataframe if "FLOOR STRIKE (%)" in d.value.columns)
-    np.testing.assert_allclose(caplets["PV"], caplets["CAP PV"] + caplets["FLOOR PV"], rtol=1e-12)
-    assert (caplets["FLOOR PV"] <= 0).all()
+    np.testing.assert_allclose(caplets["PV ($)"], caplets["CAP PV ($)"] + caplets["FLOOR PV ($)"], rtol=1e-12)
+    assert (caplets["FLOOR PV ($)"] <= 0).all()
     strip = json.loads(next(c for c in at.get("plotly_chart") if c.proto.id.endswith("cap_strip_chart")).proto.spec)
     assert {"CAP STRIKE", "FLOOR STRIKE", "FORWARD"} <= {t["name"] for t in strip["data"]}
     _set(at, "cap_floor_offset_bp", 75.0)  # floor above the cap: refused with the reason
