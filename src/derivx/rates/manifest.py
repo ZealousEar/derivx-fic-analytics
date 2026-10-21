@@ -4,7 +4,8 @@ A :class:`RunManifest` records what produced a result, so it can be
 reproduced and audited:
 
 * ``code``     - git commit of the checkout and whether it had uncommitted
-  changes (``sha`` is ``"unknown"`` outside a git checkout);
+  changes (:func:`derivx.provenance.git_revision`: outside a git checkout,
+  the ``DERIVX_GIT_SHA`` the Docker image records, else ``"unknown"``);
 * ``packages`` - Python and package versions;
 * ``inputs``   - what the user entered (trades, shocks, settings);
 * ``data``     - valuation date, each curve's quotes with their SHA-256 and
@@ -28,21 +29,18 @@ import datetime as dt
 import hashlib
 import io
 import json
-import math
 import platform
-import subprocess
 import zipfile
 from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib import metadata
-from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-import numpy as np
 import pandas as pd
 
 from derivx.data import rates_sources as rs
 from derivx.data.rates_history import ORIGIN_SNAPSHOT, HistoryStore, dataset_info, load_manifest
+from derivx.provenance import git_revision, jsonable
+from derivx.provenance import package_versions as _versions
 from derivx.rates.curves import Curve, Market
 
 MANIFEST_VERSION = 1
@@ -57,50 +55,8 @@ DATASET_URLS: Dict[str, Sequence[str]] = {
 
 
 @lru_cache(maxsize=1)
-def git_revision() -> Dict[str, object]:
-    """``{"sha", "dirty"}`` of the checkout this package runs from."""
-
-    here = Path(__file__).resolve().parent
-    try:
-        sha = subprocess.run(["git", "-C", str(here), "rev-parse", "HEAD"], capture_output=True, text=True,
-                             timeout=5, check=True).stdout.strip()  # fmt: skip
-        dirty = subprocess.run(["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
-                               capture_output=True, text=True, timeout=5, check=True).stdout.strip()  # fmt: skip
-        return {"sha": sha or "unknown", "dirty": bool(dirty)}
-    except (OSError, subprocess.SubprocessError):
-        return {"sha": "unknown", "dirty": None}
-
-
-@lru_cache(maxsize=1)
 def package_versions() -> Dict[str, str]:
-    out = {"python": platform.python_version()}
-    for name in PACKAGES:
-        try:
-            out[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            out[name] = "not installed"
-    return out
-
-
-def jsonable(value: object) -> object:
-    """``value`` with dates, numpy types and non-finite floats made JSON
-    safe (NaN and infinities become None)."""
-
-    if isinstance(value, Mapping):
-        return {str(k): jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [jsonable(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return [jsonable(v) for v in value.tolist()]
-    if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
-        return value.isoformat()
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return str(value)
+    return _versions(PACKAGES)
 
 
 def sha256_bytes(payload: bytes) -> str:

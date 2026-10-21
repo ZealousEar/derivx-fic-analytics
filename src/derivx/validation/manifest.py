@@ -1,7 +1,8 @@
 """Run manifests (G14): what produced a result, so it can be reproduced.
 
 A manifest is a JSON-friendly dict with the code version (git commit and
-whether the tree had uncommitted changes), package versions, the inputs and
+whether the tree had uncommitted changes, from :mod:`derivx.provenance`,
+shared with the Rates manifests), package versions, the inputs and
 filters, the data's source, fetch time and SHA-256, the model settings and
 the random seed (None when nothing random was used). :func:`results_zip`
 bundles it with CSV tables of the result (parameters, metrics, ...).
@@ -12,85 +13,24 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
-import math
-import os
 import platform
-import re
-import subprocess
 import sys
 import zipfile
 from functools import lru_cache
-from importlib import metadata
-from pathlib import Path
 from typing import Dict, Mapping, Optional
 
-import numpy as np
 import pandas as pd
+
+from derivx.provenance import GIT_SHA_ENV, git_revision, jsonable
+from derivx.provenance import package_versions as _versions
 
 PACKAGES = ("derivx", "numpy", "scipy", "pandas", "streamlit", "plotly", "yfinance", "pyarrow")
 MANIFEST_VERSION = 1
 
 
-GIT_SHA_ENV = "DERIVX_GIT_SHA"  # set by the Docker image (build arg GIT_SHA), which has no .git
-
-
-@lru_cache(maxsize=1)
-def git_revision() -> Dict[str, object]:
-    """Commit of the checkout this package runs from: ``{"sha", "dirty"}``.
-
-    Outside a git checkout (an installed wheel, or the Docker image, which
-    has no .git) the sha comes from the ``DERIVX_GIT_SHA`` environment
-    variable when it holds a 40-hex commit id (``dirty`` is then None:
-    unknown), else it is 'unknown'."""
-
-    here = Path(__file__).resolve().parent
-    try:
-        sha = subprocess.run(
-            ["git", "-C", str(here), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5, check=True
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        ).stdout.strip()
-        return {"sha": sha or "unknown", "dirty": bool(dirty)}
-    except (OSError, subprocess.SubprocessError):
-        env_sha = os.environ.get(GIT_SHA_ENV, "").strip().lower()
-        return {"sha": env_sha if re.fullmatch(r"[0-9a-f]{40}", env_sha) else "unknown", "dirty": None}
-
-
 @lru_cache(maxsize=1)
 def package_versions() -> Dict[str, str]:
-    out = {"python": platform.python_version()}
-    for name in PACKAGES:
-        try:
-            out[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            out[name] = "not installed"
-    return out
-
-
-def jsonable(value):
-    """``value`` with timestamps, numpy scalars/arrays and non-finite floats
-    converted to JSON-safe types (NaN/inf -> None)."""
-
-    if isinstance(value, Mapping):
-        return {str(k): jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [jsonable(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return [jsonable(v) for v in value.tolist()]
-    if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
-        return value.isoformat()
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return str(value)
+    return _versions(PACKAGES)
 
 
 def build_manifest(
@@ -140,3 +80,14 @@ def results_zip(manifest: Mapping[str, object], tables: Mapping[str, pd.DataFram
             info.compress_type = zipfile.ZIP_DEFLATED
             zf.writestr(info, table.to_csv(index=False))
     return buf.getvalue()
+
+
+__all__ = [
+    "GIT_SHA_ENV",
+    "build_manifest",
+    "git_revision",
+    "jsonable",
+    "manifest_bytes",
+    "package_versions",
+    "results_zip",
+]
