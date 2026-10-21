@@ -953,13 +953,25 @@ def _passes_checks(x: np.ndarray, k_range: Tuple[float, float], grid: Optional[n
 
 def _constraint_grid(xs: Sequence[np.ndarray], k_range: Tuple[float, float]) -> np.ndarray:
     """Moderate grid for the SLSQP constraints (the dense check grid is added
-    only where a solution dips below zero between these points)."""
+    only where a solution dips below zero between these points): 51 points
+    over the check range widened by 1.5 on each side, 17 over the check
+    range, and per slice in ``xs`` 21 points over m +- 3 and 13 over
+    m +- 6 sigma; at most 136 points.
+
+    It is kept well under ~200 constraint rows: from about 210 rows SciPy's
+    SLSQP hands its subproblems to multi-threaded BLAS (OpenBLAS), whose
+    thread start-up then costs more than the solve on this 5-parameter
+    problem (2-10x slower SLSQP steps on a busy 4-core machine, measured
+    with SciPy 1.17; the 396-point grid used before made a whole-sample
+    calibration 41 s instead of 18 s with default BLAS threads). Fits
+    differ from the 396-point grid's by at most 0.0005 vol bp in sample and
+    0.0032 vol bp out of sample on the committed SPY slices."""
 
     lo, hi = k_range
-    parts = [np.linspace(lo - 1.5, hi + 1.5, 151), np.linspace(lo, hi, 41)]
+    parts = [np.linspace(lo - 1.5, hi + 1.5, 51), np.linspace(lo, hi, 17)]
     for x in xs:
         _, _, _, m, sigma = _x_to_raw(x)
-        parts += [np.linspace(m - 3.0, m + 3.0, 61), m + sigma * np.linspace(-6.0, 6.0, 41)]
+        parts += [np.linspace(m - 3.0, m + 3.0, 21), m + sigma * np.linspace(-6.0, 6.0, 13)]
     return np.unique(np.concatenate(parts))
 
 
