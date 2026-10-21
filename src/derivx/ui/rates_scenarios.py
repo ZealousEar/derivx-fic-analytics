@@ -1,9 +1,18 @@
 """SCENARIOS tab of the Rates page: shock curve quotes and vols, roll the
 market forward, explain each position's P&L and run the standard scenario
-library over the portfolio."""
+library over the portfolio. Historical shocks (named episodes or any window
+of the history store) move each curve by its own history where a free one
+exists and say per curve which data they used.
+
+On a multi-curve market the shock moves the discount and projection curves
+separately (MOVE PROJECTION CURVES), the IBOR-OIS and tenor basis shocks
+move only the EURIBOR curves, and the explain splits delta by curve."""
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import io
 import math
 from dataclasses import replace
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -13,8 +22,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from derivx.data import rates_history as rh
 from derivx.rates.curves import Curve, Market
 from derivx.risk.scenarios import (
+    EPISODES,
     EXPLAIN_COLUMNS,
     LOGNORMAL_VOL_UNIT,
     NORMAL_VOL_UNIT,
@@ -25,21 +36,39 @@ from derivx.risk.scenarios import (
     carry_market,
     historical,
     historical_episodes,
-    historical_table,
+    historical_sources,
+    history_window,
     horizon_date,
+    ibor_ois_basis,
     key_rates,
     parallel,
+    pca_factor,
+    pca_library,
     quote_risk,
     run_scenario,
     scenario_grid,
+    shocked_curves,
     standard_library,
+    tenor_basis,
     twist,
 )
 from derivx.risk.sensitivities import Position
+from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
-SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "Historical")
+SHOCK_TYPES = ("Parallel", "Twist", "Butterfly", "Key rates", "PCA factor", "Historical", "History window")
+PCA_FACTORS = {1: "PC1 LEVEL", 2: "PC2 SLOPE", 3: "PC3 CURVATURE"}
+PCA_LOOKBACKS = {"WHOLE DAILY HISTORY": None, "LAST 250 CHANGES": 250, "LAST 500 CHANGES": 500,
+                 "LAST 1000 CHANGES": 1000}  # fmt: skip
+BASIS_TYPES = ("IBOR-OIS basis", "Tenor basis")  # multi-curve markets only
+HISTORY_UPLOAD_KEY = "rates_user_history"
+FLAG_LABELS = {
+    "real": "REAL: the curve's own market",
+    "upload": "YOUR UPLOAD",
+    "proxy": "PROXY: another market's moves (spreads held)",
+    "cross-currency proxy": "CROSS-CURRENCY PROXY",
+}
 KEY_TENORS = ("3M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y")
 BP_LIMIT = 500.0
 NORMAL_VOL_LIMIT = 200.0  # bp of normal vol
@@ -55,16 +84,36 @@ EXPLAIN_LABELS = {
     "carry": "CARRY",
     "residual": "RESIDUAL",
 }
-TABLE_LABELS = {
-    "position": "POSITION",
-    "kind": "KIND",
-    "base_pv": "BASE PV ($)",
-    "shocked_pv": "HORIZON PV ($)",
-    "cash": "CASH ($)",
-    "pnl": "TOTAL P&L ($)",
-    **{k: f"{v} ($)" for k, v in EXPLAIN_LABELS.items()},
-}
 MONEY = st.column_config.NumberColumn(format="%,.2f")
+
+
+def _table_labels(c: str = "$") -> Dict[str, str]:
+    """Explain table columns, amounts in currency ``c``."""
+
+    return {
+        "position": "POSITION",
+        "kind": "KIND",
+        "base_pv": f"BASE PV ({c})",
+        "shocked_pv": f"HORIZON PV ({c})",
+        "cash": f"CASH ({c})",
+        "pnl": f"TOTAL P&L ({c})",
+        **{k: f"{v} ({c})" for k, v in EXPLAIN_LABELS.items()},
+    }
+
+
+def _book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
+    """(currency label of the book's values, whether it mixes currencies):
+    Treasury bonds are in dollars, swaps and caps in the swap curve's
+    currency. Values are added without FX conversion."""
+
+    symbols = sorted({rates_risk.money(market, "govt" if p.kind == "bond" else "curve") for p in positions})
+    return (symbols[0], False) if len(symbols) == 1 else (" + ".join(symbols), True)
+
+
+def book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, bool]:
+    """(currency label of the book's values, whether it mixes currencies)."""
+
+    return _book_currency(positions, market)
 
 
 def _cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
@@ -78,22 +127,12 @@ def _cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
     return entries[key]
 
 
-def _curve_key(curve: Optional[Curve]) -> tuple:
-    if curve is None:
-        return ()
-    if not curve.quotes:
-        return (id(curve),)
-    return (curve.asof, tuple(curve.quotes), curve.interpolation, curve.conventions)
-
-
 def _market_key(market: Market) -> tuple:
-    return (
-        _curve_key(market.curve),
-        _curve_key(market.govt),
-        _curve_key(market.fixings),
-        market.vol_shift_normal,
-        market.vol_shift_lognormal,
-    )
+    return rates_risk.market_key(market)
+
+
+def _curve_label(market: Market, which: str) -> str:
+    return CURVE_LABELS.get(which, which) if not market.is_multi_curve else rates_risk.curve_title(market, which)
 
 
 def _positions_key(positions: Sequence[Position], market: Market) -> tuple:
@@ -132,9 +171,18 @@ def _bp(container, label: str, value: float, key: str) -> float:
 # --------------------------------------------------------------------------
 
 
-def _profile_inputs(kind: str, c2, c3) -> Shock:
+def _profile_inputs(kind: str, c2, c3, store: rh.HistoryStore, market: Market) -> Shock:
     """The quote-move part of the shock; raises ValueError on bad inputs."""
 
+    if kind == "IBOR-OIS basis":
+        indices = [k for k in market.projections if not market.projections.is_discount(k)]
+        picked = c3.multiselect("PROJECTION CURVES", indices, default=indices, key="scn_basis_indices")
+        if not picked:
+            raise ValueError("pick at least one projection curve")
+        bp = _bp(c2, "BASIS MOVE (BP)", 10.0, "scn_basis_bp")
+        return ibor_ois_basis(bp, None if len(picked) == len(indices) else picked)
+    if kind == "Tenor basis":
+        return tenor_basis(_bp(c2, "BASIS SPREAD MOVE (BP)", 5.0, "scn_tenor_bp"))
     if kind == "Parallel":
         return parallel(_bp(c2, "SHIFT (BP)", 25.0, "scn_par_bp"))
     if kind == "Twist":
@@ -177,25 +225,170 @@ def _profile_inputs(kind: str, c2, c3) -> Shock:
         cols = st.columns(len(KEY_TENORS))
         moves = {t: _bp(col, f"{t} (BP)", 0.0, f"scn_kr_{t}") for t, col in zip(KEY_TENORS, cols)}
         return key_rates(moves)
-    name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
-    scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
-    return historical(name, scale)
+    if kind == "PCA factor":
+        return _pca_inputs(c2, c3, store, market)
+    if kind == "Historical":
+        name = c2.selectbox("EPISODE", historical_episodes(), key="scn_hist")
+        scale = c3.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_hist_scale")
+        return historical(name, scale, store=store)
+    dates = store.dates("UST_PAR")[::-1]
+    end_default = 0
+    start_default = next((i for i, d in enumerate(dates) if (dates[0] - d).days >= 28), len(dates) - 1)
+    start = c2.selectbox("WINDOW START", dates, index=start_default, key="scn_win_start")
+    end = c3.selectbox("WINDOW END", dates, index=end_default, key="scn_win_end")
+    scale = st.number_input("SCALE (x)", min_value=-3.0, max_value=3.0, value=1.0, step=0.25, key="scn_win_scale")
+    return history_window(start, end, scale, store=store)
 
 
-def _shock_inputs(market: Market) -> Optional[Shock]:
+def history_store(market: Market) -> rh.HistoryStore:
+    """The CURVE tab's store plus the user's swap history uploaded on this
+    tab (the RESEARCH tab reads the same store)."""
+
+    return _history_store(market)
+
+
+def book_risk(positions: Sequence[Position], market: Market) -> Tuple[tuple, Dict[str, QuoteRisk]]:
+    """(portfolio key, key-rate PV01s and gammas of the book to every curve
+    with quotes) on the valuation date, from the cache this tab's P&L
+    explain fills, so the RESEARCH tab does not bump the curves again.
+    Raises ValueError if a position has no finite value."""
+
+    key = (_market_key(market), _positions_key(positions, market))
+    out = {}
+    for which in shocked_curves(market):
+        if _has_quotes(market.get_curve(which)):
+            out[which] = _cached(f"risk_{which}", (key, 0), lambda w=which: quote_risk(positions, market, w))
+    return key, out
+
+
+def _pca_inputs(c2, c3, store: rh.HistoryStore, market: Market) -> Shock:
+    """PCA factor shock: n sd of PC1/PC2/PC3 of a history's daily changes up
+    to the valuation date."""
+
+    factor = c2.selectbox("FACTOR", list(PCA_FACTORS), format_func=PCA_FACTORS.get, key="scn_pca_factor")
+    n_sigma = c3.number_input(
+        "SIZE (STANDARD DEVIATIONS)", min_value=-10.0, max_value=10.0, value=2.0, step=0.5, key="scn_pca_sigma"
+    )
+    a, b, c = st.columns(3)
+    datasets = [k for k in store.datasets() if k != "FIXINGS" and len(store.dates(k)) > 1]
+    datasets.sort(key=lambda k: (k != "UST_PAR", k))
+    dataset = a.selectbox(
+        "FROM THE DAILY CHANGES OF", datasets, format_func=lambda k: rh.dataset_info(k).title, key="scn_pca_dataset"
+    )
+    lookback = b.selectbox("OVER", list(PCA_LOOKBACKS), key="scn_pca_lookback")
+    days = c.number_input(
+        "HOLDING PERIOD (BUSINESS DAYS)", min_value=1, max_value=250, value=1, step=1, key="scn_pca_days",
+        help="The one-day standard deviation is scaled by the square root of this (independent daily moves assumed).",
+    )  # fmt: skip
+    return pca_factor(
+        int(factor), float(n_sigma), store, dataset, end=market.asof, window=PCA_LOOKBACKS[lookback], days=int(days)
+    )
+
+
+def _history_store(market: Market) -> rh.HistoryStore:
+    """The CURVE tab's store plus the user's uploaded swap history."""
+
+    base = rates_data.active_store()
+    uploads = st.session_state.get(HISTORY_UPLOAD_KEY, {})
+    if not uploads:
+        return base
+    token = ",".join(sorted(f"{ccy}:{u['sha'][:10]}" for ccy, u in uploads.items()))
+    memo = st.session_state.setdefault("_scn_store_memo", {})
+    key = (id(base), token)
+    if key not in memo:
+        memo.clear()
+        memo[key] = rh.build_store([base.frame] + [u["frame"] for u in uploads.values()], f"{base.label} + {token}")
+    return memo[key]
+
+
+def _history_upload(market: Market) -> None:
+    """Expander to upload the user's own swap-curve history (kept in session
+    state per currency until cleared)."""
+
+    currency = market.curve.conventions.currency if market.curve.conventions else "USD"
+    uploads = st.session_state.setdefault(HISTORY_UPLOAD_KEY, {})
+    with st.expander(f"Your {currency} swap-curve history (CSV upload, used by historical shocks)"):
+        st.caption(
+            "Columns date, tenor, rate (long) or date plus one column per tenor (wide: 2Y, 5Y, 10Y ...); par swap "
+            "rates. Where it covers a window it replaces the proxy for the swap curve."
+        )
+        c1, c2 = st.columns([3, 1])
+        file = c1.file_uploader("SWAP HISTORY CSV", type=["csv"], key=rates_data.widget_key("scn_hist_upload"))
+        units = c2.radio("UNITS", ["auto", "percent", "decimal", "bp"], key="scn_hist_units")
+        if file is not None:
+            payload = file.getvalue()
+            sha = hashlib.sha256(payload + units.encode()).hexdigest()
+            if uploads.get(currency, {}).get("sha") != sha:
+                try:
+                    raw = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig")  # Excel adds a BOM
+                except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError, ValueError) as exc:
+                    st.error(f"{file.name}: could not read the file ({exc})")
+                    raw = None
+                if raw is not None:
+                    frame, issues, used = rh.parse_history_upload(raw, currency, units, file.name)
+                    for issue in issues:
+                        (st.error if issue.level == "error" else st.caption)(f"{file.name}: {issue.message}")
+                    if len(frame):
+                        uploads[currency] = {"name": file.name, "sha": sha, "frame": frame}
+        mine = uploads.get(currency)
+        if mine is not None:
+            days = sorted(set(mine["frame"]["asof"]))
+            st.caption(
+                f"Using {mine['name']}: {len(days)} dates from {days[0]} to {days[-1]}, "
+                f"{mine['frame']['tenor'].nunique()} tenors."
+            )
+            st.button(
+                "CLEAR SWAP HISTORY",
+                key="scn_hist_clear",
+                on_click=rates_data.clear_upload,
+                args=(HISTORY_UPLOAD_KEY, "scn_hist_upload", currency),
+            )
+
+
+def _sources_table(shock: Shock, market: Market) -> None:
+    """Which data each moved curve of a historical shock replays."""
+
+    table = historical_sources(shock)
+    if table.empty:
+        return
+    currency = market.curve.conventions.currency if market.curve.conventions else None
+    shown = table[(table["curve"] == "TREASURY") | (table["currency"] == currency)]
+    shown = shown.assign(flag=shown["flag"].map(FLAG_LABELS).fillna(shown["flag"]))
+    shown.columns = [c.upper() for c in shown.columns]
+    st.dataframe(shown, hide_index=True, width="stretch")
+    st.caption(
+        "Each curve's quotes move by its data's change at the same tenor (linear in between, flat beyond). REAL "
+        "swap/OIS history: ICE USD swap rates (FRED, to 2016-10-28), the Bank of England OIS curve (GBP, par OIS "
+        "rates derived from its spot curve) or your upload. Otherwise a flagged proxy moves the swap curve by "
+        "government yield changes, which holds swap spreads unchanged."
+    )
+
+
+def _shock_inputs(market: Market, store: rh.HistoryStore) -> Optional[Shock]:
     """Read the shock builder; None (with the reason shown) if invalid."""
 
     c1, c2, c3 = st.columns(3)
-    kind = c1.selectbox("SHOCK TYPE", SHOCK_TYPES, key="scn_type")
+    multi = market.is_multi_curve
+    kind = c1.selectbox("SHOCK TYPE", SHOCK_TYPES + (BASIS_TYPES if multi else ()), key="scn_type")
     try:
-        shock = _profile_inputs(kind, c2, c3)
+        shock = _profile_inputs(kind, c2, c3, store, market)
     except ValueError as exc:
         st.error(f"Cannot build this shock: {exc}")
         return None
     has_govt = _has_quotes(market.govt)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    move_curve = c1.checkbox("MOVE SWAP CURVE", value=True, key="scn_move_curve")
-    move_govt = c2.checkbox("MOVE TREASURY CURVE", value=has_govt, key="scn_move_govt", disabled=not has_govt)
+    basis = kind in BASIS_TYPES
+    if multi:
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        move_proj = c6.checkbox(
+            "MOVE PROJECTION CURVES", value=True, key="scn_move_proj", disabled=basis,
+            help="Move the EURIBOR curves' rate quotes with the swap curve (basis spreads held). Untick to move the "
+            "OIS discount curve alone: the projection curves are then rebuilt on it with their quotes held.",
+        )  # fmt: skip
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        move_proj = None
+    move_curve = c1.checkbox("MOVE SWAP CURVE", value=True, key="scn_move_curve", disabled=basis)
+    move_govt = c2.checkbox("MOVE TREASURY CURVE", value=has_govt, key="scn_move_govt", disabled=not has_govt or basis)
     normal = c3.number_input(
         "NORMAL VOL SHOCK (BP)",
         min_value=-NORMAL_VOL_LIMIT,
@@ -223,28 +416,28 @@ def _shock_inputs(market: Market) -> Optional[Shock]:
         key="scn_horizon",
         help="Calendar days to roll the market forward; the shock hits at the horizon.",
     )
+    curves = {} if basis else dict(curve=move_curve, govt=move_govt and has_govt, projections=move_proj)
     shock = replace(
         shock,
-        curve=move_curve,
-        govt=move_govt and has_govt,
+        **curves,
         normal_vol_bp=float(normal),
         lognormal_vol_pts=float(lognormal),
         horizon_days=int(horizon),
     )
     st.caption(f"{shock.name}: {shock.description}.")
-    if kind == "Historical":
-        st.caption(
-            "Historical moves are US Treasury constant-maturity yield changes (FRED), applied to every quote by "
-            "tenor (flat beyond 1M and 30Y). Applied to the swap curve they hold swap spreads unchanged."
-        )
+    if kind in ("Historical", "History window", "PCA factor"):
+        _sources_table(shock, market)
     if not (shock.moves_rates or normal or lognormal or horizon):
         st.warning("This scenario moves nothing: pick a curve, a non-zero shock, a vol shock or a horizon.")
     return shock
 
 
 def _lowest_vol(vol: object) -> Optional[float]:
-    """Lowest of a flat vol or an {expiry: vol} term structure."""
+    """Lowest of a flat vol, an {expiry: vol} term structure or stripped
+    caplet vols."""
 
+    if hasattr(vol, "lowest"):
+        return float(vol.lowest)
     values = list(vol.values()) if isinstance(vol, Mapping) else [vol]
     try:
         return min(float(v) for v in values)
@@ -272,8 +465,10 @@ def _floored_vols(positions: Sequence[Position], market: Market, shock: Shock) -
 # --------------------------------------------------------------------------
 
 
-def _curve_chart(base: Curve, shocked: Curve, view: str, bumps: np.ndarray) -> go.Figure:
-    years = np.array([inst.tenor.years for inst in base.instruments])
+def _curve_chart(
+    base: Curve, shocked: Curve, view: str, bumps: np.ndarray, source: Optional[Tuple[str, dt.date]] = None
+) -> go.Figure:
+    years = base.years
     if view == "PAR QUOTES":
         x = years
         y_base = np.array([q.rate for q in base.quotes]) * 100.0
@@ -302,6 +497,8 @@ def _curve_chart(base: Curve, shocked: Curve, view: str, bumps: np.ndarray) -> g
     fig.update_layout(
         yaxis2=dict(title_text="SHOCK (BP)", overlaying="y", side="right", showgrid=False, zeroline=False)
     )
+    label, asof = source if source is not None else ("curve as passed to this tab", base.asof)
+    rates_data.badge(fig, label, asof)
     return bound_axes(
         fig,
         xaxis=axis_limits(np.concatenate([x, years]), pad=0.02, floor=0.0),
@@ -310,7 +507,7 @@ def _curve_chart(base: Curve, shocked: Curve, view: str, bumps: np.ndarray) -> g
     )
 
 
-def _waterfall(total: Dict[str, float]) -> go.Figure:
+def _waterfall(total: Dict[str, float], c: str = "$") -> go.Figure:
     labels = [EXPLAIN_LABELS[c] for c in EXPLAIN_COLUMNS] + ["TOTAL P&L"]
     values = [total[c] for c in EXPLAIN_COLUMNS] + [total["pnl"]]
     fig = go.Figure(
@@ -325,7 +522,7 @@ def _waterfall(total: Dict[str, float]) -> go.Figure:
             hovertemplate="%{x}: %{y:,.2f}<extra></extra>",
         )
     )
-    dark_layout(fig, height=360, xtitle="P&L COMPONENT", ytitle="P&L ($)", legend=False)
+    dark_layout(fig, height=360, xtitle="P&L COMPONENT", ytitle=f"P&L ({c})", legend=False)
     levels = np.concatenate([np.cumsum([0.0] + values[:-1]), [values[-1], -1.0, 1.0]])  # at least +/-$1
     return bound_axes(
         fig,
@@ -334,11 +531,63 @@ def _waterfall(total: Dict[str, float]) -> go.Figure:
     )
 
 
-def _explain_table(rows: List[Dict[str, object]]) -> pd.DataFrame:
-    frame = pd.DataFrame(rows)
+def _explain_table(rows: List[Dict[str, object]], c: str = "$") -> pd.DataFrame:
+    frame = pd.DataFrame(rows).drop(columns=["delta_by_curve"], errors="ignore")
     total = {"position": TOTAL, "kind": "", **frame.drop(columns=["position", "kind"]).sum().to_dict()}
     frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
-    return frame[list(TABLE_LABELS)].rename(columns=TABLE_LABELS)
+    labels = _table_labels(c)
+    return frame[list(labels)].rename(columns=labels)
+
+
+def scenario_library(market: Market, store: rh.HistoryStore) -> Tuple[List[Shock], List[str]]:
+    """The scenario grid's shocks: :func:`standard_library` (parallel, 2s10s
+    twists, 2s5s10s fly, historical episodes), the IBOR-OIS and tenor basis
+    shocks on a multi-curve market, and +/-2 sd one-day moves of PC1-PC3 of
+    the daily US Treasury changes up to the valuation date. Shocks leave the
+    Treasury curve alone when the market has none. Returns (shocks, notes
+    on any left out)."""
+
+    library = standard_library(store)
+    notes: List[str] = []
+    if market.is_multi_curve:
+        library += [ibor_ois_basis(10.0), tenor_basis(5.0)]
+    try:
+        library += pca_library(store, end=market.asof)
+    except ValueError as exc:
+        notes.append(f"PCA shocks: {exc}")
+    if not _has_quotes(market.govt):
+        library = [replace(s, govt=False) for s in library]
+    return library, notes
+
+
+def seed_risk(positions: Sequence[Position], market: Market, risk: Mapping[str, QuoteRisk]) -> None:
+    """Hand key-rate risk measured elsewhere (the BOOK tab's, from the same
+    bumped curves) to this tab's cache, so the P&L explain and the RESEARCH
+    tab's VaR do not bump the curves again for the same positions."""
+
+    key = (_market_key(market), _positions_key(positions, market))
+    for which, qr in risk.items():
+        if qr.asof != market.asof or qr.pv01.shape[1] != len(positions):
+            continue
+        entries = st.session_state.setdefault(f"scn_cache_risk_{which}", {})
+        if (key, 0) not in entries:
+            if len(entries) >= CACHE_ENTRIES:
+                entries.pop(next(iter(entries)))
+            entries[(key, 0)] = qr
+
+
+def library_grid(
+    positions: Sequence[Position], market: Market, store: rh.HistoryStore
+) -> Tuple[pd.DataFrame, List[str], List[Shock]]:
+    """(grid of :func:`scenario_library` shocks x positions with a TOTAL
+    column, reasons for shocks not revalued, the shocks), cached on the
+    market, the positions and the shocks (the BOOK and SCENARIOS tabs share
+    it)."""
+
+    library, notes = scenario_library(market, store)
+    key = ((_market_key(market), _positions_key(positions, market)), tuple(library))
+    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
+    return grid, notes + failed, library
 
 
 def _grid(positions: Sequence[Position], market: Market, shocks: Sequence[Shock]) -> Tuple[pd.DataFrame, List[str]]:
@@ -368,41 +617,61 @@ def _risk(positions: Sequence[Position], market: Market, shock: Shock, key: tupl
         return quote_risk(positions, hit, which)
 
     out = {}
-    for which in ("curve", "govt"):
-        if getattr(shock, which) and _has_quotes(getattr(market, which)):
+    for which in shocked_curves(market):
+        if shock.applies_to(which) and _has_quotes(market.get_curve(which)):
             out[which] = _cached(f"risk_{which}", (key, shock.horizon_days), lambda w=which: compute(w))
     return out
 
 
 def _show_curves(market: Market, shock: Shock) -> None:
     st.markdown("#### / BASE VS SHOCKED CURVE")
-    available = [w for w in ("curve", "govt") if _has_quotes(getattr(market, w))]
+    available = [w for w in shocked_curves(market) if _has_quotes(market.get_curve(w))]
     c1, c2 = st.columns(2)
-    which = c1.radio("CURVE", available, format_func=CURVE_LABELS.get, horizontal=True, key="scn_chart_curve")
+    which = c1.radio("CURVE", available, format_func=lambda w: _curve_label(market, w), horizontal=True,
+                     key="scn_chart_curve")  # fmt: skip
     view = c2.radio("SHOW", ["PAR QUOTES", "ZERO RATES"], horizontal=True, key="scn_chart_view")
-    base = getattr(market, which)
-    bumps = shock.quote_bumps(base) if getattr(shock, which) else np.zeros(len(base.quotes))
-    shocked = base.rebuilt(list(bumps)) if np.any(bumps) else base
+    base = market.get_curve(which)
+    bumps = shock.quote_bumps(base, which) if shock.applies_to(which) else np.zeros(len(base.quotes))
+    moves = {w: list(shock.quote_bumps(market.get_curve(w), w)) for w in available if shock.applies_to(w)}
+    moves = {w: b for w, b in moves.items() if np.any(b)}
+    shocked = market.rebuilt(moves).get_curve(which) if moves else base
+    badge = rates_data.badge_for(which)
+    if badge is not None and badge[1] != base.asof:
+        badge = None
     st.plotly_chart(
-        _curve_chart(base, shocked, view, bumps), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_curve_chart"
+        _curve_chart(base, shocked, view, bumps, badge),
+        width="stretch",
+        config=PLOTLY_2D_CONFIG,
+        key="scn_curve_chart",
     )
     st.caption(
         "Each quote moves by the shock profile at its tenor (linear between profile points, flat beyond) and the "
         "curve is rebuilt, so the shocked curve reprices the shocked quotes. Shown on today's date; zero rates are "
         "continuously compounded ACT/365F."
-    )
+        + (" A projection curve is rebuilt on the shocked OIS curve too, so its zero rates move with an OIS shock "
+           "even where its own quotes do not; BASIS quotes are spreads (bp), shown in %." if market.is_multi_curve
+           else "")
+    )  # fmt: skip
 
 
-def _show_explain(rows: List[Dict[str, object]], market: Market, shock: Shock) -> None:
-    table = _explain_table(rows)
+def _show_explain(
+    rows: List[Dict[str, object]], market: Market, shock: Shock, positions: Sequence[Position] = ()
+) -> pd.DataFrame:
+    c, mixed = _book_currency(positions, market) if positions else (rates_risk.money(market), False)
+    if mixed:
+        st.warning(
+            f"The book holds {market.curve.conventions.currency} swaps or caps and US Treasury bonds: totals add "
+            f"amounts in {c} without FX conversion. Read the P&L per position, or keep one currency in the book."
+        )
+    table = _explain_table(rows, c)
     total = {k: float(sum(r[k] for r in rows)) for k in ("pnl", *EXPLAIN_COLUMNS)}
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("TOTAL P&L ($)", _num(total["pnl"]))
-    m2.metric("EXPLAINED ($)", _num(total["pnl"] - total["residual"]))
-    m3.metric("RESIDUAL ($)", _num(total["residual"]))
+    m1.metric(f"TOTAL P&L ({c})", _num(total["pnl"]))
+    m2.metric(f"EXPLAINED ({c})", _num(total["pnl"] - total["residual"]))
+    m3.metric(f"RESIDUAL ({c})", _num(total["residual"]))
     share = abs(total["residual"]) / abs(total["pnl"]) * 100.0 if abs(total["pnl"]) > 1e-9 else None
     m4.metric("RESIDUAL (% OF P&L)", "n/a" if share is None else f"{share:.3f}")
-    st.plotly_chart(_waterfall(total), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
+    st.plotly_chart(_waterfall(total, c), width="stretch", config=PLOTLY_2D_CONFIG, key="scn_waterfall")
     horizon = horizon_date(market, shock.horizon_days)
     st.caption(
         f"Horizon {horizon} ({shock.horizon_days} days). P&L = value at the horizon + cash received - value today, "
@@ -411,46 +680,89 @@ def _show_explain(rows: List[Dict[str, object]], market: Market, shock: Shock) -
         "its Greeks: delta = key-rate PV01 x quote move; gamma = 1/2 diagonal key-rate gamma x move^2; cross gamma "
         "= the rest of the second-order term along the shock; vol = vega x vol shock."
     )
-    money = {label: MONEY for label in list(TABLE_LABELS.values())[2:]}
+    money = {label: MONEY for label in list(_table_labels(c).values())[2:]}
     st.dataframe(table, hide_index=True, width="stretch", column_config=money)
     st.download_button("Download P&L explain CSV", _csv(table), file_name="scenario_explain.csv", key="scn_explain_csv")
+    curves = sorted({k for r in rows for k in r.get("delta_by_curve", {})}, key=list(market.curve_keys).index)
+    if market.is_multi_curve and curves:
+        st.markdown("#### / DELTA BY CURVE")
+        by_curve = pd.DataFrame(
+            [{"POSITION": r["position"], **{f"{_curve_label(market, k)} ({rates_risk.money(market, k)})":
+                                           r["delta_by_curve"].get(k, 0.0) for k in curves}} for r in rows]
+        )  # fmt: skip
+        st.dataframe(by_curve, hide_index=True, width="stretch",
+                     column_config={c: MONEY for c in by_curve.columns[1:]})  # fmt: skip
+        st.caption("The delta column split by the curve whose quotes moved (key-rate PV01 x quote move, per curve).")
+    return table
 
 
-def _show_grid(positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple) -> None:
+def _episode_flags(store: rh.HistoryStore, market: Market) -> str:
+    """One line per episode: the data its swap-curve move comes from."""
+
+    currency = market.curve.conventions.currency if market.curve.conventions else "USD"
+    parts = []
+    for name, _, _ in EPISODES:
+        rows = historical_sources(historical(name, store=store))
+        row = rows[(rows["curve"] == "SWAP") & (rows["currency"] == currency)]
+        if not row.empty:
+            r = row.iloc[0]
+            parts.append(f"{name} ({r['start']} to {r['end']}): {r['data']} [{FLAG_LABELS.get(r['flag'], r['flag'])}]")
+    return "; ".join(parts)
+
+
+def _show_grid(
+    positions: Sequence[Position], market: Market, shock: Optional[Shock], key: tuple, store: rh.HistoryStore
+) -> pd.DataFrame:
     """Standard library grid, headed by the custom ``shock`` when given."""
 
     st.markdown("### / SCENARIO GRID")
-    library = standard_library()
-    if not _has_quotes(market.govt):
-        library = [replace(s, govt=False) for s in library]
-    grid, failed = _cached("grid", key, lambda: _grid(positions, market, library))
+    grid, failed, library = library_grid(positions, market, store)
     if shock is not None:
-        custom, _ = _cached("custom", (key, shock), lambda: _grid(positions, market, [shock]))
+        custom, _ = _cached("custom", (key, tuple(library), shock), lambda: _grid(positions, market, [shock]))
         grid = pd.concat([custom.rename(index=lambda name: f"CUSTOM: {name}"), grid])
     if failed:
         st.warning("Not revalued: " + "; ".join(failed))
     if grid.empty:
-        return
+        return pd.DataFrame()
     table = grid.rename_axis("SCENARIO").reset_index()
+    c, _ = _book_currency(positions, market)
     st.dataframe(table, hide_index=True, width="stretch", column_config={c: MONEY for c in table.columns[1:]})
     st.download_button("Download scenario grid CSV", _csv(table), file_name="scenario_grid.csv", key="scn_grid_csv")
-    episodes = historical_table().drop_duplicates("episode")
-    dates = "; ".join(f"{r.episode} {r.start} to {r.end}" for r in episodes.itertuples())
     st.caption(
-        "Full-revaluation P&L in $ per position. The library is instantaneous and moves both curves: parallel "
-        "+/-25 and +/-100bp; 2s10s steepener/flattener (2Y -/+12.5bp, 10Y +/-12.5bp, pivot 5Y, flat beyond); "
-        f"2s5s10s fly (5Y +25bp, 2Y and 10Y unchanged); historical Treasury moves ({dates})."
-    )
+        f"Full-revaluation P&L in {c} per position. " + library_caption(store, market)
+    )  # fmt: skip
+    return table
 
 
-def render(market: Market, positions: List[Position]) -> None:
-    """Scenario tab: shock builder, P&L explain and scenario grid."""
+def library_caption(store: rh.HistoryStore, market: Market) -> str:
+    """What the scenario library holds and which data each episode replays."""
+
+    return (
+        "The library is instantaneous and moves every curve: parallel +/-25 and +/-100bp; 2s10s "
+        "steepener/flattener (2Y -/+12.5bp, 10Y +/-12.5bp, pivot 5Y, flat beyond); 2s5s10s fly (5Y +25bp, 2Y and "
+        "10Y unchanged); PC1 level, PC2 slope and PC3 curvature +/-2 sd one-day moves of the daily US Treasury "
+        "changes up to the valuation date (applied to every curve); historical episodes, the Treasury curve moving "
+        "by US Treasury par yield changes and the swap curve by: " + _episode_flags(store, market) + "."
+        + (" Multi-curve: the projection curves move with the swap curve in every rate scenario (basis held; no "
+           "free EURIBOR history); IBOR-OIS basis +10bp moves only the EURIBOR rate quotes, tenor basis +5bp only "
+           "the 3s6s spreads." if market.is_multi_curve else "")
+    )  # fmt: skip
+
+
+def render(market: Market, positions: List[Position], scope: str = "") -> None:
+    """Scenario tab: shock builder, P&L explain and scenario grid on the
+    positions in scope (``scope`` names them: the book, the tab trades or
+    both)."""
 
     st.markdown("### / SCENARIOS")
+    if scope:
+        st.caption(f"RISK ON: {scope} ({len(positions)} positions). Change it with RISK SCOPE in the sidebar.")
     if not market.curve.quotes:
         st.error("Scenarios shock curve quotes: the swap curve must be bootstrapped from quotes.")
         return
-    shock = _shock_inputs(market)
+    _history_upload(market)
+    store = _history_store(market)
+    shock = _shock_inputs(market, store)
     if shock is None:
         return
     try:
@@ -461,7 +773,10 @@ def render(market: Market, positions: List[Position]) -> None:
 
     st.markdown("### / P&L EXPLAIN")
     if not positions:
-        st.info("No positions yet: price a swap, cap/floor or bond on the other Rates tabs to explain its P&L here.")
+        st.info(
+            "No positions yet: add trades to the BOOK, or price a swap, swaption, cap/floor or bond on the other "
+            "Rates tabs and pick them under RISK SCOPE, to explain their P&L here."
+        )
         return
     floored = _floored_vols(positions, market, shock)
     if floored:
@@ -480,6 +795,18 @@ def render(market: Market, positions: List[Position]) -> None:
     except ValueError as exc:
         st.error(f"Cannot revalue the portfolio under this scenario: {exc}")
         rows = None
-    if rows is not None:
-        _show_explain(rows, market, shock)
-    _show_grid(positions, market, shock if rows is not None else None, key)
+    explain = _show_explain(rows, market, shock, positions) if rows is not None else pd.DataFrame()
+    grid = _show_grid(positions, market, shock if rows is not None else None, key, store)
+    rates_exports.export_row(
+        "scenarios", market, {"pnl_explain": explain, "scenario_grid": grid},
+        {"positions": [{"name": p.name, "kind": p.kind, "details": repr(p.details)} for p in positions],
+         "scope": scope, "shock": {"name": shock.name, "description": shock.description,
+                                   "profile": shock.profile, "profiles": shock.profiles,
+                                   "curve": shock.curve, "govt": shock.govt, "projections": shock.projections,
+                                   "normal_vol_bp": shock.normal_vol_bp, "lognormal_vol_pts": shock.lognormal_vol_pts,
+                                   "horizon_days": shock.horizon_days,
+                                   "sources": [vars(src) for src in shock.sources]}},
+        {"revaluation": "quotes shocked, curves rebuilt, positions revalued", "explain": "key-rate PV01 and gamma "
+         "(+/-1bp central differences), cross gamma along the shock, vega x vol shock, carry"},
+        key="scn_export", store=store,
+    )  # fmt: skip

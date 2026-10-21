@@ -1,0 +1,1 @@
+{ "refRates": [ { "effectiveDate": "2026-10-19", "type": "SOFRAI" ,"average30day": 3.88518 ,"average90day": 3.74156 ,"average180day": 3.70112 ,"index": 1.26344146 ,"revisionIndicator": "" }, { "effectiveDate": "2026-10-16", "type": "SOFRAI" ,"average30day": 3.87449 ,"average90day": 3.73159 ,"average180day": 3.69699 ,"index": 1.26303308 ,"revisionIndicator": "" } ] }

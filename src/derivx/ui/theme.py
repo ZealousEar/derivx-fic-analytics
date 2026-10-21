@@ -181,10 +181,32 @@ HEADER_HTML = """
 """
 
 
+# Download buttons and the file uploader's browse button take the app's button style: on the black page their
+# default (light) style showed white labels on white buttons.
+CONTROL_CSS = """
+    <style>
+    .stDownloadButton button, [data-testid="stFileUploader"] button {
+        background: #000000;
+        color: #FFFFFF;
+        border: 2px solid #FFFFFF;
+        border-radius: 0;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+    }
+    .stDownloadButton button:hover, [data-testid="stFileUploader"] button:hover {
+        background: #FFFFFF;
+        color: #000000;
+        border: 2px solid #000000;
+    }
+    </style>
+"""
+
+
 def apply_app_style() -> None:
     """Inject the app-wide CSS and draw the page header."""
 
     import streamlit as st
 
     st.markdown(APP_CSS, unsafe_allow_html=True)
+    st.markdown(CONTROL_CSS, unsafe_allow_html=True)
     st.markdown(HEADER_HTML, unsafe_allow_html=True)

@@ -1,0 +1,62 @@
+{
+ "fred_ust.csv": {
+  "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS1MO,DGS3MO,DGS6MO,DGS1,DGS2,DGS3,DGS5,DGS7,DGS10,DGS20,DGS30&cosd=2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13,2026-10-13&coed=2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16,2026-10-16",
+  "recorded_at": "2026-10-20T11:36:17+00:00",
+  "note": "raw response"
+ },
+ "fred_dswp.csv": {
+  "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DSWP1,DSWP2,DSWP3,DSWP4,DSWP5,DSWP7,DSWP10,DSWP30&cosd=2013-05-01,2013-05-01,2013-05-01,2013-05-01,2013-05-01,2013-05-01,2013-05-01,2013-05-01&coed=2013-05-03,2013-05-03,2013-05-03,2013-05-03,2013-05-03,2013-05-03,2013-05-03,2013-05-03",
+  "recorded_at": "2026-10-20T11:36:18+00:00",
+  "note": "raw response"
+ },
+ "fred_fixings.csv": {
+  "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR,IUDSOIA,ECBESTRVOLWGTTRMDMNRT,SOFRINDEX&cosd=2026-10-14,2026-10-14,2026-10-14,2026-10-14&coed=2026-10-19,2026-10-19,2026-10-19,2026-10-19",
+  "recorded_at": "2026-10-20T11:36:19+00:00",
+  "note": "raw response"
+ },
+ "treasury_2026.csv": {
+  "url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/2026/all?type=daily_treasury_yield_curve&field_tdr_date_value=2026&page&_format=csv",
+  "recorded_at": "2026-10-20T11:36:19+00:00",
+  "note": "first five days of the response"
+ },
+ "nyfed_sofr_last3.json": {
+  "url": "https://markets.newyorkfed.org/api/rates/secured/sofr/last/3.json",
+  "recorded_at": "2026-10-20T11:36:20+00:00",
+  "note": "raw response"
+ },
+ "nyfed_effr_search.json": {
+  "url": "https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json?startDate=2026-10-13&endDate=2026-10-16",
+  "recorded_at": "2026-10-20T11:36:20+00:00",
+  "note": "raw response"
+ },
+ "nyfed_sofrai_last2.json": {
+  "url": "https://markets.newyorkfed.org/api/rates/secured/sofrai/last/2.json",
+  "recorded_at": "2026-10-20T11:36:21+00:00",
+  "note": "raw response"
+ },
+ "ecb_estr.csv": {
+  "url": "https://data-api.ecb.europa.eu/service/data/EST/B.EU000A2X2A25.WT?format=csvdata&lastNObservations=3",
+  "recorded_at": "2026-10-20T11:36:21+00:00",
+  "note": "raw response"
+ },
+ "ecb_yc_par.csv": {
+  "url": "https://data-api.ecb.europa.eu/service/data/YC/B.U2.EUR.4F.G_N_A.SV_C_YM.PY_3M+PY_2Y+PY_10Y+PY_30Y+SR_10Y6M?format=csvdata&detail=dataonly&lastNObservations=2",
+  "recorded_at": "2026-10-20T11:36:23+00:00",
+  "note": "raw response"
+ },
+ "boe_latest.zip": {
+  "url": "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/latest-yield-curve-data.zip",
+  "recorded_at": "2026-10-20T11:36:24+00:00",
+  "note": "OIS and GLC nominal workbooks only, each trimmed to its first three curves"
+ },
+ "boe_ois_2009_2015.xlsx": {
+  "url": "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/oisddata.zip",
+  "recorded_at": "2026-10-20T11:36:25+00:00",
+  "note": "the 2009-2015 workbook of the daily archive (older sheet layout), trimmed to three curves"
+ },
+ "fred_api_dgs10.json": {
+  "url": "https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&file_type=json (needs api_key)",
+  "recorded_at": "2026-10-20T11:36:25+00:00",
+  "note": "constructed, not recorded: the documented series/observations layout filled with the DGS10 values of fred_ust.csv plus one '.' (missing) observation; no API key was available"
+ }
+}

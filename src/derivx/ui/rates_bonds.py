@@ -30,6 +30,7 @@ from derivx.rates.bonds import (
 from derivx.rates.conventions import add_months
 from derivx.rates.curves import Curve, Market, get_conventions
 from derivx.risk.sensitivities import Position, key_rate_pv01, parallel_pv01
+from derivx.ui import rates_exports
 from derivx.ui.plot_limits import axis_limits, bound_axes
 from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
@@ -272,7 +273,10 @@ def _price_input(bond: FixedRateBond, settle: dt.date, fair_clean: float) -> Opt
         state.pop("bond_quote_mode", None)
     c1, c2, _ = st.columns(3)
     mode = c1.radio("QUOTE", ["Price", "Yield"], horizontal=True, key="bond_input_mode")
-    if state.get("bond_quote_mode") != mode:
+    widget = "bond_price_text" if mode == "Price" else "bond_yield_pct"
+    # Re-sync on a mode change, and when Streamlit dropped the widget's state
+    # because another page was open in the last run.
+    if state.get("bond_quote_mode") != mode or widget not in state:
         _sync_quote(bond, settle, mode, fair_clean)
     if mode == "Price":
         text = c2.text_input(
@@ -549,6 +553,11 @@ def _bond_calculator(market: Market) -> List[Position]:
     st.caption("Clean price against street yield; the dashed line is the duration (first-order) approximation.")
 
     st.markdown("### / KEY-RATE PV01 (TREASURY CURVE)")
+    tables = {"spreads": spreads, "cashflows": table, "analytics": pd.DataFrame([{
+        "bond": bond.label, "settle": settle, "clean": clean, "dirty": dirty, "accrued": accrued, "yield_street": y,
+        "yield_true": y_true, "macaulay": bond.macaulay_duration(y, settle),
+        "modified": bond.modified_duration(y, settle), "convexity": bond.convexity(y, settle),
+        "dv01": bond.dv01(y, settle, notional), "z_spread_bp": z * 1e4, "notional": notional}])}  # fmt: skip
     if not govt.quotes:
         st.info("Key-rate risk needs a Treasury curve bootstrapped from quotes.")
     else:
@@ -563,4 +572,14 @@ def _bond_calculator(market: Market) -> List[Position]:
             f"ladder sums to {_num(sum(r['pv01'] for r in rows))} against a parallel curve PV01 of {_num(pv01)} "
             f"and a yield DV01 of {_num(bond.dv01(y, settle, notional))}."
         )
+        tables["key_rate_pv01"] = ladder
+    rates_exports.export_row(
+        "bond", market, tables,
+        {"bond": {"coupon": bond.coupon, "maturity": bond.maturity, "dated": bond.dated, "frequency": bond.frequency,
+                  "day_count": bond.day_count, "calendar": bond.calendar}, "notional": notional, "settle": settle,
+         "clean_price": clean},
+        {"yield": "street convention", "curve": "US Treasury par curve bootstrapped, z-spread continuously "
+         "compounded over its zero rates", "risk": "+/-1bp per Treasury quote, curve rebuilt"},
+        key="bond_export",
+    )  # fmt: skip
     return [position]

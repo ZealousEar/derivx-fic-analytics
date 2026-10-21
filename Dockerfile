@@ -49,7 +49,8 @@ RUN python -m pip install --user "pytest>=8,<10" \
         "tests/test_deploy.py::test_a_server_on_the_committed_config_refuses_tokenless_uploads_and_foreign_origins" \
         tests/test_pricer_page.py tests/test_fx_page.py tests/test_analytics_lab.py tests/test_walkforward_tab.py \
         tests/test_ui_state.py tests/test_plot_limits.py tests/test_swaps.py tests/test_capfloor.py \
-        tests/test_bonds.py tests/test_scenarios.py
+        tests/test_bonds.py tests/test_scenarios.py tests/test_rates_data_ui.py tests/test_rates_multicurve_ui.py \
+        tests/test_rates_swaption_ui.py tests/test_rates_research_ui.py tests/test_rates_book_ui.py
 
 FROM app AS runtime
 

@@ -56,6 +56,9 @@ dependencies = [
   "yfinance>=0.2.66,<2"
 ]
 
+[project.scripts]
+derivx = "derivx.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8,<10",

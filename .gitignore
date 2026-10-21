@@ -26,6 +26,7 @@ venv/
 !.streamlit/config.toml
 
 # Data outputs
+data/cache/
 data/**/*.parquet
 data/**/*.feather
 data/**/*.pkl
