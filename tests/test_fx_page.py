@@ -233,6 +233,29 @@ def test_edited_quotes_reprice_and_bad_rows_are_reported():
     assert not any("Quote row" in e.value for e in at.error)
 
 
+@pytest.mark.parametrize("atm, ok", [(0.0, False), (-5.0, False), (300.0, True), (300.5, False), (7.5, True)])
+def test_atm_quote_bounds_are_stated_exactly(atm, ok):
+    """Final review: an ATM of 0 was refused with 'must be between 0 and 300'."""
+
+    from derivx.ui.fx_page import parse_quote_rows
+
+    frame = pd.DataFrame(
+        {
+            "TENOR": ["3M"],
+            "ATM (%)": [atm],
+            "RR25 (%)": [-0.2],
+            "BF25 (%)": [0.1],
+            "RR10 (%)": [None],
+            "BF10 (%)": [None],
+        }
+    )
+    (row,) = parse_quote_rows(get_pair("EURUSD"), dt.date(2026, 10, 20), frame)
+    if ok:
+        assert row.error is None and row.quote is not None
+    else:
+        assert row.error == f"3M: ATM must be above 0 and at most 300 vol points (7.5 = 7.5%), got {atm:g}"
+
+
 def test_editor_changes_are_merged_idempotently():
     base = pd.DataFrame({"TENOR": ["1M", "3M"], "ATM (%)": [7.0, 7.5], "RR25 (%)": [-0.2, -0.3]})
     state = {"edited_rows": {"1": {"ATM (%)": 8.0, "TENOR": "9Y"}, "0": {"RR25 (%)": None}}, "added_rows": [{}]}

@@ -95,6 +95,22 @@ def test_every_tab_renders_on_the_bundled_sample_without_network(no_network):
     assert at.session_state["market_chain_meta"]["ticker"] == "SPY"
 
 
+def test_filters_that_remove_every_quote_are_named_on_the_other_tabs(no_network):
+    """Final review: with a chain loaded but every quote filtered out, the
+    calibration and comparison tabs said 'Load a chain on the Market Data tab'."""
+
+    at = _lab()
+    at.number_input(key="lab_minvol").set_value(10**9).run()
+    assert not at.exception
+    assert any("liquidity filters removed every quote" in w.value for w in at.warning)
+    infos = [i.value for i in at.info]
+    for task in ("to calibrate.", "to compare models."):
+        assert any(
+            i.startswith("No usable chain") and "loosen its liquidity filters" in i and i.endswith(task) for i in infos
+        )
+    assert not any("Load a chain on the Market Data tab" in i for i in infos)
+
+
 def test_calibration_defaults_skip_expired_slices_and_export_a_manifest():
     at = _lab()
     sel = next(m for m in at.multiselect if m.label == "Expiries")

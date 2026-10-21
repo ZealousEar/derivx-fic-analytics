@@ -241,6 +241,25 @@ def test_pasted_quotes_replace_the_illustrative_grid_until_reset(app):
     assert "ILLUSTRATIVE" in _in_use(app)
 
 
+@pytest.mark.parametrize(
+    "pasted",
+    ["expiry,tenor,offset_bp,vol\n1Y,5Y,0,100\n", "expiry,tenor,ATM\n1Y,5Y,100\n2Y,5Y,97\n1Y,10Y,95\n2Y,10Y,92\n"],
+)
+def test_an_atm_only_grid_prices_on_a_flat_smile_and_says_so(app, pasted):
+    """Final review: an ATM-only vol grid (a common upload) used to crash the
+    tab with AttributeError ('SmileFit' has no 'expiry') when it reported
+    the point's flat smile, taking every later RATES tab down with it."""
+
+    app.text_area(key="swn_grid_paste").input(pasted).run()
+    app.button(key="swn_grid_paste_use").click().run()
+    _assert_contract(app)
+    assert _in_use(app) == "Vol quotes in use: uploaded: pasted quotes."
+    assert _metric(app, "VOL (BP)") == pytest.approx(100.0, abs=1e-6)
+    assert any(w.value.startswith("1Yx5Y: flat (1 usable strike(s)") for w in app.warning), [
+        w.value for w in app.warning
+    ]
+
+
 def test_swaptions_flow_into_the_scenarios_of_the_full_app():
     at = AppTest.from_file(str(FULL_APP), default_timeout=600)
     at.run()

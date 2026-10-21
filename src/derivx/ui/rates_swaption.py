@@ -601,7 +601,8 @@ def render(market: Market) -> List[Position]:
                 f"{check['negative_offsets_bp'][0]:.0f} to {check['negative_offsets_bp'][-1]:.0f}bp."
             )
         if point.status != "fitted":
-            st.warning(f"{point.expiry}x{point.tenor}: {point.status} ({point.message})")
+            note = f" ({point.message})" if point.message else ""
+            st.warning(f"{ui['expiry']}x{ui['tenor']}: {point.status}{note}")
     else:
         st.caption(
             f"{ui['expiry']}x{ui['tenor']} is between quoted points: the smile is the cube's interpolation "

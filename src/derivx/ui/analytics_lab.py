@@ -736,7 +736,7 @@ def _calibration_tables(result: ChainCalibration) -> Dict[str, pd.DataFrame]:
 def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
     st.markdown("### / PRODUCTION CALIBRATION")
     if ctx is None:
-        st.info("Load a chain on the Market Data tab to calibrate.")
+        st.info("No usable chain: load one on the Market Data tab, or loosen its liquidity filters, to calibrate.")
         return
     prov, report, chain = ctx["provenance"], ctx["report"], ctx["chain"]
     _banner(prov, extra=[f"filters {ctx['filters']}"])
@@ -1182,7 +1182,7 @@ def _model_params(comp: ModelComparison) -> pd.DataFrame:
 def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
     st.markdown("### / MODEL COMPARISON")
     if ctx is None:
-        st.info("Load a chain on the Market Data tab to compare models.")
+        st.info("No usable chain: load one on the Market Data tab, or loosen its liquidity filters, to compare models.")
         return
     prov, report, chain = ctx["provenance"], ctx["report"], ctx["chain"]
     _banner(prov, extra=[f"filters {ctx['filters']}"])
