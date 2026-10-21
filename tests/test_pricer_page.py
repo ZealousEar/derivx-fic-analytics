@@ -220,8 +220,83 @@ def test_surface_domain_scales_with_vol_and_time_not_a_fixed_box():
     surf = _charts(at)["surface"]
     y = _arr(surf["data"][0]["y"])
     assert y[0] == 0.0 and y[-1] == pytest.approx(0.25)
-    assert "TIME TO EXPIRY" in surf["layout"]["scene"]["yaxis"]["title"]["text"]
+    # the axis title is short so it fits a phone (UIE-09); the hover names the axis in full
+    assert surf["layout"]["scene"]["yaxis"]["title"]["text"] == "T (YEARS)"
+    assert "TIME TO EXPIRY (YEARS)" in surf["data"][0]["hovertemplate"]
     assert surf["layout"]["scene"]["aspectmode"] == "manual"  # still bound_scene-bounded
+
+
+# Extent of the drawn default view of the risk surface (box, ticks and axis titles), measured in Chromium on the
+# app's own chart: from the canvas centre, the left-most lit pixel sits at LEFT_EXTENT[0] * canvas height +
+# LEFT_EXTENT[1] px (canvas heights 240 to 500 px, every axes / SHOW / CALL-PUT choice, spot 0.05 to 1e6; the right
+# side reaches less far). It holds for the camera, aspect ratio and axis titles pinned below; re-measure if they
+# change. The old fixed 560 px height put the left edge 37 px past a 358 px wide (390 px phone) canvas.
+LEFT_EXTENT = (0.354, 39.0)
+LABEL_ROOM = 8.0  # px kept free at the canvas edge
+
+
+def _surface_canvas(width: float) -> float:
+    """Canvas height of the risk surface at a chart ``width`` (px), as
+    PAGE_CSS sizes its container and the figure's margins take their share."""
+
+    from derivx.ui.pricer_page import SURFACE_HEIGHT, SURFACE_MARGIN, SURFACE_MIN_ASPECT
+
+    return min(width / SURFACE_MIN_ASPECT, SURFACE_HEIGHT) - SURFACE_MARGIN["t"] - SURFACE_MARGIN["b"]
+
+
+def test_risk_surface_fits_its_axis_labels_at_phone_width(monkeypatch):
+    """UIE-09: at 390 px the 560 px tall 3D surface cut off its z-axis title,
+    the z ticks and the end spot ticks. The orthographic view's visible
+    width scales with the canvas's width / height, so the chart now fills a
+    container that PAGE_CSS keeps at a minimum width / height."""
+
+    import streamlit as st
+
+    from derivx.ui.pricer_page import DEFAULT_CAMERA, PAGE_CSS, SURFACE_HEIGHT, SURFACE_MIN_ASPECT
+
+    calls = []
+    draw = st.plotly_chart
+
+    def spy(fig, *args, **kwargs):
+        calls.append((fig, kwargs))
+        return draw(fig, *args, **kwargs)
+
+    monkeypatch.setattr(st, "plotly_chart", spy)
+    at = _app()
+    for axes in ("SPOT × VOL", "SPOT × TIME TO EXPIRY"):
+        at.radio(key="eq_surf_axes").set_value(axes).run()
+        assert not at.exception
+        fig, kwargs = [(f, k) for f, k in calls if f.layout.meta["chart"] == "surface"][-1]
+        assert kwargs["width"] == "stretch" and kwargs["height"] == "stretch"  # the chart fills its container
+        # ... the keyed container that PAGE_CSS sizes
+        assert fig.layout.height == SURFACE_HEIGHT  # only the fallback without the CSS
+        scene = fig.layout.scene
+        # what LEFT_EXTENT was measured with
+        assert scene.camera.eye.to_plotly_json() == DEFAULT_CAMERA["eye"] == {"x": 1.6, "y": 1.6, "z": 1.2}
+        assert scene.camera.projection.type == "orthographic"
+        assert scene.aspectratio.to_plotly_json() == {"x": 1.0, "y": 1.0, "z": 0.9}
+        assert len(scene.yaxis.title.text) <= len("VOL (decimal)")  # "TIME TO EXPIRY (YEARS)" reached past
+        assert len(scene.zaxis.title.text) <= len("CALL GAMMA") and scene.xaxis.title.text == "SPOT"
+    rule = f".st-key-eq_surface_box {{ aspect-ratio:{SURFACE_MIN_ASPECT}; max-height:{SURFACE_HEIGHT}px; }}"
+    assert rule in PAGE_CSS and any(rule in m.value for m in at.markdown)
+
+    def blocks(node):
+        for child in getattr(node, "children", {}).values():
+            yield child
+            yield from blocks(child)
+
+    box = [b for b in blocks(at._tree) if getattr(getattr(b, "proto", None), "id", "").endswith("-eq_surface_box")]
+    assert len(box) == 1
+    charts = [json.loads(e.proto.spec)["layout"]["meta"]["chart"] for e in blocks(box[0]) if hasattr(e.proto, "spec")]
+    assert charts == ["surface"]
+
+    # Every chart width from a 320 px phone (288 px of chart) to a wide screen leaves the labels LABEL_ROOM px.
+    for width in range(288, 1601):
+        left = LEFT_EXTENT[0] * _surface_canvas(width) + LEFT_EXTENT[1]
+        assert left <= width / 2 - LABEL_ROOM, width
+    # the old fixed height (canvas 500 px at every width) failed on a 390 px phone
+    assert LEFT_EXTENT[0] * 500 + LEFT_EXTENT[1] > 358 / 2
+    assert _surface_canvas(820) == 500  # a wide screen keeps the 560 px chart
 
 
 def _figures(at: AppTest) -> list:

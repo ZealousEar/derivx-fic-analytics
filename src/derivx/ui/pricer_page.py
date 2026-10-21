@@ -120,6 +120,18 @@ MODES: Dict[str, ModeSpec] = {
     ),
 }
 
+# The 3D risk surface is orthographic: Plotly fixes the visible height of the
+# scene and scales its visible width with the canvas's width / height, so a
+# tall, narrow canvas cuts off the left and right of the default view (the
+# z-axis title and ticks, the end spot ticks; UIE-09). The chart therefore
+# fills a container whose CSS (in PAGE_CSS) keeps width / height at
+# SURFACE_MIN_ASPECT up to SURFACE_HEIGHT px: 560 px tall from 504 px of
+# width up, 320 px tall at 288 px (a 320 px phone). tests/test_pricer_page.py
+# checks the ratio against the labels' extent measured in Chromium.
+SURFACE_HEIGHT = 560  # px, chart height on a wide screen
+SURFACE_MIN_ASPECT = 0.9  # chart width / height below SURFACE_HEIGHT * SURFACE_MIN_ASPECT px of width
+SURFACE_MARGIN = dict(l=0, r=0, t=10, b=50)  # px; the colour bar sits in the bottom margin
+
 PAGE_CSS = """
 <style>
 .dx-hero { background:#FFFFFF; color:#000000; border:4px solid #000000; padding:2.2rem 1.25rem 1.25rem;
@@ -144,8 +156,14 @@ PAGE_CSS = """
 .dx-greek-sub { margin-top:0.2rem; }
 .dx-badge { display:inline-block; padding:2px 8px; font-weight:700; font-size:0.75rem; letter-spacing:0.1em;
   border:2px solid currentColor; margin-right:0.5rem; }
-</style>
 """
+PAGE_CSS += (
+    "".join(
+        f".st-key-{s.prefix}_surface_box {{ aspect-ratio:{SURFACE_MIN_ASPECT}; max-height:{SURFACE_HEIGHT}px; }}\n"
+        for s in MODES.values()
+    )
+    + "</style>\n"
+)
 
 
 def _k(spec: ModeSpec, name: str) -> str:
@@ -455,6 +473,7 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
     grid = calc.surface_grid(inp, axes, z_label, n=int(n), n_sd=float(n_sd))
     kind = "CALL" if inp.call else "PUT"
     y_title = "VOL (decimal)" if axes == calc.SURFACE_AXES[0] else "TIME TO EXPIRY (YEARS)"
+    y_axis_title = "VOL (decimal)" if axes == calc.SURFACE_AXES[0] else "T (YEARS)"  # short, to fit a phone
     z_title = f"{kind} {z_label}"
     fig = go.Figure(
         data=[
@@ -496,7 +515,7 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
         bgcolor="#000000",
         dragmode="turntable",
         xaxis=dict(title=dict(text="SPOT", font=dict(color=FOREGROUND)), range=[grid.x[0], grid.x[-1]], **axis),
-        yaxis=dict(title=dict(text=y_title, font=dict(color=FOREGROUND)), range=[grid.y[0], grid.y[-1]], **axis),
+        yaxis=dict(title=dict(text=y_axis_title, font=dict(color=FOREGROUND)), range=[grid.y[0], grid.y[-1]], **axis),
         zaxis=dict(title=dict(text=z_title, font=dict(color=FOREGROUND)), range=[z_lo - pad, z_hi + pad], **axis),
     )
     # The camera is always the default view; Plotly keeps the user's rotation
@@ -511,8 +530,8 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
     fig.update_layout(
         scene=scene,
         paper_bgcolor="#000000",
-        height=560,
-        margin=dict(l=0, r=0, t=10, b=50),
+        height=SURFACE_HEIGHT,  # what the chart falls back to without the container's CSS
+        margin=SURFACE_MARGIN,
         font=dict(color=FOREGROUND, family="Helvetica"),
         showlegend=False,
         uirevision=revision,
@@ -520,7 +539,8 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
     )
     fig.update_scenes(camera_projection_type="orthographic")
     bound_scene(fig, eye=DEFAULT_CAMERA["eye"])
-    st.plotly_chart(fig, width="stretch", key=_k(spec, "surface_3d"), config=PLOTLY_3D_CONFIG)
+    with st.container(key=_k(spec, "surface_box")):  # sized by PAGE_CSS: see SURFACE_MIN_ASPECT
+        st.plotly_chart(fig, width="stretch", height="stretch", key=_k(spec, "surface_3d"), config=PLOTLY_3D_CONFIG)
     unit = "premium in price units" if z_label == "VALUE" else grid.z_unit
     st.caption(f"{z_title} ({unit}) for one option on one unit; the red marker is the current input.")
     if GUARD_AVAILABLE:
