@@ -1,95 +1,239 @@
-"""Utility script to wake the Streamlit Community Cloud app if it is sleeping."""
+"""Wake the Streamlit Community Cloud app and fail unless it actually renders.
+
+An HTTP status cannot tell a live app from a missing one: both
+https://derivx.streamlit.app and a nonexistent ``*.streamlit.app`` answer
+``303`` to share.streamlit.io's auth page, so a ``curl`` check always passes.
+Only a real browser follows that redirect and opens the app's websocket, and
+only such a session counts as traffic that keeps a Community Cloud app
+awake. This script therefore drives headless Chrome:
+
+1. open ``STREAMLIT_APP_URL``;
+2. if Streamlit Cloud shows its sleep page, click "Yes, get this app back up";
+3. wait until the app itself renders: the page or one of its frames (Cloud
+   serves the app in an iframe at ``/~/+/``) shows ``STREAMLIT_APP_MARKER``
+   (default ``NAVIGATION``, the app's sidebar heading);
+4. exit 0 only then. A "not found" page exits 1 at once; a sign-in wall, an
+   app error page or anything else that does not become the app within the
+   timeout exits 1 too, so the workflow run fails when the app is down.
+
+Environment: ``STREAMLIT_APP_URL``, ``STREAMLIT_APP_MARKER``,
+``STREAMLIT_WAKE_TIMEOUT`` (seconds to wait for the app to render, default
+300: waking a sleeping app takes a minute or two), ``STREAMLIT_PAGE_LOAD_TIMEOUT``
+(seconds, default 60), and optionally ``CHROME_BINARY`` / ``CHROMEDRIVER_PATH``
+(otherwise Selenium Manager finds Chrome and a matching driver).
+"""
+
 from __future__ import annotations
 
+import enum
 import os
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable, Optional, Protocol, Sequence, Tuple
 
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+DEFAULT_URL = "https://derivx.streamlit.app/"
+DEFAULT_MARKER = "NAVIGATION"
+WAKE_BUTTON_TEXT = "Yes, get this app back up"
+WAKE_BUTTON_XPATH = f"//button[contains(., '{WAKE_BUTTON_TEXT}')]"
 
-STREAMLIT_URL = os.environ.get("STREAMLIT_APP_URL", "https://derivx.streamlit.app/")
-WAKE_BUTTON_XPATH = "//button[contains(text(),'Yes, get this app back up')]"
-WAIT_SECONDS = int(os.environ.get("STREAMLIT_WAKE_WAIT", "20"))
-# Paths optionally provided by the CI setup-chrome step so the chromedriver
-# always matches the installed browser. When unset, Selenium Manager (bundled
-# with Selenium >= 4.6) resolves a matching driver automatically.
-CHROME_BINARY = os.environ.get("CHROME_BINARY")
-CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH")
-PAGE_LOAD_TIMEOUT = int(os.environ.get("STREAMLIT_PAGE_LOAD_TIMEOUT", "60"))
+# Page texts of Streamlit Community Cloud, matched case-insensitively.
+NOT_FOUND_TEXTS = ("you do not have access to this app or it does not exist",)
+APP_ERROR_TEXTS = (
+    "error running app",
+    "this app has encountered an error",
+    "traceback (most recent call last)",
+    "error installing requirements",
+)
+BOOTING_TEXTS = ("your app is in the oven", "spinning up", "please wait")
+SIGN_IN_TEXTS = ("sign in to continue", "please sign in")
 
 
-@dataclass
+class State(str, enum.Enum):
+    """What the browser shows. Only ``UP`` is healthy."""
+
+    UP = "up"
+    ASLEEP = "asleep"
+    BOOTING = "booting"
+    NOT_FOUND = "not_found"
+    SIGN_IN = "sign_in"
+    APP_ERROR = "app_error"
+    UNKNOWN = "unknown"
+
+
+FATAL = (State.NOT_FOUND,)  # waiting will not change this; a sign-in wall may be a transient redirect
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """The browser's current URL and the visible text of the page and of each
+    of its iframes."""
+
+    url: str
+    texts: Tuple[str, ...]
+
+
+def classify(snap: Snapshot, marker: str = DEFAULT_MARKER) -> State:
+    """State of the app from one snapshot. An error page or traceback wins
+    over the marker (a crashed script can still draw its sidebar)."""
+
+    text = "\n".join(snap.texts)
+    low = text.lower()
+    if "/errors/not_found" in snap.url or any(t in low for t in NOT_FOUND_TEXTS):
+        return State.NOT_FOUND
+    if WAKE_BUTTON_TEXT.lower() in low:
+        return State.ASLEEP
+    if any(t in low for t in APP_ERROR_TEXTS):
+        return State.APP_ERROR
+    if marker and marker in text:
+        return State.UP
+    if any(t in low for t in BOOTING_TEXTS):
+        return State.BOOTING
+    if any(t in low for t in SIGN_IN_TEXTS):
+        return State.SIGN_IN
+    return State.UNKNOWN
+
+
+class Page(Protocol):
+    def open(self, url: str) -> None: ...
+
+    def snapshot(self) -> Snapshot: ...
+
+    def click_wake(self) -> bool: ...
+
+
+@dataclass(frozen=True)
 class WakeResult:
-    status: int
+    status: int  # process exit code: 0 only when the app rendered
+    state: State
+    woke: bool
     message: str
 
 
-def configure_driver() -> webdriver.Chrome:
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    if CHROME_BINARY:
-        options.binary_location = CHROME_BINARY
-    # Prefer an explicit chromedriver path (from CI); otherwise let Selenium
-    # Manager download a driver that matches the installed Chrome.
-    service = Service(executable_path=CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else Service()
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    return driver
+def check_app(
+    page: Page,
+    url: str = DEFAULT_URL,
+    marker: str = DEFAULT_MARKER,
+    timeout: float = 300.0,
+    poll: float = 5.0,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WakeResult:
+    """Open ``url``, wake the app if it sleeps, and wait up to ``timeout``
+    seconds for it to render ``marker``."""
+
+    if not url:
+        return WakeResult(1, State.UNKNOWN, False, "STREAMLIT_APP_URL is empty")
+    page.open(url)
+    deadline = clock() + timeout
+    woke = False
+    state = State.UNKNOWN
+    snap = Snapshot(url, ())
+    while True:
+        snap = page.snapshot()
+        state = classify(snap, marker)
+        if state is State.UP:
+            how = "after waking it" if woke else "already awake"
+            return WakeResult(0, state, woke, f"App rendered ({how}): found {marker!r} at {snap.url}")
+        if state in FATAL:
+            return WakeResult(1, state, woke, f"App is not reachable ({state.value}) at {snap.url}")
+        if state is State.ASLEEP and not woke:
+            woke = page.click_wake()
+            print("Sleep page found; " + ("clicked the wake button." if woke else "the wake button is not clickable."))
+        if clock() >= deadline:
+            last = f"last state {state.value} at {snap.url}"
+            return WakeResult(1, state, woke, f"App did not render {marker!r} within {timeout:.0f}s; {last}")
+        sleep(poll)
 
 
-def wake_streamlit_app() -> WakeResult:
-    try:
-        driver = configure_driver()
-    except Exception as exc:  # pylint: disable=broad-except
-        return WakeResult(1, f"Failed to start Chrome WebDriver: {exc}")
+class SeleniumPage:
+    """:class:`Page` on headless Chrome (Selenium imported only here, so the
+    logic above is testable without a browser)."""
 
-    try:
-        print(f"Opening {STREAMLIT_URL}")
-        driver.get(STREAMLIT_URL)
-        wait = WebDriverWait(driver, WAIT_SECONDS)
+    def __init__(
+        self, page_load_timeout: float = 60.0, binary: Optional[str] = None, driver_path: Optional[str] = None
+    ) -> None:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+
+        options = Options()
+        for arg in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"):
+            options.add_argument(arg)
+        options.add_argument("--window-size=1920,1080")
+        if binary:
+            options.binary_location = binary
+        service = Service(executable_path=driver_path) if driver_path else Service()
+        self.driver = webdriver.Chrome(service=service, options=options)
+        self.driver.set_page_load_timeout(page_load_timeout)
+
+    def open(self, url: str) -> None:
+        self.driver.get(url)
+
+    def _body_text(self) -> str:
+        from selenium.common.exceptions import WebDriverException
+        from selenium.webdriver.common.by import By
 
         try:
-            button = wait.until(EC.element_to_be_clickable((By.XPATH, WAKE_BUTTON_XPATH)))
-        except TimeoutException:
-            return WakeResult(0, "Wake button not found; app is likely already awake.")
+            return self.driver.find_element(By.TAG_NAME, "body").text
+        except WebDriverException:
+            return ""
 
-        print("Wake button located. Clicking...")
-        button.click()
+    def snapshot(self) -> Snapshot:
+        from selenium.common.exceptions import WebDriverException
+        from selenium.webdriver.common.by import By
+
+        texts = [self._body_text()]
+        for i in range(len(self.driver.find_elements(By.TAG_NAME, "iframe"))):
+            try:
+                self.driver.switch_to.frame(self.driver.find_elements(By.TAG_NAME, "iframe")[i])
+                texts.append(self._body_text())
+            except (WebDriverException, IndexError):
+                pass
+            finally:
+                self.driver.switch_to.default_content()
+        return Snapshot(self.driver.current_url, tuple(texts))
+
+    def click_wake(self) -> bool:
+        from selenium.common.exceptions import WebDriverException
+        from selenium.webdriver.common.by import By
 
         try:
-            wait.until(EC.invisibility_of_element_located((By.XPATH, WAKE_BUTTON_XPATH)))
-            return WakeResult(0, "Wake button clicked and disappeared; app should be waking up.")
-        except TimeoutException:
-            return WakeResult(1, "Wake button clicked but did not disappear; manual check required.")
+            buttons = self.driver.find_elements(By.XPATH, WAKE_BUTTON_XPATH)
+            if not buttons:
+                return False
+            buttons[0].click()
+            return True
+        except WebDriverException:
+            return False
 
-    except Exception as exc:  # pylint: disable=broad-except
-        return WakeResult(1, f"Unexpected error: {exc}")
-    finally:
-        # Give the app a moment to start before closing the browser to avoid cutting the request short.
-        time.sleep(2)
-        driver.quit()
+    def close(self) -> None:
+        self.driver.quit()
 
 
-def main() -> int:
-    if not STREAMLIT_URL:
-        print("STREAMLIT_APP_URL is not set.")
+def main(argv: Sequence[str] = ()) -> int:
+    url = os.environ.get("STREAMLIT_APP_URL", DEFAULT_URL)
+    marker = os.environ.get("STREAMLIT_APP_MARKER", DEFAULT_MARKER)
+    timeout = float(os.environ.get("STREAMLIT_WAKE_TIMEOUT", "300"))
+    try:
+        page = SeleniumPage(
+            float(os.environ.get("STREAMLIT_PAGE_LOAD_TIMEOUT", "60")),
+            os.environ.get("CHROME_BINARY"),
+            os.environ.get("CHROMEDRIVER_PATH"),
+        )
+    except Exception as exc:  # noqa: BLE001 - any driver start-up failure is a failed check
+        print(f"Failed to start Chrome WebDriver: {exc}")
         return 1
-
-    result = wake_streamlit_app()
+    try:
+        print(f"Opening {url}")
+        result = check_app(page, url, marker, timeout)
+    except Exception as exc:  # noqa: BLE001 - report, do not hide, a browser failure
+        result = WakeResult(1, State.UNKNOWN, False, f"Browser error: {exc}")
+    finally:
+        page.close()
     print(result.message)
     return result.status
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
