@@ -54,9 +54,9 @@
         "model": "svi",
         "slices": 29,
         "failed": 0,
-        "median_rmse_cv_bp": 5.099698940393061,
-        "mean_rmse_cv_bp": 9.325277440640638,
-        "max_rmse_cv_bp": 52.34262731966634,
+        "median_rmse_cv_bp": 5.099700441559445,
+        "mean_rmse_cv_bp": 9.325345256456224,
+        "max_rmse_cv_bp": 52.34197037175561,
         "best_on": 1
       },
       {
@@ -84,14 +84,14 @@
         "a_better": 25,
         "b_better": 4,
         "ties": 0,
-        "median_diff": -10.637378543627918
+        "median_diff": -10.63737843851018
       },
       "svi_vs_spline": {
         "slices": 29,
         "a_better": 1,
         "b_better": 28,
         "ties": 0,
-        "median_diff": 3.2357914801279235
+        "median_diff": 3.2357910290932623
       },
       "sabr_vs_spline": {
         "slices": 29,
@@ -109,8 +109,8 @@
   },
   "calibration": {
     "slices": 29,
-    "median_rmse_bp": 5.958119906960052,
-    "max_rmse_bp": 41.96788961981347,
+    "median_rmse_bp": 5.958119905683825,
+    "max_rmse_bp": 41.96790947723279,
     "butterfly_ok": "29 of 29",
     "lee_ok": "29 of 29",
     "calendar_ok": "25 of 28 adjacent expiry pairs",
