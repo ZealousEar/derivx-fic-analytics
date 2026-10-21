@@ -462,3 +462,50 @@ def test_synthetic_rows_are_labelled_even_under_a_file_name():
     banner = _banners(at)[0]
     assert "source: upload: my_chain.csv" in banner and "SYNTHETIC ROWS: not market data" in banner
     assert "dx-lab-banner synthetic" in banner
+
+
+def test_a_shared_calibration_is_keyed_on_the_discount_factors_not_their_description():
+    """Follow-up review: the cross-session calibration store (B3) keyed a run on
+    Discounting.describe(), which names a curve by date, label and pillar count
+    only: a store refreshed with revised yields for the same day and source
+    would have been answered with the calibration of the old discount factors."""
+
+    from derivx.vol.discounting import CurveDiscount, Discounting
+
+    def discounting(df5: float) -> Discounting:
+        curve = CurveDiscount(pd.Timestamp("2026-10-20").date(), (0.0, 1.0, 5.0), (1.0, 0.96, df5), "loglinear",
+                              "US Treasury par curve of 2026-10-20 (FRED), bootstrapped")  # fmt: skip
+        return Discounting("curve", 0.0, (("2026-10-20", curve),))
+
+    old, revised = discounting(0.82), discounting(0.8200001)
+    assert old.describe() == revised.describe()  # what data_key and settings_key see
+    key = lab._calibration_key("data", "settings", old)
+    assert key != lab._calibration_key("data", "settings", revised)
+    assert key == lab._calibration_key("data", "settings", discounting(0.82))  # same curve: same stored run
+
+
+def test_a_revised_treasury_curve_of_the_same_day_and_source_is_calibrated_again(monkeypatch):
+    """The same, end to end: Calibrate twice on identical quotes and settings
+    reuses the stored run, but not once the Treasury curve of that day (same
+    label) has moved."""
+
+    from dataclasses import replace
+
+    lab._calibration_store.clear()
+    runs = []
+    real_calibrate, real_curves = lab.calibrate_chain, lab._treasury_curves
+    monkeypatch.setattr(lab, "calibrate_chain", lambda *a, **k: runs.append(1) or real_calibrate(*a, **k))
+    at = _lab()
+    at.selectbox(key="lab_discount").set_value("curve").run()
+    for _ in range(2):
+        at.button(key="lab_cal_run").click().run()
+    assert not at.exception and len(runs) == 1  # identical inputs: the stored run
+
+    def revised(signature, days):
+        return tuple((day, replace(c, dfs=tuple(d * (1 - 1e-4 * t) for d, t in zip(c.dfs, c.times))))
+                     for day, c in real_curves(signature, days))  # fmt: skip
+
+    monkeypatch.setattr(lab, "_treasury_curves", revised)
+    at.run()
+    at.button(key="lab_cal_run").click().run()
+    assert not at.exception and len(runs) == 2
