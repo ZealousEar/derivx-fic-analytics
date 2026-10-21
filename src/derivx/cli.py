@@ -139,8 +139,8 @@ def _summary(fetched: rs.Fetched, show: int) -> str:
                 f"last {latest['value_original']:g} {latest['unit_original']} ({latest['measure']})"
             )
     lines += [f"  note: {n}" for n in fetched.notices]
-    if show and len(frame):
-        lines.append(frame.tail(show).to_string(index=False))
+    if show and len(frame):  # the latest N rows, whatever order the source returned them in
+        lines.append(frame.sort_values("asof", kind="stable").tail(show).to_string(index=False))
     return "\n".join(lines)
 
 
@@ -852,7 +852,11 @@ def _scenario(args: argparse.Namespace) -> int:
     shocks = [sc.add_fx(dc_replace(s, **settings), args.fx_move or {}) for s in shocks]
     asof = books[0].market.asof
     reporting = _reporting(args, asof)
-    parts, failed, skipped, vol_inputs, vol_sources = [], {}, 0, {}, {}
+    parts: List[tuple] = []
+    failed: Dict[str, str] = {}  # shock name -> reason it could not be applied
+    skipped = 0
+    vol_inputs: Dict[str, object] = {}
+    vol_sources: Dict[str, object] = {}
     for book in books:
         vols, inputs = _vols(args, book.market, book.trades)
         vol_inputs[book.currency or ""] = inputs

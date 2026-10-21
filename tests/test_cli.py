@@ -86,6 +86,14 @@ def test_pull_every_source(online, tmp_path, capsys, argv, expect):
     assert expect in capsys.readouterr().out
 
 
+def test_pull_show_prints_the_latest_rows(online, tmp_path, capsys):
+    # NY Fed returns newest first; --show N must still print the last N dates.
+    assert cli.main(["pull", "nyfed", "--rate", "sofr", "--last", "3", "--show", "1", "--cache", str(tmp_path)]) == 0
+    table = capsys.readouterr().out.strip().splitlines()[-1]
+    frame = rs.nyfed_rate("sofr", last_n=3, offline=True, cache=rs.DiskCache(tmp_path)).frame
+    assert str(max(frame["asof"])) in table and str(min(frame["asof"])) not in table
+
+
 def test_pull_errors(tmp_path, capsys):
     assert cli.main(["pull", "fred", "--ids", "DGS10", "--offline", "--cache", str(tmp_path)]) == cli.EXIT_SOURCE_ERROR
     assert "offline: no cached FRED data" in capsys.readouterr().err
