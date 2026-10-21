@@ -120,6 +120,27 @@ TICKER_RE = re.compile(r"^[A-Z0-9.^=\-]{1,15}$")
 SESSION_RE = re.compile(r"^(?P<ticker>[A-Z0-9.^=\-]{1,15})_(?P<session>\d{4}-\d{2}-\d{2})\.csv\.gz$")
 
 
+BRANCH_README = """# data-snapshots
+
+Daily option-chain snapshots for DerivX, one file per trading session, written by the scheduled workflow
+`.github/workflows/collect-data.yml` on the default branch (`derivx snapshots collect`). Append-only: a
+stored session is never rewritten.
+
+- `options/index.csv`: one row per file (session, ticker, rows, expiries, sha256, bytes, fetched_at, spot,
+  status, path).
+- `options/<TICKER>/<YYYY>/<TICKER>_<session>.csv.gz`: the quotes in the compact storage schema of
+  `derivx.data.snapshots` (expiries 1-730 days, strikes 0.4-1.6 x spot, Yahoo's implied vol rounded to 1e-5;
+  bids, asks, strikes, volumes and times as published).
+- `options/<TICKER>/<YYYY>/<TICKER>_<session>.json`: the manifest (fetch status with the real fetch time,
+  spot and its time, retries, compaction counts, SHA-256, code and package versions).
+
+Read it with `derivx snapshots sync` (or the ANALYTICS lab's Collected history source).
+
+Source: Yahoo Finance delayed quotes via yfinance. Yahoo's terms of use apply (personal and research use);
+the files are kept for reproducible research and are not market data for trading.
+"""
+
+
 class SnapshotError(RuntimeError):
     """A store or a sync could not be read or written (the message says why)."""
 
@@ -517,22 +538,25 @@ class SnapshotStore:
         their manifest's SHA-256 before they are copied."""
 
         out: List[Tuple[str, str, str]] = []
-        rows = []
-        for rel, manifest in other.manifests():
+        todo = []
+        for rel, manifest in other.manifests():  # check everything before anything is written
             ticker, session = str(manifest["ticker"]), str(manifest["session"])
-            target = self.file(rel)
-            if target.exists():
+            if self.file(rel).exists():
                 out.append((ticker, session, "kept"))
                 continue
             data = other.file(rel).read_bytes()
             if sha256_hex(data) != manifest.get("sha256"):
-                raise SnapshotError(f"{rel}: its bytes do not match its manifest's SHA-256: not copied")
-            _atomic_write(self.file(manifest_path(rel)), other.file(manifest_path(rel)).read_bytes())
-            _atomic_write(target, data)
-            rows.append(index_row(manifest, str(rel)))
+                raise SnapshotError(f"{rel}: its bytes do not match its manifest's SHA-256: nothing copied")
+            todo.append((rel, manifest, data))
             out.append((ticker, session, "added"))
-        if rows:
-            self._append_rows(rows)
+        for rel, manifest, data in todo:
+            _atomic_write(self.file(manifest_path(rel)), other.file(manifest_path(rel)).read_bytes())
+            _atomic_write(self.file(rel), data)
+        if todo:
+            self._append_rows([index_row(manifest, str(rel)) for rel, manifest, _ in todo])
+            readme = self.root / "README.md"
+            if not readme.exists():
+                _atomic_write(readme, BRANCH_README.encode("utf-8"))
         return out
 
     # -- reading -------------------------------------------------------------

@@ -17,6 +17,12 @@ name: keep-alive
 # schedule is disabled after 60 quiet days and GitHub emails the owner; one
 # click on "Enable workflow" (or `gh workflow enable keep-alive.yml`)
 # restores it. Either way no run reports "alive" for an app that is down.
+#
+# collect-data.yml now adds a data commit to the data-snapshots branch every
+# trading day, which is repository activity too. That does not make this
+# workflow redundant: it is the only check that the hosted app is up, and it
+# keeps its own re-enable step because GitHub does not document whether
+# activity on a branch other than the default one counts for the 60 days.
 
 on:
   schedule:
