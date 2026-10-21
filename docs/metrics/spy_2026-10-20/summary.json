@@ -109,8 +109,8 @@
   },
   "calibration": {
     "slices": 29,
-    "median_rmse_bp": 5.958119905683825,
-    "max_rmse_bp": 41.96790947723279,
+    "median_rmse_bp": 5.958140435295284,
+    "max_rmse_bp": 41.967909673540326,
     "butterfly_ok": "29 of 29",
     "lee_ok": "29 of 29",
     "calendar_ok": "25 of 28 adjacent expiry pairs",
