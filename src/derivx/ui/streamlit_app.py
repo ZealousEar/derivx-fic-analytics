@@ -19,7 +19,7 @@ from derivx.ui.plot_limits import mount_zoom_guard
 from derivx.ui.state import keep_widget_values
 from derivx.ui.theme import apply_app_style
 
-st.set_page_config(page_title="DERIVX / FIC ANALYTICS", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="DERIVX / FIC ANALYTICS", layout="wide", initial_sidebar_state="auto")
 
 # Minimalist mode selector - architectural, no emojis
 st.sidebar.markdown("### / NAVIGATION")

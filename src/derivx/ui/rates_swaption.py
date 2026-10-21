@@ -43,7 +43,15 @@ from derivx.risk.scenarios import theta
 from derivx.risk.sensitivities import Position, rate_pv01_gamma
 from derivx.ui import rates_data, rates_exports, rates_risk
 from derivx.ui.plot_limits import axis_limits, bound_axes
-from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import (
+    ACCENT,
+    CELL_TEXT,
+    DIVERGING_COLORS,
+    PLOTLY_2D_CONFIG,
+    SEQUENTIAL_COLORS,
+    SERIES,
+    dark_layout,
+)
 
 MODEL_LABELS = {"Normal (bp)": "bachelier", "Black (%)": "black", "Shifted Black (%)": "shifted_black"}
 FIT_LABELS = {"Normal SABR (beta 0)": "normal", "Shifted-lognormal SABR (beta 0.5)": "lognormal"}
@@ -271,7 +279,6 @@ def _smile_chart(
         xs.append(trade_offset)
         shown.append(trade_vol)
     dark_layout(fig, height=420, xtitle="STRIKE - ATM FORWARD (BP)", ytitle="NORMAL VOL (BP)")
-    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0), margin=dict(b=100))  # off the curve
     rates_data.badge(fig, source, asof)
     return bound_axes(
         fig,
@@ -289,10 +296,9 @@ def _heatmap(z: np.ndarray, expiries, tenors, title: str, fmt: str, diverging: b
     finite = z[np.isfinite(z)]
     peak = max(float(np.max(np.abs(finite))) if finite.size else 1.0, 1e-12)
     if diverging:
-        scale = [[0.0, ACCENT], [0.5, "#111111"], [1.0, SERIES[2]]]
-        kwargs = dict(colorscale=scale, zmid=0.0, zmin=-peak, zmax=peak, textfont=dict(color=SERIES[0]))
+        kwargs = dict(colorscale=DIVERGING_COLORS, zmid=0.0, zmin=-peak, zmax=peak)
     else:
-        kwargs = dict(colorscale="Viridis")
+        kwargs = dict(colorscale=SEQUENTIAL_COLORS)
     fig = go.Figure(
         go.Heatmap(
             z=z,
@@ -300,6 +306,7 @@ def _heatmap(z: np.ndarray, expiries, tenors, title: str, fmt: str, diverging: b
             y=rows,
             text=[[fmt.format(v) for v in row] for row in z],
             texttemplate="%{text}",
+            textfont=CELL_TEXT,
             hovertemplate="%{y} x %{x}: %{text}<extra></extra>",
             colorbar=dict(title=dict(text=title)),
             **kwargs,

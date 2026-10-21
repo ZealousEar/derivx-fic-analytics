@@ -81,9 +81,9 @@ from derivx.fx.smile import (
 )
 from derivx.ui import pricer_calc as calc
 from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes
-from derivx.ui.pricer_page import PAGE_CSS, PNL_COLORS, ZOOM_HINT
+from derivx.ui.pricer_page import PAGE_CSS, ZOOM_HINT
 from derivx.ui.state import PERSIST
-from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, PNL_COLORS, SEQUENTIAL_COLORS, SERIES, dark_layout
 
 QUOTE_COLUMNS = ("ATM (%)", "RR25 (%)", "BF25 (%)", "RR10 (%)", "BF10 (%)")
 POINTS_COLUMN = "FWD PTS (PIPS)"
@@ -100,9 +100,8 @@ FX_CSS = """
    gamma is EUR 10,336,703); longer values are shortened by _card_money, never cut off */
 .dx-greeks { grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
 .dx-greek-value { font-size: 1.3rem; }
-/* the sidebar captions carry the spot source and as-of date and the ILLUSTRATIVE labels: keep them readable */
-.stSidebar [data-testid="stCaptionContainer"],
-.stSidebar [data-testid="stCaptionContainer"] p { color: #BDBDBD !important; }
+/* the sidebar captions (spot source, as-of date, ILLUSTRATIVE labels) use the dark theme's caption colour:
+   white at 60% opacity, 7.1:1 on black */
 @media (max-width: 640px) {
   .dx-greek-value { font-size: 1.05rem; }
   .dx-greeks { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }
@@ -124,7 +123,6 @@ SHORT_LABELS = {
     "SABR": "SABR (β = 1 FIXED)",
     "VV": "VANNA-VOLGA",
 }
-SURFACE_COLORS = [[0.0, "#003B82"], [0.35, "#35C1FF"], [0.6, "#7FFFD4"], [0.8, "#FFE66D"], [1.0, "#E5243B"]]
 SCENARIO_SPOT_STEPS = calc.SHOCK_STEPS
 SCENARIO_VOL_STEPS = calc.VOL_STEPS
 
@@ -1190,8 +1188,7 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     dark_layout(fig, height=420, xtitle=x_title, ytitle="IMPLIED VOL (%)")
     fig.update_layout(
         hovermode="closest",
-        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.0, font=dict(color=FOREGROUND)),
-        margin=dict(l=60, r=20, t=30, b=100),
+        margin=dict(l=60, r=20, t=30, b=60),  # the legend sits below the x title (theme.LEGEND_BELOW)
     )
     bound_axes(fig, xaxis=x_lim, yaxis=axis_limits(ys, pad=0.15, floor=0.0))
     st.plotly_chart(fig, width="stretch", key=_k("smile_chart"), config=PLOTLY_2D_CONFIG)
@@ -1321,8 +1318,8 @@ def _surface(inp: FxInputs, rows: List[TenorRow]) -> None:
             text=text,
             texttemplate="%{text}",
             customdata=hover_k,
-            textfont=dict(family="IBM Plex Mono", size=8),
-            colorscale=SURFACE_COLORS,
+            textfont=dict(family="IBM Plex Mono", size=8, color=FOREGROUND),
+            colorscale=SEQUENTIAL_COLORS,
             colorbar=dict(
                 title=dict(text="VOL %", side="right"), orientation="h", thickness=10, y=-0.25, yanchor="top"
             ),
@@ -1371,7 +1368,7 @@ def _scenario(inp: FxInputs, sel: Selected, p: Priced) -> None:
             y=y,
             text=[[calc.fmt_compact(v) for v in row] for row in grid.pnl],
             texttemplate="%{text}",
-            textfont=dict(family="IBM Plex Mono", size=10),
+            textfont=dict(family="IBM Plex Mono", size=10, color=FOREGROUND),
             colorscale=PNL_COLORS,
             zmid=0.0,
             colorbar=dict(

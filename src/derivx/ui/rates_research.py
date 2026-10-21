@@ -32,7 +32,7 @@ from derivx.risk.scenarios import vegas as position_vegas
 from derivx.risk.sensitivities import Position
 from derivx.ui import rates_data, rates_exports, rates_risk, rates_scenarios
 from derivx.ui.plot_limits import axis_limits, bound_axes
-from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
 SUBTABS = ("/ RV", "/ CARRY & ROLL", "/ PCA", "/ VAR")
 MEASURES = {
@@ -145,7 +145,7 @@ def _legend_below(fig: go.Figure) -> None:
     """Horizontal legend under the plot, so it never squeezes the plot on a
     narrow screen."""
 
-    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.25, x=0.0), margin=dict(b=120))
+    fig.update_layout(legend=LEGEND_BELOW)  # dark_layout's default; kept for charts styled without it
 
 
 def _times(dates: Sequence[dt.date]) -> np.ndarray:

@@ -35,7 +35,7 @@ from derivx.rates.multicurve import (
 from derivx.rates.quotes import clean_quotes
 from derivx.ui import rates_data, rates_exports
 from derivx.ui.plot_limits import axis_limits, bound_axes
-from derivx.ui.theme import ACCENT, PLOTLY_2D_CONFIG, SERIES, dark_layout
+from derivx.ui.theme import ACCENT, LEGEND_BELOW, PLOTLY_2D_CONFIG, SERIES, dark_layout
 
 SWAP_CURVES = ["USD SOFR", "EUR ESTR", "GBP SONIA"]
 HW_DEFAULTS = (3.0, 85.0)  # mean reversion (% per year), normal short-rate vol (bp per year)
@@ -332,7 +332,7 @@ def _legend_below(fig: go.Figure) -> None:
     """Horizontal legend under the plot, so it never covers the lines on a
     narrow screen."""
 
-    fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0), margin=dict(b=110))
+    fig.update_layout(legend=LEGEND_BELOW)  # dark_layout's default; kept for charts styled without it
 
 
 def _forward_chart(market: Market, source: str) -> go.Figure:
