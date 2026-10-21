@@ -10,6 +10,14 @@
 # exception's type, not a traceback with server paths. Local runs keep
 # Streamlit's default (full details).
 
+[global]
+# derivx.ui.state writes each kept input back onto its key at the start of a
+# run (UIE-04: inputs survive a trip through the other modes), by design for
+# widgets that also pass a default value; without this Streamlit logs a
+# 30-line stack trace once per server process on the first mode round trip,
+# which reads like an error in the server log and says nothing new.
+disableWidgetStateDuplicationWarning = true
+
 [server]
 # Cross-site request forgery and CORS protection stay at Streamlit's safe
 # defaults (on). The app has file uploaders; never turn these off to work

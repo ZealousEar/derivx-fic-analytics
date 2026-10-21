@@ -87,6 +87,21 @@ def test_committed_streamlit_config_keeps_protection_on_and_uses_known_options()
         assert not re.search(r"secret|password|token|apikey|api_key", key, re.IGNORECASE)
 
 
+def test_kept_inputs_written_back_do_not_log_a_stack_trace():
+    """Follow-up review: derivx.ui.state writes every kept input back onto its
+    key (UIE-04), by design also for widgets that pass a default value, and
+    Streamlit logged a 30-line "created with a default value but also had its
+    value set via the Session State API" stack trace in the server log on the
+    first mode round trip of each process. The committed config turns that
+    warning off, and a server started from the repository reads it."""
+
+    assert tomllib.loads(CONFIG.read_text())["global"]["disableWidgetStateDuplicationWarning"] is True
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STREAMLIT_")}
+    code = "from streamlit import config; print(config.get_option('global.disableWidgetStateDuplicationWarning'))"
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    assert out.stdout.strip().splitlines()[-1] == "True", out.stderr
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
