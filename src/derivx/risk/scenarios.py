@@ -34,8 +34,14 @@ each curve's own history where a free one exists: the Treasury curve moves
 by the Treasury's par yield changes, and the swap curve by the swap/OIS
 history of its currency (ICE USD swap rates before 2016-10-28, the Bank of
 England's OIS curve for GBP, or the user's uploaded history), otherwise by a
-flagged proxy (government yield changes, i.e. swap spreads held). Each shock
-records the data behind every curve in ``Shock.sources``.
+flagged proxy (government yield changes, i.e. swap spreads held). FX spots
+move with the ECB euro reference rates of the same dates (``Shock.fx``:
+EURUSD and GBPUSD, from the store's ``FX_ECB`` history; the nearest rates to
+the Treasury curve's start and end dates within the same tolerance), so the
+book's converted totals replay the FX move too; ``fx=False`` holds them,
+and a window the FX history does not cover holds them with a note. Each
+shock records the data behind every curve and the FX spots in
+``Shock.sources``.
 
 FX spot shocks (``Shock.fx``, :func:`fx_spot`, :func:`fx_library`) move
 EURUSD and GBPUSD by a percentage. They move no curve or vol, so every
@@ -43,7 +49,7 @@ position's P&L in its own currency is unchanged; they move the book's
 totals converted to a reporting currency
 (:func:`~derivx.risk.reporting.add_total_columns`, ``scenario_grid(...,
 reporting=...)``: the FX translation of each position's value after the
-scenario). Without an FX shock, FX spots are held.
+scenario). Without an FX shock or an FX replay, FX spots are held.
 
 Multi-curve markets: a shock moves the discount curve (``curve``), the
 projection curves (``projections``, e.g. EURIBOR 3M/6M) and the Treasury
@@ -73,7 +79,14 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from derivx.data.rates_history import EPISODE_TOLERANCE_DAYS, HistoryStore, bundled_store, dataset_info, user_dataset
+from derivx.data.rates_history import (
+    EPISODE_TOLERANCE_DAYS,
+    FX_DATASET,
+    HistoryStore,
+    bundled_store,
+    dataset_info,
+    user_dataset,
+)
 from derivx.rates import pca as pca_mod
 from derivx.rates.conventions import Date, parse_tenor
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Curve, Market
@@ -110,7 +123,8 @@ class ReplaySource:
     ``"<curve field>:<currency>"`` (``"projections:EUR"`` for the projection
     curves), ``flag`` one of ``"real"`` (the curve's own market),
     ``"upload"`` (the user's history), ``"proxy"`` (another market's moves,
-    same currency) or ``"cross-currency proxy"``."""
+    same currency) or ``"cross-currency proxy"``; ``"fx:EURUSD,GBPUSD"`` is
+    the FX spots' (flag ``"real"``, or ``"held"`` when they do not move)."""
 
     selector: str
     dataset: str
@@ -545,8 +559,46 @@ def _swap_move(store: HistoryStore, currency: str, start: dt.date, end: dt.date,
     raise ValueError(f"no {currency} swap-curve or proxy history for {start} to {end}: " + "; ".join(errors))
 
 
+def replay_fx(
+    store: HistoryStore, start: dt.date, end: dt.date, tolerance: int = EPISODE_TOLERANCE_DAYS, scale: float = 1.0
+) -> Tuple[Tuple[Tuple[str, float], ...], ReplaySource]:
+    """(``Shock.fx`` moves, their source): the % moves of EURUSD and GBPUSD
+    between the ECB reference rates nearest ``start`` and ``end`` (within
+    ``tolerance`` days), times ``scale``; no moves (flag ``held``, with the
+    reason) when the store's FX history does not cover both dates."""
+
+    info = dataset_info(FX_DATASET)
+    selector = "fx:" + ",".join(SHOCK_PAIRS)
+    try:
+        d0 = store.nearest(FX_DATASET, start, tolerance)
+        d1 = store.nearest(FX_DATASET, end, tolerance)
+        if d1 <= d0:
+            raise ValueError(f"the window maps to a single ECB rate date ({d0})")
+    except ValueError as exc:
+        note = f"FX spots held: {exc}"
+        return (), ReplaySource(selector, FX_DATASET, info.title, start.isoformat(), end.isoformat(), "held", note)
+    table = store.fx_table()
+    a, b = table.loc[d0], table.loc[d1]
+    eurusd = 100.0 * (b["USD"] / a["USD"] - 1.0) * scale
+    gbpusd = 100.0 * ((b["USD"] / b["GBP"]) / (a["USD"] / a["GBP"]) - 1.0) * scale
+    moves = (("EURUSD", float(eurusd)), ("GBPUSD", float(gbpusd)))
+    note = (
+        f"ECB reference rates {d0} to {d1}: EURUSD {eurusd:+.2f}%, GBPUSD {gbpusd:+.2f}%"
+        + (f" (x{scale:g})" if scale != 1.0 else "")
+        + "; they move the totals converted to the reporting currency, not local P&L"
+    )
+    return moves, ReplaySource(selector, FX_DATASET, info.title, d0.isoformat(), d1.isoformat(), "real", note)
+
+
 def _replay(
-    name: str, start: dt.date, end: dt.date, scale: float, store: Optional[HistoryStore], tolerance: int, settings
+    name: str,
+    start: dt.date,
+    end: dt.date,
+    scale: float,
+    store: Optional[HistoryStore],
+    tolerance: int,
+    settings,
+    fx: bool = True,
 ) -> Shock:
     store = store or bundled_store()
     if not math.isfinite(scale):
@@ -569,24 +621,37 @@ def _replay(
                 )
             )
     label = name if scale == 1.0 else f"{name} x{scale:g}"
+    fx_moves: Tuple[Tuple[str, float], ...] = ()
+    description = f"historical curve changes {start} to {end}, each curve from its own data (see sources)"
+    if fx:
+        fx_moves, fx_source = replay_fx(store, govt.start, govt.end, tolerance, scale)
+        sources.append(fx_source)
+        description += f"; {fx_source.note}"
+    else:
+        description += "; FX spots held (as asked)"
     return _shock(
         label,
         [(y, b * scale) for y, b in govt.profile],
         settings,
-        description=f"historical curve changes {start} to {end}, each curve from its own data (see sources)",
+        description=description,
         profiles=tuple(profiles),
         sources=tuple(sources),
+        fx=fx_moves,
     )
 
 
-def historical(name: str, scale: float = 1.0, store: Optional[HistoryStore] = None, **settings) -> Shock:
+def historical(
+    name: str, scale: float = 1.0, store: Optional[HistoryStore] = None, fx: bool = True, **settings
+) -> Shock:
     """Replay a named episode (:data:`EPISODES`) times ``scale``: the
     Treasury curve by US Treasury par yield changes, each swap curve by its
-    currency's swap/OIS history or a flagged proxy (see ``Shock.sources``).
-    ``store`` defaults to the committed history sample (no network)."""
+    currency's swap/OIS history or a flagged proxy, and (``fx``) EURUSD and
+    GBPUSD by the ECB reference-rate moves of the same dates (see
+    ``Shock.sources``). ``store`` defaults to the committed history sample
+    (no network)."""
 
     start, end = _episode(name)
-    return _replay(name, start, end, float(scale), store, EPISODE_TOLERANCE_DAYS, settings)
+    return _replay(name, start, end, float(scale), store, EPISODE_TOLERANCE_DAYS, settings, fx=fx)
 
 
 def history_window(
@@ -595,15 +660,16 @@ def history_window(
     scale: float = 1.0,
     store: Optional[HistoryStore] = None,
     tolerance_days: int = 7,
+    fx: bool = True,
     **settings,
 ) -> Shock:
     """Replay the curve changes between any two dates of the history store
-    (nearest complete curves within ``tolerance_days``), like
-    :func:`historical`."""
+    (nearest complete curves within ``tolerance_days``) and, with ``fx``,
+    the FX moves of the same dates, like :func:`historical`."""
 
     if end <= start:
         raise ValueError(f"the window end ({end}) must be after its start ({start})")
-    return _replay(f"History {start} to {end}", start, end, float(scale), store, tolerance_days, settings)
+    return _replay(f"History {start} to {end}", start, end, float(scale), store, tolerance_days, settings, fx=fx)
 
 
 def historical_table(store: Optional[HistoryStore] = None) -> pd.DataFrame:
@@ -632,7 +698,7 @@ def historical_sources(shock: Shock) -> pd.DataFrame:
     """One row per curve and currency of a historical shock: which data it
     replays, the dates used and whether it is the curve's own market."""
 
-    names = {"govt": "TREASURY", "projections": "PROJECTION"}
+    names = {"govt": "TREASURY", "projections": "PROJECTION", "fx": "FX SPOTS"}
     rows = [
         {
             "curve": names.get(src.selector.split(":", 1)[0], "SWAP"),
@@ -785,10 +851,11 @@ def factor_risk(
     return total
 
 
-def standard_library(store: Optional[HistoryStore] = None) -> List[Shock]:
+def standard_library(store: Optional[HistoryStore] = None, fx: bool = True) -> List[Shock]:
     """Parallel +/-25 and +/-100bp, 2s10s steepener/flattener of 25bp, a
     2s5s10s fly and every historical episode (instantaneous, both curves;
-    episodes from ``store``, by default the committed sample)."""
+    episodes from ``store``, by default the committed sample, with their FX
+    moves unless ``fx`` is False)."""
 
     shocks = [parallel(bp) for bp in (25.0, -25.0, 100.0, -100.0)]
     shocks += [
@@ -796,7 +863,7 @@ def standard_library(store: Optional[HistoryStore] = None) -> List[Shock]:
         twist(5.0, 12.5, -12.5, short_years=2.0, long_years=10.0, name="2s10s flattener 25bp"),
         butterfly(0.0, 25.0, 5.0, wings=(2.0, 10.0), name="2s5s10s fly: 5Y +25bp"),
     ]
-    return shocks + [historical(name, store=store) for name in historical_episodes()]
+    return shocks + [historical(name, store=store, fx=fx) for name in historical_episodes()]
 
 
 # --------------------------------------------------------------------------

@@ -6,10 +6,13 @@ currency: US Treasuries in USD, everything else in the swap curve's currency.
 Totals are per currency; whenever the positions hold a currency other than
 the reporting one (USD by default), the whole book is also shown converted
 into it (``ALL IN USD``) at FX spots from the ECB euro reference rates of the
-bundled snapshot (the latest day on or before the valuation date) or at
-rates the user types, and every converted figure says which rates and date
-it used. FX spots are held in scenarios unless the SCENARIOS tab shocks them
-(EURUSD, GBPUSD) and in the value at risk (no FX history in the store).
+valuation date (the latest day on or before it in the ``FX_ECB`` history of
+the sidebar DATA SOURCE's store: the bundled daily history since 2015, plus
+the latest days in LIVE mode) or at rates the user types, and every
+converted figure says which rates and date it used. Historical replays and
+the value at risk move the spots by the ECB rates of their own dates (each
+can hold them); other scenarios hold them unless the SCENARIOS tab shocks
+them (EURUSD, GBPUSD).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from derivx.risk.reporting import (
     entered_spots,
     ordered,
     position_currencies,
+    store_spots,
     symbol,
 )
 from derivx.risk.sensitivities import Position
@@ -54,6 +58,13 @@ def _ecb():
 
 
 def _ecb_spots(asof: dt.date) -> Optional[FxSpots]:
+    """The ECB reference rates of ``asof`` from the DATA SOURCE's history
+    store (latest day on or before it), else from the bundled history."""
+
+    try:
+        return store_spots(rates_data.active_store(), asof)
+    except ValueError:
+        pass
     rates = _ecb()
     if rates is None:
         return None
@@ -128,15 +139,18 @@ def sidebar(market: Market) -> Optional[Reporting]:
         return None
     st.sidebar.caption(
         _fx_caption(chosen.fx)
-        + (" ECB reference rates are indicative, not dealable quotes." if source == SOURCES[0] else "")
-        + " FX spots are held in scenarios unless the SCENARIOS tab shocks them, and in the value at risk."
-    )
+        + (" ECB reference rates of the valuation date (daily history since 2015), indicative, not dealable quotes."
+           if source == SOURCES[0] else "")
+        + " Historical replays and the value at risk move the spots by the ECB rates of their dates (each can hold "
+        "them); other scenarios hold them unless the SCENARIOS tab shocks them."
+    )  # fmt: skip
     if source == SOURCES[0] and chosen.fx.asof is not None and chosen.fx.asof != market.asof:
         days = chosen.stale_days(market.asof)
         when = "before" if chosen.fx.asof < market.asof else "after"
         st.sidebar.warning(
-            f"The ECB snapshot has no rates for {market.asof}: converting at those of {chosen.fx.asof}, {days} days "
-            f"{when} the valuation date. Enter the rates of {market.asof} (ENTER RATES) for a consistent conversion."
+            f"The ECB history has no rates for {market.asof} (not a TARGET business day, or beyond the days held): "
+            f"converting at those of {chosen.fx.asof}, {days} days {when} the valuation date. Enter the rates of "
+            f"{market.asof} (ENTER RATES) for a consistent conversion."
         )
     return chosen
 
@@ -190,7 +204,7 @@ def conversion_note(currencies: Sequence[str], rep: Optional[Reporting], valuati
     if rep.fx.asof is not None and rep.fx.asof != valuation:
         stale = f" (FX of {rep.fx.asof}, not of the valuation date {valuation})"
     return (f"{per} {rep.label} converts {', '.join(c for c in groups if c != rep.currency)} at "
-            f"{rep.describe(currencies)}{stale}; FX spot held unless a scenario shocks it.")  # fmt: skip
+            f"{rep.describe(currencies)}{stale}.")  # fmt: skip
 
 
 def record(rep: Optional[Reporting], currencies: Sequence[str]) -> dict:

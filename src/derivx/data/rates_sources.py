@@ -11,7 +11,8 @@ normalised long format (:data:`LONG_COLUMNS`), one row per observation:
 * ``value_original`` - the number as published
 * ``unit_original``  - its unit: ``percent``, ``bp``, ``decimal`` or ``index``
 * ``value_decimal``  - the rate as a decimal (``percent / 100``); for an
-  ``index`` it is the index level; NaN where the unit is unknown
+  ``index`` it is the index level and for an FX rate (unit ``fx``) the rate
+  itself; NaN where the unit is unknown
 * ``measure``        - what the number is (see :data:`MEASURES`)
 * ``dataset``        - the history-store dataset it belongs to
 
@@ -30,8 +31,9 @@ Sources and their terms (all free, no key):
 * US Treasury daily par yield curve CSV (public domain; slow endpoint).
 * NY Fed Markets API: SOFR, EFFR, OBFR, TGCR, BGCR, SOFR averages/index
   ("Source: Federal Reserve Bank of New York").
-* ECB Data Portal: euro short-term rate and the euro area yield curves
-  ("Source: ECB").
+* ECB Data Portal: euro short-term rate, the euro area yield curves and
+  the euro foreign exchange reference rates (dataset EXR; reference rates
+  for information, not dealable quotes) ("Source: ECB").
 * Bank of England yield-curve archive: the fitted UK OIS (SONIA) curve
   ("Source: Bank of England").
 """
@@ -82,6 +84,7 @@ MEASURES = {
     "overnight_fixing": "overnight reference rate fixing (SOFR/EFFR/OBFR/ESTR ACT/360, SONIA ACT/365F)",
     "compounded_average": "backward-looking compounded average of SOFR (ACT/360)",
     "index_level": "compounded index level (dimensionless)",
+    "fx_per_eur": "ECB euro reference rate: units of the currency per 1 EUR (EXR, 14:15 CET)",
 }
 OFFLINE_ENV = "DERIVX_OFFLINE"
 FRED_KEY_ENV = "FRED_API_KEY"
@@ -142,6 +145,7 @@ ECB_CURVES = {"AAA": "G_N_A", "ALL": "G_N_C"}  # AAA-rated / all euro area centr
 ECB_MEASURES = {"par": ("PY", "par_yield_cc"), "spot": ("SR", "zero_cc"), "forward": ("IF", "forward_cc")}
 ECB_TENORS = ("3M", "6M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "30Y")
 ECB_SPOT_TENORS = ("3M", "6M", "9M") + tuple(f"{y}Y" for y in range(1, 31))  # dense enough to derive par rates
+ECB_FX_CURRENCIES = ("USD", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD")  # EXR daily reference rates vs EUR
 BOE_ARCHIVES = {
     "latest": "latest-yield-curve-data.zip",  # current month, daily
     "daily": "oisddata.zip",  # 2009 to date, daily (about 12 MB)
@@ -194,11 +198,11 @@ def to_decimal(values: Iterable[float], unit: str) -> np.ndarray:
     arr = np.asarray(list(values), dtype=float)
     if unit in UNIT_SCALE:
         return arr * UNIT_SCALE[unit]
-    if unit == "index":
+    if unit in ("index", "fx"):  # an index level, or an FX rate (units of a currency per unit of another)
         return arr
     if unit == "unknown":
         return np.full_like(arr, np.nan)
-    raise ValueError(f"unknown unit {unit!r}; expected one of {sorted(UNIT_SCALE) + ['index', 'unknown']}")
+    raise ValueError(f"unknown unit {unit!r}; expected one of {sorted(UNIT_SCALE) + ['fx', 'index', 'unknown']}")
 
 
 def tenor_years(tenor: Optional[str]) -> float:
@@ -712,6 +716,11 @@ def _ecb_series(key: str) -> Tuple[str, Optional[str], str, str]:
 
     if key.startswith("EST."):
         return "ESTR", "ON", "overnight_fixing", "FIXINGS"
+    if key.startswith("EXR."):
+        parts = key.split(".")
+        if len(parts) != 6 or parts[1] != "D" or parts[3] != "EUR" or parts[4] != "SP00" or parts[5] != "A":
+            raise ValueError(f"unsupported ECB exchange-rate series {key!r} (expected EXR.D.<CCY>.EUR.SP00.A)")
+        return key, None, "fx_per_eur", "FX_ECB"
     if key.startswith("YC."):
         parts = key.split(".")
         curve, item = parts[5], parts[-1]
@@ -746,17 +755,22 @@ def parse_ecb_csv(text: str) -> pd.DataFrame:
         raise ValueError(f"not an ECB csvdata payload: missing {sorted(missing)}")
     meta = {key: _ecb_series(key) for key in raw["KEY"].unique()}
     asof = list(pd.to_datetime(raw["TIME_PERIOD"], format="%Y-%m-%d").dt.date)
-    n = len(raw)
-    return long_frame(
+    units = ["fx" if meta[k][2] == "fx_per_eur" else "percent" for k in raw["KEY"]]
+    frame = long_frame(
         asof,
         "ECB",
         [meta[k][0] for k in raw["KEY"]],
         [meta[k][1] for k in raw["KEY"]],
         list(raw["OBS_VALUE"]),
-        ["percent"] * n,
+        units,
         [meta[k][2] for k in raw["KEY"]],
         [meta[k][3] for k in raw["KEY"]],
     )
+    fx = frame["measure"] == "fx_per_eur"
+    if fx.any() and not (frame.loc[fx, "value_decimal"] > 0).all():
+        bad = frame.loc[fx & ~(frame["value_decimal"] > 0)].iloc[0]
+        raise ValueError(f"ECB rate {bad['series']} on {bad['asof']} is not positive: {bad['value_original']}")
+    return frame
 
 
 def _ecb_query(start: Optional[dt.date], end: Optional[dt.date], last_n: Optional[int]) -> str:
@@ -842,6 +856,46 @@ def ecb_yield_curve(
         "end": _iso(end),
         "last_n": last_n,
     }
+    return _fetch(
+        "ECB",
+        params,
+        [url],
+        lambda p: parse_ecb_csv(p[0].decode("utf-8")),
+        offline,
+        max_age,
+        timeout,
+        retries,
+        cache,
+    )
+
+
+def ecb_fx(
+    currencies: Sequence[str] = ECB_FX_CURRENCIES,
+    start: Optional[dt.date] = None,
+    end: Optional[dt.date] = None,
+    last_n: Optional[int] = None,
+    *,
+    offline: Optional[bool] = None,
+    max_age: Optional[float] = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    retries: int = 2,
+    cache: Optional[DiskCache] = None,
+) -> Fetched:
+    """ECB euro foreign exchange reference rates (dataset EXR, daily, units
+    of each currency per 1 EUR, published around 16:00 CET on TARGET
+    business days); crosses are derived from them explicitly
+    (:func:`derivx.data.rates_history.fx_cross`: USD per GBP = USD per EUR
+    / GBP per EUR). Reference rates, indicative, not dealable."""
+
+    codes = [str(c).strip().upper() for c in currencies]
+    bad = [c for c in codes if not re.fullmatch(r"[A-Z]{3}", c) or c == "EUR"]
+    if not codes or bad:
+        raise ValueError(f"give ISO currency codes other than EUR, got {list(currencies)!r}")
+    if start is None and last_n is None:
+        last_n = 30
+    key = f"D.{'+'.join(codes)}.EUR.SP00.A"
+    url = ECB_URL.format(flow="EXR", key=key) + "?" + _ecb_query(start, end, last_n)
+    params = {"flow": "EXR", "currencies": codes, "start": _iso(start), "end": _iso(end), "last_n": last_n}
     return _fetch(
         "ECB",
         params,

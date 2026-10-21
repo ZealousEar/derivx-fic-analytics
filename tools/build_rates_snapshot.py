@@ -4,6 +4,11 @@ Downloads, with the fetchers in ``derivx.data.rates_sources``:
 
 * ``ust_par_yield_curve_<year>.csv`` - the Treasury's daily par yield curve
   CSV for the current year, as published (the offline default);
+* ``rates_history/fx_ecb.csv`` - the ECB euro foreign exchange reference
+  rates (EXR) of USD, GBP, JPY, CHF, CAD, AUD and NZD, as published: every
+  TARGET business day since 2015-01-02 (the FX history that converts book
+  totals on any valuation date and moves FX in the value at risk), month
+  ends since 2008 and the episode windows (FX in historical replays);
 * ``rates_history/*.csv`` - small wide samples, values as published:
   month-end curves since 2008/2009, every business day of the current year
   where noted, and every curve within four days of each named scenario
@@ -45,7 +50,8 @@ WINDOW_DAYS = 4
 UST_FROM, ECB_FROM = dt.date(2008, 1, 1), dt.date(2008, 1, 1)
 UST_DAILY_FROM = dt.date(2015, 1, 1)  # every business day from here (PCA, RV and VaR need daily changes)
 FILES = ("ust_par_fred.csv", "usd_swap_ice.csv", "gbp_ois_boe.csv", "eur_aaa_ecb.csv", "eur_aaa_ecb_spot.csv",
-         "fixings.csv")  # fmt: skip
+         "fixings.csv", "fx_ecb.csv")  # fmt: skip
+FX_FROM, FX_DAILY_FROM = dt.date(2008, 1, 1), dt.date(2015, 1, 1)  # month ends + episodes, then every day
 BOE_TENORS = tuple(f"{m}M" for m in range(1, 12)) + ("1Y", "18M") + tuple(f"{y}Y" for y in range(2, 26))
 DAILY_FROM = dt.date(utc_now().year, 1, 1)
 RECENT_FROM = utc_now().date() - dt.timedelta(days=62)  # daily curves kept for about two months
@@ -91,10 +97,24 @@ def sample(table: pd.DataFrame, required: Sequence[str], daily_from: Optional[dt
     return complete.loc[sorted(keep)]
 
 
-def write(name: str, table: pd.DataFrame, decimals: Mapping[str, int], entry: Dict[str, object], files: list) -> None:
+def write(
+    name: str,
+    table: pd.DataFrame,
+    decimals: Mapping[str, int],
+    entry: Dict[str, object],
+    files: list,
+    as_published: bool = False,
+) -> None:
+    """Write one sample file: each value with ``decimals[column]`` decimals
+    (default 6), or with ``as_published`` its shortest exact form (the
+    published number, e.g. 0.84385 or 177.34)."""
+
     out = table.copy()
     for col in out.columns:
-        out[col] = out[col].map(lambda v, n=decimals.get(col, 6): "" if pd.isna(v) else f"{v:.{n}f}")
+        if as_published:
+            out[col] = out[col].map(lambda v: "" if pd.isna(v) else repr(float(v)).removesuffix(".0"))
+        else:
+            out[col] = out[col].map(lambda v, n=decimals.get(col, 6): "" if pd.isna(v) else f"{v:.{n}f}")
     out.index.name = "date"
     path = SAMPLE_DIR / name
     out.to_csv(path, lineterminator="\n")
@@ -159,7 +179,7 @@ def build(args: argparse.Namespace) -> None:
             files,
         )  # fmt: skip
 
-    if only & {"gbp_ois_boe.csv", "eur_aaa_ecb.csv", "eur_aaa_ecb_spot.csv", "fixings.csv"}:
+    if only & {"gbp_ois_boe.csv", "eur_aaa_ecb.csv", "eur_aaa_ecb_spot.csv", "fixings.csv", "fx_ecb.csv"}:
         _build_rest(only, kw, files, fetched_at)
     _write_manifest(files, fetched_at, keep_others=bool(args.only))
 
@@ -175,6 +195,29 @@ def _build_rest(only: set, kw: Mapping[str, object], files: list, fetched_at: st
         _ecb_spot(kw, files)
     if "fixings.csv" in only:
         _fixings(kw, files, fetched_at)
+    if "fx_ecb.csv" in only:
+        _fx(kw, files)
+
+
+def _fx(kw: Mapping[str, object], files: list) -> None:
+    # ECB euro reference rates (units per 1 EUR), as published: month ends and episode windows from FX_FROM,
+    # every TARGET business day from FX_DAILY_FROM.
+    fx = rs.ecb_fx(rs.ECB_FX_CURRENCIES, start=FX_FROM, **kw)
+    order = [f"EXR.D.{c}.EUR.SP00.A" for c in rs.ECB_FX_CURRENCIES]
+    table = sample(wide(fx.frame, {})[order].dropna(how="all"), order, FX_DAILY_FROM)
+    write(
+        "fx_ecb.csv",
+        table,
+        {},
+        {"dataset": "FX_ECB", "source": "ECB", "unit": "fx", "measure": "fx_per_eur",
+         "series": {key: {"tenor": None, "currency": c} for key, c in zip(order, rs.ECB_FX_CURRENCIES)},
+         "sampling": f"month ends since {FX_FROM.year}, episode windows (+/-{WINDOW_DAYS} days) and every TARGET "
+                     f"business day from {FX_DAILY_FROM} (ECB reference rates, set at 14:15 CET), values as published: "
+                     "units of each currency per 1 EUR; indicative reference rates, not dealable",
+         "urls": [fx.url], "fetched_at": fx.fetched_at, "attribution": ATTRIBUTION["ECB"]},
+        files,
+        as_published=True,
+    )  # fmt: skip
 
 
 def _boe(kw: Mapping[str, object], files: list) -> None:

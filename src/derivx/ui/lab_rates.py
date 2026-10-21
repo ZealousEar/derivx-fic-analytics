@@ -107,7 +107,7 @@ def _datasets(store: rh.HistoryStore) -> List[str]:
     out = []
     for key in store.datasets():
         info = rh.dataset_info(key)
-        if info.kind == "fixings":
+        if info.kind in ("fixings", "fx"):
             continue
         if len(store.dates(key)) >= MIN_CURVES:
             out.append(key)
@@ -767,7 +767,7 @@ def _rvi_sources(hist: VolHistory, store: rh.HistoryStore) -> List[str]:
     any), then every curve history of the store (uploads and the daily
     Treasury curve first)."""
 
-    curves = [k for k in store.datasets() if rh.dataset_info(k).kind != "fixings"]
+    curves = [k for k in store.datasets() if rh.dataset_info(k).kind not in ("fixings", "fx")]
     curves.sort(key=lambda k: (not k.startswith("USER_SWAP:"), k != "UST_PAR", k))
     own = [ri.HISTORY_FORWARDS] if any(hist.forwards.get(d) for d in hist.dates) else []
     return own + curves

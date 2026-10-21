@@ -37,14 +37,17 @@ def test_manifest_describes_every_committed_file():
         assert rh.file_sha256(path) == entry["sha256"], f"{name} changed without rebuilding the manifest"
         header = pd.read_csv(path, nrows=0).columns
         assert header[0] == "date" and set(header[1:]) == set(entry["series"]), name
-        assert entry["unit"] == "percent" and entry["attribution"] and entry["urls"] and entry["fetched_at"]
+        unit = "fx" if entry["dataset"] == rh.FX_DATASET else "percent"  # FX: units of a currency per 1 EUR
+        assert entry["unit"] == unit and entry["attribution"] and entry["urls"] and entry["fetched_at"]
         assert entry["dataset"] in rh.DATASETS
     total = sum((rh.SAMPLE_DIR / n).stat().st_size for n in files)
-    assert total < 400_000  # small enough to commit; the daily 2015-2025 Treasury curves are ~190 kB of it
+    # small enough to commit: the daily 2015-2025 Treasury curves are ~190 kB of it, the daily ECB FX rates
+    # since 2015 (seven currencies, as published) ~190 kB
+    assert total < 600_000 and (rh.SAMPLE_DIR / "fx_ecb.csv").stat().st_size < 200_000
 
 
 def test_bundled_store_coverage(store):
-    assert store.datasets() == ["EUR_AAA_ECB", "FIXINGS", "GBP_OIS_BOE", "USD_SWAP_ICE", "UST_PAR"]
+    assert store.datasets() == ["EUR_AAA_ECB", "FIXINGS", "FX_ECB", "GBP_OIS_BOE", "USD_SWAP_ICE", "UST_PAR"]
     ust = store.dates("UST_PAR")
     snapshot = set(rs.parse_treasury_csv(rh.TREASURY_SNAPSHOT.read_text())["asof"])
     assert snapshot <= set(ust) and ust[-1] == max(snapshot) == EXAMPLE_ASOF

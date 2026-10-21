@@ -19,7 +19,9 @@ Scenarios (:func:`build_scenarios`)
     for counts as missing, and a missing day moves that curve by 0.
 
 Which history moves which curve (``VarScenarios.sources``)
-    The Treasury curve: US Treasury par yields (``real``). The swap curve of
+    The Treasury curve: US Treasury par yields (``real``). FX spots: the ECB
+    reference rates (``FX_ECB``), when they move on at least
+    ``min_coverage`` of the scenario dates. The swap curve of
     currency c: the user's uploaded swap history (``upload``), else the
     currency's real swap/OIS history (ICE USD swap rates, to 2016-10-28;
     the Bank of England's SONIA OIS curve as derived par OIS rates), else a
@@ -39,14 +41,33 @@ P&L of each position in each scenario
     * :func:`full_revaluation_pnl`: curves rebuilt from the moved quotes and
       every position revalued.
 
-Currencies
+Currencies and FX
     Each position's P&L is in its own currency (swaps and options in the
-    swap curve's, Treasuries in USD). :func:`var_table` with ``currencies``
-    gives the VaR of each currency's positions together (``TOTAL USD``,
-    ``TOTAL EUR``; ``TOTAL`` for a book in one currency) and, with a
-    ``reporting`` currency, of the whole book converted at today's FX spots
-    (``ALL IN <R>``, :mod:`derivx.risk.reporting`). FX spots are held: there
-    is no FX history in the store, so the VaR has no FX risk.
+    swap curve's, Treasuries in USD) and does not move with FX.
+    :func:`var_table` with ``currencies`` gives the VaR of each currency's
+    positions together (``TOTAL USD``, ``TOTAL EUR``; ``TOTAL`` for a book in
+    one currency) and, with a ``reporting`` currency R, of the whole book
+    converted (``ALL IN <R>``, :mod:`derivx.risk.reporting`).
+
+    FX is a risk factor of the converted book: the ECB euro reference rates
+    of the store (``FX_ECB``, :meth:`HistoryStore.fx_table`) are aligned to
+    the same scenario dates as the curves (as-of, the same
+    ``max_stale_days``; :class:`FxMoves`). On scenario day i the value in R
+    of one unit of currency c moves by ``x_ic = r_iR / r_ic - 1``, with
+    ``r_ic`` the ratio of the day's ECB rate of c (units per EUR) to the
+    previous scenario day's (``r_EUR = 1``), applied to today's spot S_c.
+    The converted P&L of position j (today's value V_j, local P&L p_ij) is
+    exact, ``(V_j + p_ij) S_c (1 + x_ic) - V_j S_c``::
+
+        ALL IN R             = sum_j p_ij S_c + (V_j + p_ij) S_c x_ic
+        ALL IN R (FX HELD)   = sum_j p_ij S_c              (spots held)
+        ALL IN R (FX ONLY)   = sum_j V_j S_c x_ic          (curves held)
+
+    so the FX contribution is visible on its own (the cross term p_ij S_c
+    x_ic is in ALL IN R only). The delta-normal check of ALL IN R uses the
+    first-order P&L ``sum_j PV01 b S_c + V_j S_c x_ic``: FX returns are risk
+    factors with sensitivity V_j S_c. ``fx=None`` (or ``build_scenarios(...,
+    fx=False)``) holds the spots, as before.
 
 Risk measures (:func:`var_es`, :func:`delta_normal`), losses as positive
 amounts in the positions' currency
@@ -73,10 +94,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
-from derivx.data.rates_history import HistoryStore, dataset_info, user_dataset
+from derivx.data.rates_history import FX_DATASET, HistoryStore, dataset_info, user_dataset
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Market
 from derivx.rates.pca import MAX_GAP_DAYS, tenor_map, tenor_years
-from derivx.risk.reporting import Reporting, ordered, total_label
+from derivx.risk.reporting import Reporting, market_pair, ordered, total_label
 from derivx.risk.scenarios import GOVT_HISTORY, SWAP_HISTORY, SWAP_PROXIES, QuoteRisk, quoted_levels, shocked_curves
 from derivx.risk.sensitivities import Position
 
@@ -87,6 +108,9 @@ MIN_COVERAGE = 0.9
 MAX_STALE_DAYS = 5
 MIN_SCENARIOS = 20
 TOTAL = "TOTAL"
+FX_HELD = "(FX HELD)"
+FX_ONLY = "(FX ONLY)"
+FX_KEY = "FX"  # the FX spots' row of the sources table
 
 
 @dataclass(frozen=True)
@@ -105,6 +129,37 @@ class CurveSource:
 
 
 @dataclass(frozen=True)
+class FxMoves:
+    """Daily moves of the ECB reference rates on the scenario dates:
+    ``ratio[c][i]`` is the rate of currency c (units per 1 EUR) on scenario
+    day i over its rate on the previous scenario day, as-of aligned like the
+    curves (EUR is 1 throughout); a day without a rate within
+    ``max_stale_days`` on either side is no move (ratio 1, ``observed``
+    False)."""
+
+    ratio: Dict[str, np.ndarray]
+    observed: np.ndarray
+    title: str = "ECB euro foreign exchange reference rates"
+
+    @property
+    def coverage(self) -> float:
+        return float(self.observed.mean()) if self.observed.size else 0.0
+
+    def translation(self, currencies: Sequence[str], reporting: str) -> np.ndarray:
+        """``x[i, j]``: the relative move on scenario day i of the value in
+        ``reporting`` of one unit of ``currencies[j]`` (0 for the reporting
+        currency itself)."""
+
+        missing = sorted(c for c in {*currencies, reporting} if c not in self.ratio)
+        if missing:
+            raise ValueError(f"the FX history has no {', '.join(missing)} rate on the scenario dates")
+        base = self.ratio[reporting]
+        if not len(currencies):
+            return np.zeros((len(base), 0))
+        return np.column_stack([base / self.ratio[c] - 1.0 for c in currencies])
+
+
+@dataclass(frozen=True)
 class VarScenarios:
     """Daily quote moves (bp) of each curve of a market: ``bumps[key]`` is
     scenarios x quotes; ``dates[i]`` the day of scenario i and
@@ -117,6 +172,8 @@ class VarScenarios:
     labels: Dict[str, Tuple[str, ...]]
     sources: Tuple[CurveSource, ...]
     lookback: int = 0  # daily changes asked for; ``n`` is fewer when the daily history starts later
+    fx: Optional[FxMoves] = None  # None: FX spots held
+    fx_note: str = ""
 
     @property
     def n(self) -> int:
@@ -141,6 +198,19 @@ class VarScenarios:
             }
             for s in self.sources
         ]
+        if self.fx is not None:
+            rows.append(
+                {
+                    "curve": FX_KEY,
+                    "currency": ", ".join(c for c in sorted(self.fx.ratio) if c != "EUR"),
+                    "history": self.fx.title,
+                    "dataset": FX_DATASET,
+                    "flag": "real",
+                    "coverage_pct": 100.0 * self.fx.coverage,
+                    "note": "FX spot moves of the same dates: they move the totals converted to the reporting "
+                    "currency (ALL IN), not local P&L",
+                }
+            )
         return pd.DataFrame(rows, columns=["curve", "currency", "history", "dataset", "flag", "coverage_pct", "note"])
 
 
@@ -206,6 +276,40 @@ def aligned_changes(
     return out, ok
 
 
+def fx_moves(
+    store: HistoryStore,
+    previous: Sequence[dt.date],
+    dates: Sequence[dt.date],
+    max_stale_days: int = MAX_STALE_DAYS,
+) -> Optional[FxMoves]:
+    """The ECB reference-rate moves of the store on the scenario days
+    ``previous[i] -> dates[i]`` (see :class:`FxMoves`); None when the store
+    holds no FX history."""
+
+    table = store.fx_table()
+    n = len(dates)
+    if table.empty or not n:
+        return None
+    ordinals = np.array([d.toordinal() for d in table.index])
+    ends = np.array([d.toordinal() for d in dates])
+    starts = np.array([d.toordinal() for d in previous])
+    i_end = np.searchsorted(ordinals, ends, side="right") - 1
+    i_start = np.searchsorted(ordinals, starts, side="right") - 1
+    ok = (i_end >= 0) & (i_start >= 0)
+    ok &= np.where(ok, ends - ordinals[np.maximum(i_end, 0)], 10**6) <= max_stale_days
+    ok &= np.where(ok, starts - ordinals[np.maximum(i_start, 0)], 10**6) <= max_stale_days
+    ratio: Dict[str, np.ndarray] = {}
+    for currency in table.columns:
+        values = table[currency].to_numpy(dtype=float)
+        r = np.ones(n)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            moved = values[np.maximum(i_end, 0)] / values[np.maximum(i_start, 0)]
+        good = ok & np.isfinite(moved) & (moved > 0)
+        r[good] = moved[good]
+        ratio[str(currency)] = r
+    return FxMoves(ratio, ok)
+
+
 def _candidates(currency: str) -> List[Tuple[str, str]]:
     """(dataset, flag) in order of preference for a currency's swap curve."""
 
@@ -239,10 +343,13 @@ def build_scenarios(
     end: Optional[dt.date] = None,
     max_stale_days: int = MAX_STALE_DAYS,
     min_coverage: float = MIN_COVERAGE,
+    fx: bool = True,
 ) -> VarScenarios:
     """Quote moves of every curve of ``market`` (see the module docstring)
     for the last ``lookback`` daily changes up to ``end`` (default: the
-    valuation date)."""
+    valuation date), and the FX moves of the same days (``fx``; held when
+    False, or when the store's FX history covers less than
+    ``min_coverage`` of the days)."""
 
     if int(lookback) != lookback or lookback < MIN_SCENARIOS:
         raise ValueError(f"the lookback must be a whole number of at least {MIN_SCENARIOS} days")
@@ -306,7 +413,24 @@ def build_scenarios(
         bumps[key] = quote_moves
         labels[key] = tuple(curve.labels)
         sources.append(CurveSource(key, ccy, dataset, dataset_info(dataset).title, flag, coverage, note))
-    return VarScenarios(market.asof, dates, previous, bumps, labels, tuple(sources), int(lookback))
+    moves_fx: Optional[FxMoves] = None
+    fx_note = "FX spots held (as asked)"
+    if fx:
+        moves_fx = fx_moves(store, previous, dates, max_stale_days)
+        if moves_fx is None:
+            fx_note = "FX spots held: the history store has no ECB reference rates"
+        elif moves_fx.coverage < min_coverage:
+            fx_note = (
+                f"FX spots held: the ECB reference rates move on only {100 * moves_fx.coverage:.0f}% of the "
+                f"scenario dates (need {100 * min_coverage:.0f}%)"
+            )
+            moves_fx = None
+        else:
+            fx_note = (
+                f"FX spots move with the ECB reference rates of the same dates ({100 * moves_fx.coverage:.0f}% of "
+                "the days observed)"
+            )
+    return VarScenarios(market.asof, dates, previous, bumps, labels, tuple(sources), int(lookback), moves_fx, fx_note)
 
 
 # --------------------------------------------------------------------------
@@ -422,13 +546,20 @@ def book_columns(
     names: Sequence[str],
     currencies: Optional[Sequence[str]] = None,
     reporting: Optional[Reporting] = None,
+    fx: Optional[FxMoves] = None,
+    base: Optional[Sequence[float]] = None,
+    linear: bool = False,
 ) -> Dict[str, Tuple[np.ndarray, str]]:
     """{label: (P&L per scenario, currency)}: each position, then the book
     per currency (``TOTAL`` or ``TOTAL <CCY>``: P&L summed per scenario over
     that currency's positions) and, when ``reporting`` is given and some
-    position is in another currency, ``ALL IN <R>`` (every position
-    converted at today's spot). Without ``currencies`` every position is
-    taken to be in one currency (labelled ``""``)."""
+    position is in another currency, ``ALL IN <R>``: every position
+    converted at today's spot and, with ``fx`` (and ``base``, today's value
+    of each position in its currency), moved by the FX change of the day,
+    followed by ``ALL IN <R> (FX HELD)`` and ``ALL IN <R> (FX ONLY)`` (see
+    the module docstring). ``linear`` leaves out the cross term p S x (the
+    first-order P&L of the delta-normal check). Without ``currencies``
+    every position is taken to be in one currency (labelled ``""``)."""
 
     pnl = np.atleast_2d(np.asarray(pnl, dtype=float))
     ccys = list(currencies) if currencies is not None else [""] * len(names)
@@ -440,7 +571,22 @@ def book_columns(
         picks = [j for j, c in enumerate(ccys) if c == ccy]
         out[total_label(ccy, len(groups) > 1)] = (pnl[:, picks].sum(axis=1), ccy)
     if reporting is not None and currencies is not None and reporting.needs_conversion(ccys):
-        out[reporting.label] = ((pnl * reporting.rates(ccys)).sum(axis=1), reporting.currency)
+        rates = reporting.rates(ccys)
+        held = (pnl * rates).sum(axis=1)
+        if fx is None:
+            out[reporting.label] = (held, reporting.currency)
+        else:
+            if base is None or len(base) != len(names):
+                raise ValueError("FX moves need today's value of each position (base)")
+            x = fx.translation(ccys, reporting.currency)
+            if x.shape[0] != pnl.shape[0]:
+                raise ValueError(f"{pnl.shape[0]} scenarios but FX moves for {x.shape[0]}")
+            today = np.asarray(base, dtype=float)[None, :]
+            fx_only = (today * rates * x).sum(axis=1)
+            cross = np.zeros(pnl.shape[0]) if linear else (pnl * rates * x).sum(axis=1)
+            out[reporting.label] = (held + fx_only + cross, reporting.currency)
+            out[f"{reporting.label} {FX_HELD}"] = (held, reporting.currency)
+            out[f"{reporting.label} {FX_ONLY}"] = (fx_only, reporting.currency)
     return out
 
 
@@ -451,18 +597,22 @@ def var_table(
     delta: Optional[np.ndarray] = None,
     currencies: Optional[Sequence[str]] = None,
     reporting: Optional[Reporting] = None,
+    fx: Optional[FxMoves] = None,
+    base: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
     """One row per position and a ``TOTAL`` row (the book: P&L summed per
     scenario, so its VaR is not the sum of the rows): VaR, ES, worst loss,
     mean and sd of daily P&L; with ``delta`` (first-order P&L) the
     delta-normal sigma, VaR and ES. With ``currencies`` (one per position)
     the table has a ``currency`` column and a total per currency, and with
-    ``reporting`` the whole book converted (:func:`book_columns`)."""
+    ``reporting`` the whole book converted; with ``fx`` (and ``base``) the
+    converted rows move with FX and come with their FX HELD and FX ONLY
+    rows (:func:`book_columns`)."""
 
-    columns = book_columns(pnl, names, currencies, reporting)
+    columns = book_columns(pnl, names, currencies, reporting, fx, base)
     first = None
     if delta is not None:
-        first = book_columns(delta, names, currencies, reporting)
+        first = book_columns(delta, names, currencies, reporting, fx, base, linear=True)
     rows = []
     for name, (values, ccy) in columns.items():
         var, es = var_es(values, confidence)
@@ -478,12 +628,36 @@ def var_table(
     return pd.DataFrame(rows)
 
 
-def worst_days(scenarios: VarScenarios, total_pnl: Sequence[float], n: int = 10) -> pd.DataFrame:
-    """The ``n`` worst scenario days of the book: date, P&L and the largest
-    quote move of each curve that day (bp)."""
+def pair_moves(fx: FxMoves, currencies: Sequence[str], reporting: str) -> Dict[str, np.ndarray]:
+    """``{market pair: % move per scenario}`` of the pairs that convert
+    ``currencies`` into ``reporting`` (EURUSD +1.0: the euro up 1% in
+    dollars)."""
+
+    out: Dict[str, np.ndarray] = {}
+    for ccy in ordered([c for c in currencies if c != reporting]):
+        pair = market_pair(ccy, reporting)
+        x = fx.translation([ccy], reporting)[:, 0]  # the value of ccy in the reporting currency
+        out[pair] = 100.0 * (x if pair.startswith(ccy) else 1.0 / (1.0 + x) - 1.0)
+    return out
+
+
+def worst_days(
+    scenarios: VarScenarios,
+    total_pnl: Sequence[float],
+    n: int = 10,
+    currencies: Optional[Sequence[str]] = None,
+    reporting: Optional[str] = None,
+) -> pd.DataFrame:
+    """The ``n`` worst scenario days of the book: date, P&L, the largest
+    quote move of each curve that day (bp) and, when the scenarios move FX
+    and ``currencies`` convert into ``reporting``, each converting pair's
+    move that day (%)."""
 
     total = np.asarray(total_pnl, dtype=float)
     order = np.argsort(total)[: int(n)]
+    moves: Dict[str, np.ndarray] = {}
+    if scenarios.fx is not None and currencies is not None and reporting is not None:
+        moves = pair_moves(scenarios.fx, currencies, reporting)
     rows = []
     for i in order:
         row: Dict[str, object] = {"date": scenarios.dates[i], "from": scenarios.previous[i], "pnl": float(total[i])}
@@ -491,6 +665,8 @@ def worst_days(scenarios: VarScenarios, total_pnl: Sequence[float], n: int = 10)
             j = int(np.argmax(np.abs(bumps[i]))) if bumps.shape[1] else 0
             row[f"{key} max move (bp)"] = float(bumps[i, j]) if bumps.shape[1] else 0.0
             row[f"{key} at"] = scenarios.labels[key][j] if bumps.shape[1] else ""
+        for pair, pct in moves.items():
+            row[f"{pair} move (%)"] = float(pct[i])
         rows.append(row)
     return pd.DataFrame(rows)
 

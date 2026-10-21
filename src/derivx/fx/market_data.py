@@ -10,8 +10,13 @@ rates and carry the ECB's rounding (four or five significant decimals).
 
 * :func:`fetch_ecb_rates` - the latest rates over the network (short
   timeout; raises :class:`FxDataError` on any failure).
-* :func:`bundled_ecb_rates` - the snapshot shipped in
-  ``data/examples/ecb_fx_reference_rates.csv`` (the offline fallback).
+* :func:`bundled_ecb_rates` - the history shipped in
+  ``data/examples/rates_history/fx_ecb.csv`` (every TARGET business day
+  from 2015-01-02, values as published; the offline fallback): dated its
+  latest day, with every earlier day in ``history``. The same file is the
+  ``FX_ECB`` dataset of the rates history store
+  (:mod:`derivx.data.rates_history`), which converts book totals on any
+  valuation date and moves FX in the value at risk.
 * :func:`parse_ecb_csv` - parser of the Data Portal's ``csvdata`` format.
 """
 
@@ -35,7 +40,7 @@ ECB_URL = (
     "?lastNObservations={n}&format=csvdata&detail=dataonly"
 )
 ECB_SOURCE = "ECB euro foreign exchange reference rates (Data Portal, EXR, 14:15 CET)"
-BUNDLED_CSV = Path(__file__).resolve().parents[3] / "data" / "examples" / "ecb_fx_reference_rates.csv"
+BUNDLED_CSV = Path(__file__).resolve().parents[3] / "data" / "examples" / "rates_history" / "fx_ecb.csv"
 DEFAULT_TIMEOUT = 4.0  # seconds: the page never waits longer than this for the ECB
 
 
@@ -66,7 +71,11 @@ class EcbRates:
 
     @property
     def description(self) -> str:
-        when = "bundled snapshot" if self.origin == "bundled" else f"fetched {self.fetched_at}"
+        when = (
+            "bundled snapshot of the daily history from 2015"
+            if self.origin == "bundled"
+            else (f"fetched {self.fetched_at}")
+        )
         return f"{ECB_SOURCE}, {self.asof.isoformat()} ({when}); cross via EUR; indicative, not dealable"
 
 
@@ -127,11 +136,50 @@ def fetch_ecb_rates(timeout: float = DEFAULT_TIMEOUT, observations: int = 5) -> 
     return parse_ecb_csv(text, origin="live")
 
 
+def parse_history_csv(text: str, origin: str = "bundled", currencies=ECB_CURRENCIES) -> EcbRates:
+    """Parse the committed wide history (``date`` plus one column per ECB
+    series ``EXR.D.<CCY>.EUR.SP00.A``, units of the currency per 1 EUR).
+    ``asof`` is the latest date on which every currency in ``currencies``
+    has a rate; ``history`` holds every date. Raises :class:`FxDataError`."""
+
+    try:
+        rows = list(csv.DictReader(io.StringIO(text)))
+    except csv.Error as exc:
+        raise FxDataError(f"ECB history is not CSV: {exc}") from None
+    if not rows or "date" not in rows[0]:
+        raise FxDataError("ECB history has no rows (expected a date column and one column per EXR series)")
+    codes = {}
+    for column in rows[0]:
+        parts = str(column).split(".")
+        if len(parts) == 6 and parts[0] == "EXR" and parts[3] == "EUR":
+            codes[column] = parts[2]
+    if not codes:
+        raise FxDataError("ECB history has no EXR.D.<CCY>.EUR.SP00.A columns")
+    by_date: Dict[dt.date, Dict[str, float]] = {}
+    for row in rows:
+        try:
+            day = dt.date.fromisoformat(row["date"])
+            values = {ccy: float(row[col]) for col, ccy in codes.items() if row.get(col)}
+        except ValueError:
+            raise FxDataError(f"ECB history row {row.get('date')!r} has a bad date or value") from None
+        bad = [c for c, v in values.items() if not v > 0]
+        if bad:
+            raise FxDataError(f"ECB rate {bad[0]} on {day} is not positive")
+        by_date[day] = values
+    complete = [d for d, rates in by_date.items() if set(currencies) <= set(rates)]
+    if not complete:
+        raise FxDataError(f"no date in the ECB history has rates for all of {', '.join(currencies)}")
+    asof = max(complete)
+    return EcbRates(asof, dict(by_date[asof]), origin, None, by_date)
+
+
 def bundled_ecb_rates() -> EcbRates:
-    """The ECB rates shipped with the app (``data/examples``)."""
+    """The ECB rates shipped with the app: the latest day of the committed
+    history (``data/examples/rates_history/fx_ecb.csv``), every earlier
+    day in ``history``."""
 
     try:
         text = BUNDLED_CSV.read_text(encoding="utf-8")
     except OSError as exc:
-        raise FxDataError(f"bundled ECB snapshot not found at {BUNDLED_CSV.name}: {exc.strerror}") from None
-    return parse_ecb_csv(text, origin="bundled")
+        raise FxDataError(f"bundled ECB history not found at {BUNDLED_CSV.name}: {exc.strerror}") from None
+    return parse_history_csv(text, origin="bundled")
