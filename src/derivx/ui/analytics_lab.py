@@ -45,7 +45,7 @@ from __future__ import annotations
 import gzip
 import json
 import time
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -178,9 +178,7 @@ def _when(iso: Optional[str]) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _banner(
-    prov: Mapping[str, object], label: str = "ACTIVE DATASET", extra: Sequence[str] = (), kind: str = ""
-) -> None:
+def _banner(prov: Mapping[str, Any], label: str = "ACTIVE DATASET", extra: Sequence[str] = (), kind: str = "") -> None:
     dates = prov.get("trade_dates") or []
     session = dates[0] if len(dates) == 1 else (f"{dates[0]} .. {dates[-1]} ({len(dates)} sessions)" if dates else "?")
     size = f"{int(prov.get('rows') or 0):,} rows, {prov.get('expiries')} expiries"
@@ -202,7 +200,7 @@ def _banner(
     banner(label, parts, kind, synthetic=labelled or bool(synth_rows))
 
 
-def _stale_notice(stored: Mapping[str, object], data_key: str, settings_key: str, what: str) -> bool:
+def _stale_notice(stored: Mapping[str, Any], data_key: str, settings_key: str, what: str) -> bool:
     """Warn when a stored result no longer matches the data or settings;
     True when the data changed (the result is STALE)."""
 
@@ -215,11 +213,11 @@ def _stale_notice(stored: Mapping[str, object], data_key: str, settings_key: str
     )
 
 
-def _manifest(kind: str, prov: Mapping, inputs: Mapping, model: Mapping, seed=None) -> Dict[str, object]:
+def _manifest(kind: str, prov: Mapping, inputs: Mapping, model: Mapping, seed=None) -> Dict[str, Any]:
     return build_manifest(kind, inputs=inputs, data=prov, model=model, seed=seed)
 
 
-def _filter_breakdown(chain: pd.DataFrame, filters: Mapping[str, object]) -> str:
+def _filter_breakdown(chain: pd.DataFrame, filters: Mapping[str, Any]) -> str:
     """How many quotes fail each liquidity rule (a quote can fail several)."""
 
     bid = pd.to_numeric(chain["bid"], errors="coerce").fillna(0.0)
@@ -245,13 +243,13 @@ def _filter_breakdown(chain: pd.DataFrame, filters: Mapping[str, object]) -> str
 class _NotCached(Exception):
     """A pull that must not be cached (failed or partial)."""
 
-    def __init__(self, chain: pd.DataFrame, status: Dict[str, object]):
+    def __init__(self, chain: pd.DataFrame, status: Dict[str, Any]):
         super().__init__(status.get("reason", ""))
         self.chain, self.status = chain, status
 
 
 @st.cache_data(ttl=2 * PULL_BUCKET_S, max_entries=16, show_spinner=False)
-def _pull_shared(ticker: str, max_expiries: int, bucket: int) -> Tuple[pd.DataFrame, Dict[str, object]]:
+def _pull_shared(ticker: str, max_expiries: int, bucket: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """The current chain, shared by sessions asking for the same ticker and
     expiries within one bucket of ``PULL_BUCKET_S`` seconds (``bucket`` is
     the bucket number, part of the cache key). Only complete pulls are
@@ -264,7 +262,7 @@ def _pull_shared(ticker: str, max_expiries: int, bucket: int) -> Tuple[pd.DataFr
     return result.chain, status
 
 
-def _pull(ticker: str, max_expiries: int, force: bool) -> Tuple[pd.DataFrame, Dict[str, object], bool]:
+def _pull(ticker: str, max_expiries: int, force: bool) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
     """(chain, status, served_from_cache). ``force`` bypasses the cache."""
 
     if force:
@@ -291,7 +289,7 @@ def _activate(ds: ChainDataset, origin: str, status: Optional[dict] = None, note
     st.session_state[K_LOAD_MSG] = ("success", (note + " " if note else "") + msg)
 
 
-def _active() -> Optional[Dict[str, object]]:
+def _active() -> Optional[Dict[str, Any]]:
     return st.session_state.get(K_DATA)
 
 
@@ -529,7 +527,7 @@ def _load_controls() -> None:
                 st.markdown(f"- {w}")
 
 
-def _fetch_status_panel(status: Optional[Mapping[str, object]]) -> None:
+def _fetch_status_panel(status: Optional[Mapping[str, Any]]) -> None:
     """What the fetch of the active dataset did (Yahoo pulls and the
     bundled sample's recorded fetch): requests, retries, the spot and how
     far it moved between the first and last expiry response, and notes."""
@@ -591,7 +589,7 @@ def _publish_to_pricer(
     st.session_state["market_chain_discount"] = discount  # the EQUITY page's MARKET smile discounts the same way
 
 
-def _render_market_data_tab() -> Optional[Dict[str, object]]:
+def _render_market_data_tab() -> Optional[Dict[str, Any]]:
     """Draw the Market Data tab; returns the context the other tabs use
     (filtered chain, provenance, hygiene report and its fingerprint)."""
 
@@ -809,7 +807,7 @@ def _calibration_tables(result: ChainCalibration) -> Dict[str, pd.DataFrame]:
     return {"metrics": metrics, "params": params, "skipped": skipped, "calendar": result.calendar}
 
 
-def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
+def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
     st.markdown("### / PRODUCTION CALIBRATION")
     if ctx is None:
         st.info("No usable chain: load one on the Market Data tab, or loosen its liquidity filters, to calibrate.")
@@ -878,7 +876,7 @@ def _render_calibration_tab(ctx: Optional[Dict[str, object]]) -> None:
             st.info("Select at least one expiry.")
         return
     _stale_notice(stored, ctx["data_key"], settings_key, "calibration")
-    result: ChainCalibration = stored["result"]
+    result = stored["result"]  # a ChainCalibration, as stored above
     tables = _calibration_tables(result)
     if result.skipped:
         with st.expander(f"{len(result.skipped)} slice(s) skipped, with the reason"):
@@ -1030,7 +1028,7 @@ def _plot_walkforward(daily: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def _prepared_history(ds: ChainDataset, filters: Mapping[str, object]) -> Dict[pd.Timestamp, pd.DataFrame]:
+def _prepared_history(ds: ChainDataset, filters: Mapping[str, Any]) -> Dict[pd.Timestamp, pd.DataFrame]:
     out = {}
     for td, df in ds.chains.items():
         f = apply_liquidity_filters(
@@ -1145,7 +1143,7 @@ def _render_walkforward_tab() -> None:
     lab_vol.stability_section(lambda: _prepared_history(ds, filters), discount, max_days, data_key, prov, _banner)
 
 
-def _walkforward_results(stored: Mapping[str, object], data_key: str, settings_key: str, prov: Mapping) -> None:
+def _walkforward_results(stored: Mapping[str, Any], data_key: str, settings_key: str, prov: Mapping) -> None:
     _stale_notice(stored, data_key, settings_key, "walk-forward")
     result: WalkForwardResult = stored["result"]
     if result.empty:
@@ -1266,7 +1264,7 @@ def _model_params(comp: ModelComparison) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
+def _render_model_comparison_tab(ctx: Optional[Dict[str, Any]]) -> None:
     st.markdown("### / MODEL COMPARISON")
     if ctx is None:
         st.info("No usable chain: load one on the Market Data tab, or loosen its liquidity filters, to compare models.")
@@ -1350,7 +1348,7 @@ def _render_model_comparison_tab(ctx: Optional[Dict[str, object]]) -> None:
             st.error(f"Model comparison failed for this slice: {stored['error']}")
     elif stored:
         _stale_notice(stored, ctx["data_key"], settings_key, "model comparison")
-        comp: ModelComparison = stored["comp"]
+        comp = stored["comp"]  # a ModelComparison, as stored above
         table = comp.table
         st.dataframe(table, hide_index=True, width="stretch")
         failed = table[table["status"].astype(str).str.startswith("failed")]

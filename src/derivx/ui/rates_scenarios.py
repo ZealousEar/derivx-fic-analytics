@@ -15,7 +15,7 @@ import hashlib
 import io
 import math
 from dataclasses import replace
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -116,7 +116,10 @@ def book_currency(positions: Sequence[Position], market: Market) -> Tuple[str, b
     return _book_currency(positions, market)
 
 
-def _cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
+T = TypeVar("T")
+
+
+def _cached(name: str, key: tuple, compute: Callable[[], T]) -> T:
     """Keep the last few results of a slow computation across reruns."""
 
     entries = st.session_state.setdefault(f"scn_cache_{name}", {})

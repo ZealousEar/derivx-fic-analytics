@@ -313,3 +313,40 @@ def test_enforcement_reports_how_the_arbitrage_was_removed():
     assert free.arbitrage_repair == "none" and not free.penalised
     with pytest.raises(ValueError, match="loss"):
         fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="l1")
+
+
+def test_constrained_refit_silences_only_scipys_bound_clip_notice(monkeypatch):
+    """UIE-18: CI turns RuntimeWarnings into errors. SciPy 1.11's SLSQP warns
+    when a step lands a rounding error past a bound (it clips the point back
+    first), which failed the walk-forward on the oldest supported versions.
+    That notice is silenced inside the refit; any other warning still
+    surfaces."""
+
+    import warnings
+
+    import derivx.vol.svi as svi
+
+    K = np.exp(np.linspace(-1.0, 1.4, 25))
+    vols = svi_iv(K, VOGT, 1.0, 1.0)
+    expected = fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="linear", enforce_no_arbitrage=True)
+    real, calls = svi.minimize, []
+
+    def warning_minimize(message):
+        def run(*args, **kwargs):
+            calls.append(message)
+            warnings.warn(message, RuntimeWarning)
+            return real(*args, **kwargs)
+
+        return run
+
+    notice = "Values in x were outside bounds during a minimize step, clipping to bounds"
+    monkeypatch.setattr(svi, "minimize", warning_minimize(notice))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        fixed = fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="linear", enforce_no_arbitrage=True)
+    assert calls and fixed.params == expected.params and fixed.arbitrage_repair == expected.arbitrage_repair
+    monkeypatch.setattr(svi, "minimize", warning_minimize("overflow encountered in the objective"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning, match="overflow"):
+            fit_svi_strike_slice(K, vols, 1.0, 1.0, loss="linear", enforce_no_arbitrage=True)

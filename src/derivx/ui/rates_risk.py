@@ -8,7 +8,7 @@ projection curves on it with their quotes held), signed to the holder.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import numpy as np
 import plotly.graph_objects as go
@@ -122,11 +122,14 @@ def risk_keys(market: Market) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _store(name: str) -> Dict[tuple, object]:
+T = TypeVar("T")
+
+
+def _store(name: str) -> Dict[tuple, Any]:
     return st.session_state.setdefault(f"_rates_risk_{name}", {})
 
 
-def cached(name: str, key: tuple, compute: Callable[[], object]) -> object:
+def cached(name: str, key: tuple, compute: Callable[[], T]) -> T:
     """Keep the last few results of a slow computation across reruns (per
     session: results hold curves of this session's market)."""
 

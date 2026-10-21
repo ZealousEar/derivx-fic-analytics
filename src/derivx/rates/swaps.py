@@ -861,15 +861,18 @@ def benchmark_instruments(
     basis_index = getattr(curve, "basis_index", None)
     for tenor in tenors:
         if basis_index:
-            unit = BasisSwap(
+            basis = BasisSwap(
                 unit_notional, 0.0, tenor, spread_index=key, other_index=basis_index, trade_date=market.asof
             )
-            par = replace(unit, spread=unit.par_spread(market))
-            out.append((f"{tenor} {get_index(key).months}s{get_index(basis_index).months}s", basis_position(par)))
+            out.append(
+                (
+                    f"{tenor} {get_index(key).months}s{get_index(basis_index).months}s",
+                    basis_position(replace(basis, spread=basis.par_spread(market))),
+                )
+            )
         else:
-            unit = VanillaSwap.from_index(key, tenor, 0.0, notional=unit_notional, trade_date=market.asof)
-            par = replace(unit, fixed_rate=unit.par_rate(market))
-            out.append((f"{tenor} IRS {key}", swap_position(par)))
+            irs = VanillaSwap.from_index(key, tenor, 0.0, notional=unit_notional, trade_date=market.asof)
+            out.append((f"{tenor} IRS {key}", swap_position(replace(irs, fixed_rate=irs.par_rate(market)))))
     return out
 
 

@@ -67,7 +67,8 @@ dev = [
   "QuantLib==1.44",
   "black>=24",
   "ruff==0.17.1",
-  "mypy>=1.10"
+  # Pinned like ruff: a new mypy release adds checks, so CI only changes when this does.
+  "mypy==2.4.0"
 ]
 notebooks = [
   "matplotlib>=3.8,<4",
@@ -86,6 +87,62 @@ extend-exclude = [".worktrees"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+
+# A lenient start: CI type-checks the package against the Docker lock's versions
+# (requirements-lock.txt) and fails on any error code not switched off here.
+# What stays on: undefined names, wrong argument names or counts in calls,
+# redefinitions, missing annotations where mypy cannot infer a type, bad
+# overrides, missing returns and, outside the modules listed below, unknown
+# attributes. What is off for now: codes that mostly flag loose annotations,
+# not bugs (numpy arrays passed as Sequence[float], Streamlit's Optional widget
+# returns, values of heterogeneous dicts typed as object, pandas without
+# stubs). Turn them on one at a time as the code is annotated.
+[tool.mypy]
+python_version = "3.10"
+files = ["src/derivx"]
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disable_error_code = [
+  "arg-type",
+  "assignment",
+  "call-overload",
+  "dict-item",
+  "index",
+  "list-item",
+  "misc",
+  "operator",
+  "return-value",
+  "type-var",
+  "union-attr",
+]
+
+# Modules whose duck-typed instruments and Dict[str, object] results still
+# trip attr-defined (about 110 errors, none of them a missing attribute at
+# run time); new modules are checked for it.
+[[tool.mypy.overrides]]
+module = [
+  "derivx.cli",
+  "derivx.data.rates_history",
+  "derivx.rates.curve_io",
+  "derivx.rates.curve_models",
+  "derivx.rates.curves",
+  "derivx.rates.exports",
+  "derivx.rates.manifest",
+  "derivx.rates.multicurve",
+  "derivx.rates.portfolio",
+  "derivx.rates.swaptions",
+  "derivx.risk.scenarios",
+  "derivx.risk.sensitivities",
+  "derivx.ui.rates_bonds",
+  "derivx.ui.rates_capfloor",
+  "derivx.ui.rates_risk",
+  "derivx.ui.rates_scenarios",
+  "derivx.ui.rates_swap",
+  "derivx.ui.rates_swaption",
+]
+disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

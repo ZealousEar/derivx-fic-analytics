@@ -27,7 +27,7 @@ comparable number across models with different numbers of parameters.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -53,7 +53,7 @@ class ModelComparison:
 
     table: pd.DataFrame
     clean: CleanSlice
-    fits: Dict[str, object] = field(default_factory=dict)
+    fits: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def quotes(self) -> pd.DataFrame:
@@ -151,7 +151,8 @@ def fit_models(
     k = q["k"].to_numpy(float)
     F, T = clean.forward, clean.tau
     rows = []
-    fits: Dict[str, object] = {}
+    fits: Dict[str, Any] = {}
+    fit: Any  # SviFit, SabrCalibration or CubicSpline, by model
     for name in models:
         row = {"model": name, "description": MODELS[name], "n_params": N_PARAMS[name], "n_points": int(K.size)}
         try:
@@ -358,7 +359,7 @@ def summarise_comparison(scores: pd.DataFrame, metric: str = "rmse_cv_bp") -> pd
     return pd.DataFrame(rows)
 
 
-def pairwise_wins(scores: pd.DataFrame, a: str, b: str, metric: str = "rmse_cv_bp") -> Dict[str, object]:
+def pairwise_wins(scores: pd.DataFrame, a: str, b: str, metric: str = "rmse_cv_bp") -> Dict[str, Any]:
     """On slices where both ``a`` and ``b`` were scored: how many times
     ``a``'s ``metric`` is lower, higher or equal, and the median of
     ``metric(a) - metric(b)`` (negative: ``a`` is better)."""
@@ -385,7 +386,7 @@ MODEL_LABELS = {"svi": "SVI", "sabr": "SABR", "spline": "IV spline"}
 def describe_pairwise(
     a: str,
     b: str,
-    res: Dict[str, object],
+    res: Dict[str, Any],
     labels: Optional[Dict[str, str]] = None,
     items: str = "expiries",
     unit: str = "vol bp",

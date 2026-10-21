@@ -24,13 +24,13 @@ restore_widget_values()  # before any page draws: inputs of a mode switched back
 
 # Minimalist mode selector - architectural, no emojis
 st.sidebar.markdown("### / NAVIGATION")
-mode = st.sidebar.radio(
+choice = st.sidebar.radio(
     "MODE",
     ["[ EQUITY ]", "[ FX ]", "[ RATES ]", "[ ANALYTICS ]"],
     format_func=lambda x: x,
     label_visibility="collapsed",
 )
-mode = mode.replace("[", "").replace("]", "").strip()  # Extract mode name
+mode = (choice or "").replace("[", "").replace("]", "").strip()  # Extract mode name (a radio always has one)
 
 apply_app_style()
 

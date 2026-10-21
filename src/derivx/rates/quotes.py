@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -143,7 +143,7 @@ def clean_quotes(
     scale = UNIT_SCALE[units]
 
     quotes: List[CurveQuote] = []
-    seen = {}
+    seen: Dict[tuple, int] = {}  # quote key -> first row
     for n, kind, tenor, rate in parsed:
         if kind in FUTURES_KINDS:
             try:

@@ -84,7 +84,7 @@ def _widget_keys() -> Tuple[List[str], List[str]]:
         return [], []
     state = ctx.session_state._state
     shared = getattr(ctx, "shared", None)  # Streamlit >= 1.6x keeps per-run sets here
-    drawn_ids = shared.widget_ids_this_run if shared is not None else ctx.widget_ids_this_run
+    drawn_ids = shared.widget_ids_this_run if shared is not None else getattr(ctx, "widget_ids_this_run")
     metadata = state._new_widget_state.widget_metadata
     undrawn, drawn = [], []
     for widget_id, user_key in dict(state._key_id_mapper.id_key_mapping).items():

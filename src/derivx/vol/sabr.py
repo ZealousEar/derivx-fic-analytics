@@ -331,8 +331,8 @@ def atm_vol_from_quotes(f: float, k: np.ndarray, vols: np.ndarray) -> float:
 
 
 def calibrate_sabr_smile(
-    Ks: Sequence[float],
-    ivs: Sequence[float],
+    Ks: Union[Sequence[float], np.ndarray],
+    ivs: Union[Sequence[float], np.ndarray],
     T: float,
     F: float,
     beta: float = 0.5,

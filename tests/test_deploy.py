@@ -207,6 +207,59 @@ def test_the_ci_docker_job_checks_xsrf_and_cors_on_the_running_container():
     assert "headers=$(curl -fsS" in text and "exit 1" in text
 
 
+def _ci_jobs() -> Dict[str, str]:
+    """Job id -> its text, for the jobs of .github/workflows/ci.yaml."""
+
+    body = (ROOT / ".github" / "workflows" / "ci.yaml").read_text().split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):\n", body, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _dev_pins() -> Dict[str, str]:
+    dev = _pyproject()["project"]["optional-dependencies"]["dev"]
+    return {canonicalize_name(Requirement(r).name): str(Requirement(r).specifier) for r in dev}
+
+
+def test_ci_type_checks_the_package_with_the_dev_extras_mypy_on_the_locked_versions():
+    """UIE-18: mypy was in the dev extra with no config and never ran."""
+
+    jobs = _ci_jobs()
+    runs_mypy = [job for job, body in jobs.items() if re.search(r"^\s*run: mypy\s*$", body, re.MULTILINE)]
+    assert runs_mypy, "no CI job runs mypy"
+    body = jobs[runs_mypy[0]]
+    pin = re.search(r'"mypy==([^"]+)"', body)
+    assert pin and _dev_pins()["mypy"] == f"=={pin.group(1)}"  # CI and `pip install -e .[dev]` agree
+    assert "-r requirements-lock.txt" in body  # the tested resolution, not whatever stubs are newest
+    ruff = re.search(r'"ruff==([^"]+)"', jobs["lint"])
+    assert ruff and _dev_pins()["ruff"] == f"=={ruff.group(1)}"
+    cfg = _pyproject()["tool"]["mypy"]
+    assert cfg["files"] == ["src/derivx"] and cfg["python_version"] == "3.10"
+    # Lenient, not off: no module is skipped, and the codes that flag real defects stay on everywhere.
+    overrides = cfg.get("overrides", [])
+    assert "ignore_errors" not in cfg and all("ignore_errors" not in o for o in overrides)
+    off = set(cfg["disable_error_code"]) | {c for o in overrides for c in o.get("disable_error_code", [])}
+    on = {"call-arg", "name-defined", "no-redef", "var-annotated", "has-type", "override", "return", "import"}
+    assert not off & on
+    assert all(o["disable_error_code"] == ["attr-defined"] for o in overrides)  # the attr-defined baseline only
+
+
+def test_every_ci_test_run_turns_deprecation_and_runtime_warnings_into_errors():
+    """UIE-18: the suite passes with both, so CI keeps it that way (the
+    notebooks job executes notebooks in a kernel, where -W does not reach)."""
+
+    runs = [
+        (job, line)
+        for job, body in _ci_jobs().items()
+        for line in body.splitlines()
+        if re.search(r"-m pytest\b|^\s*(run:\s*)?pytest\b", line) and "--nbmake" not in line
+    ]
+    assert {job for job, _ in runs} >= {"test", "oldest"}
+    runs += [("Dockerfile test stage", args) for word, args in _dockerfile() if word == "RUN" and "-m pytest" in args]
+    assert len(runs) >= 3
+    for where, line in runs:
+        assert "-W error::DeprecationWarning" in line and "-W error::RuntimeWarning" in line, (where, line)
+
+
 def test_setup_sh_is_gone_and_the_procfile_runs_streamlit_on_the_host_port():
     assert not (ROOT / "setup.sh").exists()  # it wrote ~/.streamlit/config.toml with dash-only echo escapes
     lines = [line for line in (ROOT / "Procfile").read_text().splitlines() if line.strip()]

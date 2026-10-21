@@ -98,7 +98,8 @@ def _rgb(color: str) -> Tuple[float, float, float]:
     h = h[1:]
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
-    return tuple(float(int(h[i : i + 2], 16)) for i in (0, 2, 4))  # type: ignore[return-value]
+    r, g, b = (float(int(h[i : i + 2], 16)) for i in (0, 2, 4))
+    return r, g, b
 
 
 def relative_luminance(color: str) -> float:
