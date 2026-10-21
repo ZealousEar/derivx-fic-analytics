@@ -53,11 +53,14 @@ RUN python -m pip install --user "pytest>=8,<10" \
 
 FROM app AS runtime
 
+# DERIVX_CACHE_DIR: a writable place for downloaded market data (the app user
+# cannot write under /app, which root owns).
 ENV STREAMLIT_SERVER_PORT=8501 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_FILE_WATCHER_TYPE=none \
-    STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type
+    STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type \
+    DERIVX_CACHE_DIR=/home/derivx/.cache/derivx
 
 EXPOSE 8501
 
