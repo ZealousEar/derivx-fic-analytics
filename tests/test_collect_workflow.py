@@ -5,7 +5,8 @@ schedule), one run at a time, and never splices inputs into its scripts.
 Its branch and publish scripts are run here as they are, with git, against
 a local bare repository: the first run that saves a session creates the
 orphan ``data-snapshots`` branch, later runs append, a run with nothing new
-commits nothing. No network (the staged snapshots are recorded fakes)."""
+commits nothing, a rejected push is rebuilt on the branch's new tip. No
+network (the staged snapshots are recorded fakes)."""
 
 from __future__ import annotations
 
@@ -178,6 +179,32 @@ def test_publish_creates_the_orphan_branch_then_appends_and_skips_empty_runs(wor
     third = _run(tmp_path, origin, env, "run3", [])  # a holiday: nothing staged
     assert third.returncode == 0 and "Nothing new to commit" in third.stdout
     assert len(_git("log", "--format=%s", "data-snapshots", cwd=origin).splitlines()) == 2
+    assert "Pushed to data-snapshots: SPY_2026-10-21" in summary.read_text()
+
+
+def test_a_rejected_push_is_rebuilt_on_the_new_tip(workspace):
+    tmp_path, origin, env, summary = workspace
+    assert _run(tmp_path, origin, env, "run1", ["2026-10-20"]).returncode == 0
+    ws = tmp_path / "run2"
+    _git("clone", "-q", str(origin), str(ws / "code"), cwd=tmp_path)
+    assert _bash(_step("Check out data-snapshots")["run"], ws / "code", env).returncode == 0
+    real_store(ws / "staging", ["2026-10-20", "2026-10-21"])
+    # after this run checked the branch out, someone else pushes to it: the run's first push is rejected
+    other = tmp_path / "other"
+    _git("clone", "-q", "-b", "data-snapshots", str(origin), str(other), cwd=tmp_path)
+    (other / "README.md").write_text("notes on the data branch\n")
+    _git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-am", "docs: notes", cwd=other)
+    _git("push", "-q", "origin", "data-snapshots", cwd=other)
+    result = _bash(_step("Copy the new files")["run"], ws / "store", env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "push rejected (attempt 1)" in result.stdout
+    # the data commit is rebuilt on top of the other push: nothing of either is lost, nothing is mislabelled
+    log = _git("log", "--format=%an|%s", "data-snapshots", cwd=origin).splitlines()
+    assert log == ["github-actions[bot]|data: option chains SPY_2026-10-21", "t|docs: notes",
+                   "github-actions[bot]|data: option chains SPY_2026-10-20"]  # fmt: skip
+    assert _git("show", "data-snapshots:README.md", cwd=origin) == "notes on the data branch\n"
+    index = _git("show", "data-snapshots:options/index.csv", cwd=origin).splitlines()
+    assert [row.split(",")[0] for row in index[1:]] == ["2026-10-20", "2026-10-21"]
     assert "Pushed to data-snapshots: SPY_2026-10-21" in summary.read_text()
 
 
