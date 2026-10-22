@@ -8,6 +8,7 @@ from the SYNTHETIC history or the recorded fake Yahoo chain; no network."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -44,7 +45,8 @@ def _texts(at: AppTest) -> str:
 def test_without_a_synced_copy_the_panel_explains_how_to_get_one():
     at = _collected(_lab())
     text = _texts(at)
-    assert "No collected history here yet" in text and "has not been synced" in text
+    assert "No collected history here yet" in text and "has not been synced on this server" in text
+    assert os.environ["DERIVX_CACHE_DIR"] not in text  # no server path on the page
     assert not [b for b in at.button if b.key == "lab_hist_use"]
     # SYNC NOW goes to the network, which the tests block: the failure says why, and nothing breaks
     at.button(key="lab_hist_sync").click().run()

@@ -97,7 +97,7 @@ from scipy.stats import norm
 from derivx.data.rates_history import FX_DATASET, HistoryStore, dataset_info, user_dataset
 from derivx.rates.curves import DISCOUNT_KEY, GOVT_KEY, SPREAD_KINDS, Market
 from derivx.rates.pca import MAX_GAP_DAYS, tenor_map, tenor_years
-from derivx.risk.reporting import Reporting, market_pair, ordered, total_label
+from derivx.risk.reporting import CURRENCIES, Reporting, market_pair, ordered, total_label
 from derivx.risk.scenarios import GOVT_HISTORY, SWAP_HISTORY, SWAP_PROXIES, QuoteRisk, quoted_levels, shocked_curves
 from derivx.risk.sensitivities import Position
 
@@ -202,7 +202,7 @@ class VarScenarios:
             rows.append(
                 {
                     "curve": FX_KEY,
-                    "currency": ", ".join(c for c in sorted(self.fx.ratio) if c != "EUR"),
+                    "currency": ", ".join(c for c in CURRENCIES if c in self.fx.ratio),
                     "history": self.fx.title,
                     "dataset": FX_DATASET,
                     "flag": "real",

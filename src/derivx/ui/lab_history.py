@@ -69,15 +69,18 @@ def synced_store() -> Tuple[Optional[SnapshotStore], Dict[str, Any], str]:
     repository and branch in the cache (read offline, never downloaded)."""
 
     local = os.environ.get(LOCAL_ENV, "").strip()
+    label = f"local checkout of the data branch (${LOCAL_ENV})"  # server paths are never shown on the page
     if local:
         root = Path(local).expanduser()
         if not (root / "options" / "index.csv").exists():
-            return None, {}, f"${LOCAL_ENV} = {local} holds no options/index.csv (not a data-branch checkout)"
-        return SnapshotStore(root, f"local checkout {root}"), {"source": f"local checkout {root}"}, ""
+            return None, {}, f"${LOCAL_ENV} names a directory without options/index.csv (not a data-branch checkout)"
+        return SnapshotStore(root, label), {"source": label}, ""
     repo, branch = _source()
     try:
         result = sync(repo, branch, offline=True)
-    except (SnapshotError, ValueError) as exc:
+    except SnapshotError:
+        return None, {"repo": repo, "branch": branch}, f"{repo}@{branch} has not been synced on this server"
+    except ValueError as exc:
         return None, {"repo": repo, "branch": branch}, str(exc)
     info = {"source": f"{repo}@{branch}", "repo": repo, "branch": branch, "synced_at": result.synced_at,
             "url": result.url}  # fmt: skip
@@ -182,6 +185,9 @@ def render_walkforward_source(on_use: Callable[[ChainDataset, Dict[str, Any]], N
         if st.button("Sync now", key="lab_hist_sync", width="stretch"):
             _sync_now(*_source())
             st.rerun()  # the MARKET DATA tab, drawn earlier in this run, reads the new copy too
+    if os.environ.get(LOCAL_ENV, "").strip():
+        st.caption(f"${LOCAL_ENV} is set: the lab reads that local checkout of the data branch; SYNC NOW only "
+                   "refreshes the cached copy of the repository above.")  # fmt: skip
     _message()
     store, info, why = synced_store()
     if store is None:
