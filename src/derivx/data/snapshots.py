@@ -229,6 +229,28 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+SYNTHETIC_LABEL = "SYNTHETIC (generated, not market data)"
+
+
+UNRECORDED = "unrecorded"  # :meth:`SnapshotStore.row_sources` of a manifest without them (or unreadable)
+
+
+def source_label(row_sources: Iterable[str]) -> str:
+    """What a stored file holds, from its rows' ``source`` values: Yahoo's
+    delayed quotes (``yahoo``), SYNTHETIC rows (named as such whatever else
+    is there), a source the manifests do not record (:data:`UNRECORDED`),
+    or the values themselves."""
+
+    sources = sorted({str(s) for s in row_sources})
+    if any("synthetic" in s.lower() for s in sources):
+        return SYNTHETIC_LABEL
+    if sources == ["yahoo"]:
+        return SOURCE_LABEL
+    if UNRECORDED in sources:
+        return "rows of a source some manifests do not record (see each file's source column)"
+    return "rows from " + (", ".join(sources) if sources else "an unnamed source")
+
+
 # --------------------------------------------------------------------------
 # Snapshots and the store
 # --------------------------------------------------------------------------
@@ -244,6 +266,20 @@ def relative_path(ticker: str, session: str) -> PurePosixPath:
 
 def manifest_path(data_path: PurePosixPath) -> PurePosixPath:
     return data_path.with_name(data_path.name[: -len(".csv.gz")] + ".json")
+
+
+def layout_problem(ticker: object, session: object, path: object) -> Optional[str]:
+    """Why an index row's ``path`` is not where the layout files its ticker
+    and session (None when it is): a row that names another session's file
+    would file that chain under a false date."""
+
+    try:
+        expected = str(relative_path(str(ticker), str(session)))
+    except ValueError as exc:
+        return f"{path}: index row ({ticker}, {session}) is not a ticker and session ({exc})"
+    if str(path) != expected:
+        return f"{path}: the index files ({ticker}, {session}) here, the layout puts it at {expected}"
+    return None
 
 
 def _ticker(ticker: str) -> str:
@@ -307,7 +343,12 @@ def build_snapshot(
 
     status = result.status
     if status.status != "ok":
-        raise ValueError(f"{status.ticker}: not stored, the fetch is {status.status.upper()}: {status.summary()}")
+        failed = "; ".join(f"{e}: {why}" for e, why in list(status.failed_expiries.items())[:3])
+        more = "..." if len(status.failed_expiries) > 3 else ""
+        raise ValueError(
+            f"{status.ticker}: not stored, the fetch is not complete ({status.summary()})"
+            + (f"; failed expiries: {failed}{more}" if failed else "")
+        )
     served = str(status.quote_date)
     if session is not None and served != _session(session):
         raise ValueError(
@@ -318,6 +359,7 @@ def build_snapshot(
     if frame.empty:
         raise ValueError(f"{status.ticker}: no quote is within the storage limits {limits.as_dict()}")
     data = store_bytes(frame)
+    row_sources = sorted({str(s) for s in frame["source"].dropna()}) if "source" in frame else []
     manifest: Dict[str, Any] = {
         "store_version": STORE_VERSION,
         "ticker": status.ticker,
@@ -330,7 +372,8 @@ def build_snapshot(
         "spot": status.spot,
         "spot_time_utc": status.spot_time_utc,
         "fetched_at_utc": status.finished_at_utc,
-        "source": SOURCE_LABEL,
+        "source": source_label(row_sources),
+        "row_sources": row_sources,
         "terms": TERMS,
         "columns": list(frame.columns),
         "limits": limits.as_dict(),
@@ -339,7 +382,11 @@ def build_snapshot(
         "manifest": build_manifest(
             "snapshot",
             inputs={"ticker": status.ticker, "expiries_requested": status.expiries_requested},
-            data={"source": SOURCE_LABEL, "fetched_at_utc": status.finished_at_utc, "data_sha256": sha256_hex(data)},
+            data={
+                "source": source_label(row_sources),
+                "fetched_at_utc": status.finished_at_utc,
+                "data_sha256": sha256_hex(data),
+            },  # fmt: skip
             model={"store_version": STORE_VERSION, "limits": limits.as_dict()},
         ),
     }
@@ -487,14 +534,19 @@ class SnapshotStore:
         return self.index()
 
     def verify(self) -> List[str]:
-        """Problems: index rows without their file or with another SHA-256,
-        and stored files the index does not list."""
+        """Problems: index rows that name a path other than their ticker's
+        and session's, rows without their file or with another SHA-256, and
+        stored files the index does not list."""
 
         problems = []
         index = self.index()
         listed = set()
         for row in index.itertuples(index=False):
             listed.add(str(row.path))
+            misplaced = layout_problem(row.ticker, row.session, row.path)
+            if misplaced:
+                problems.append(misplaced)
+                continue
             try:
                 path = self.file(str(row.path))
             except SnapshotError as exc:
@@ -570,18 +622,43 @@ class SnapshotStore:
 
         path = self.file(manifest_path(relative_path(ticker, _session(session))))
         try:
-            return json.loads(path.read_text())
+            manifest = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
-            raise SnapshotError(f"{path.name}: no readable manifest in {self.label} ({exc})") from None
+            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+            raise SnapshotError(f"{path.name}: no readable manifest in {self.label} ({reason})") from None
+        if not isinstance(manifest, dict):
+            raise SnapshotError(f"{path.name}: not a manifest (a JSON object) in {self.label}")
+        return manifest
+
+    def row_sources(self, ticker: str, sessions: Optional[Iterable[object]] = None) -> List[str]:
+        """The distinct ``source`` values of the rows of ``ticker``'s stored
+        files (all, or ``sessions``), from their manifests' ``row_sources``;
+        a manifest without them (written before they were kept) or an
+        unreadable one counts as :data:`UNRECORDED`, never as a guess."""
+
+        days = [d.isoformat() for d in self.sessions(ticker)] if sessions is None else [_session(s) for s in sessions]
+        out: set = set()
+        for day in days:
+            try:
+                listed = self.manifest(ticker, day).get("row_sources")
+            except SnapshotError:
+                listed = None
+            out |= {str(s) for s in listed} if isinstance(listed, list) and listed else {UNRECORDED}
+        return sorted(out)
 
     def sessions(self, ticker: str) -> List[dt.date]:
         index = self.index()
         picked = index[index["ticker"].astype(str) == _ticker(ticker)]
         return sorted(pd.Timestamp(s).date() for s in picked["session"].astype(str))
 
-    def coverage(self, ticker: str) -> Coverage:
+    def coverage(self, ticker: str, last: Optional[int] = None) -> Coverage:
+        """Coverage of ``ticker``'s sessions (``last``: only the most recent
+        ``last`` of them)."""
+
         index = self.index()
-        picked = index[index["ticker"].astype(str) == _ticker(ticker)]
+        picked = index[index["ticker"].astype(str) == _ticker(ticker)].sort_values("session", kind="stable")
+        if last is not None:
+            picked = picked.iloc[-max(int(last), 1) :]
         days = sorted(pd.Timestamp(s).date() for s in picked["session"].astype(str))
         gaps = tuple(d.date() for d in missing_trading_days(days))
         return Coverage(
@@ -595,7 +672,8 @@ class SnapshotStore:
     def load(self, ticker: str, sessions: Optional[Iterable[object]] = None, verify: bool = True) -> ChainDataset:
         """The stored sessions of ``ticker`` (all, or ``sessions``) as one
         validated :class:`ChainDataset`, each file checked against the
-        index's SHA-256 (``verify``)."""
+        index's SHA-256 (``verify``), its place in the layout and its own
+        trade date (a file holding another session is refused)."""
 
         symbol = _ticker(ticker)
         index = self.index()
@@ -610,6 +688,9 @@ class SnapshotStore:
             raise SnapshotError(f"{symbol}: no stored sessions in {self.label}")
         datasets = []
         for row in picked.sort_values("session").itertuples(index=False):
+            misplaced = layout_problem(row.ticker, row.session, row.path)
+            if misplaced:
+                raise SnapshotError(misplaced)
             path = self.file(str(row.path))
             try:
                 data = path.read_bytes()
@@ -621,6 +702,9 @@ class SnapshotStore:
                 ds = load_chain_file(path.name, data, ticker=symbol)
             except ChainSchemaError as exc:
                 raise SnapshotError(f"{row.path}: {exc}") from None
+            held = [d.date().isoformat() for d in ds.trade_dates]
+            if held != [_session(row.session)]:
+                raise SnapshotError(f"{row.path}: holds the session(s) {', '.join(held)}, not {row.session}")
             ds.files = [str(row.path)]
             datasets.append(ds)
         merged = merge_datasets(datasets, source=f"collected history: {self.label}")
@@ -774,11 +858,14 @@ def collect(
     """Collect the due session (:func:`due_session`) of each ticker into
     the ``staging`` store, skipping tickers whose session ``store`` (the
     published store, e.g. a checkout of the data branch) or ``staging``
-    already holds. A fetch that fails, is partial or serves another
-    session is retried ``attempts`` times in all, waiting ``wait_s``
+    already holds. A fetch that fails, is partial, serves another session
+    or raises is retried ``attempts`` times in all, waiting ``wait_s``
     seconds, then twice that, between attempts (each Yahoo request also
     retries ``retries_per_request`` times with backoff); after that the
-    ticker is ``failed`` and nothing is written for it."""
+    ticker is ``failed`` and nothing is written for it, and the next
+    ticker is collected. Expiries are requested from ``limits.min_days``
+    after the *session* (the fetch's own ``min_days`` counts from the New
+    York date of the fetch, a day later for a run after midnight)."""
 
     from derivx.data.market_data import Backoff
 
@@ -794,6 +881,7 @@ def collect(
     report = CollectReport(stamp, session.isoformat() if session else None, reason, limits=limits.as_dict(),
                            dry_run=dry_run)  # fmt: skip
     staged = SnapshotStore(staging, "staging")
+    run_started = time.monotonic()
     for symbol in symbols:
         if session is None:
             report.outcomes.append(Outcome(symbol, None, "skipped", "no session due"))
@@ -809,14 +897,18 @@ def collect(
         started = time.monotonic()
         for attempt in range(1, int(attempts) + 1):
             outcome.attempts = attempt
-            result = fetch(symbol, min_days=float(limits.min_days), backoff=Backoff(retries=int(retries_per_request)))
-            status = result.status
-            outcome.requests += int(status.requests)
-            outcome.retries += int(status.retries)
+            # the fetch counts min_days from its own New York date: shift it so the window starts at the session
+            fetch_day = _ny(clock + pd.Timedelta(seconds=time.monotonic() - run_started)).date()
+            min_days = max(0.0, float(limits.min_days) - (fetch_day - session).days)
             try:
+                result = fetch(symbol, min_days=min_days, backoff=Backoff(retries=int(retries_per_request)))
+                status = result.status
+                outcome.requests += int(status.requests)
+                outcome.retries += int(status.retries)
                 snapshot = build_snapshot(result, limits, session=day)
-            except ValueError as exc:
-                outcome.reason = f"attempt {attempt}: {exc}"
+            except Exception as exc:  # a refused fetch (ValueError) or anything the fetch raised: retry, then fail
+                text = str(exc) if isinstance(exc, ValueError) else f"{type(exc).__name__}: {exc}"
+                outcome.reason = f"attempt {attempt}: {text}"
                 if attempt < int(attempts):
                     sleep(float(wait_s) * 2 ** (attempt - 1))
                 continue
@@ -924,6 +1016,16 @@ class SyncResult:
 SYNC_META = "sync.json"
 
 
+def _readable_manifest(store: SnapshotStore, rel: PurePosixPath) -> bool:
+    """True when the JSON sidecar of a cached file is there and parses (a
+    cached file without it is downloaded again)."""
+
+    try:
+        return isinstance(json.loads(store.file(manifest_path(rel)).read_text()), dict)
+    except (OSError, ValueError):
+        return False
+
+
 def sync(
     repo: Optional[str] = None,
     branch: Optional[str] = None,
@@ -985,12 +1087,12 @@ def sync(
     have_rows = []
     for row in remote.itertuples(index=False):
         rel = PurePosixPath(str(row.path))
-        try:
-            local = store.file(rel)
-        except SnapshotError as exc:
-            result.failed.append(str(exc))
+        misplaced = layout_problem(row.ticker, row.session, row.path)
+        if misplaced:
+            result.failed.append(f"{misplaced} (not kept)")
             continue
-        if local.exists() and sha256_hex(local.read_bytes()) == str(row.sha256):
+        local = store.file(rel)
+        if local.exists() and sha256_hex(local.read_bytes()) == str(row.sha256) and _readable_manifest(store, rel):
             result.cached += 1
             have_rows.append(row._asdict())
         else:
@@ -1003,10 +1105,13 @@ def sync(
             meta = rs.http_get(f"{url}/{manifest_path(rel)}", timeout=timeout, retries=retries)
         except rs.SourceError as exc:
             return row, f"{rel}: {exc}"
+        except Exception as exc:  # anything else one download raises fails that file, never the whole sync
+            return row, f"{rel}: {type(exc).__name__}: {exc}"
         if sha256_hex(data) != str(row.sha256):
             return row, f"{rel}: the download's SHA-256 differs from the index (not kept)"
         try:
-            json.loads(meta)
+            if not isinstance(json.loads(meta), dict):
+                raise ValueError("not an object")
         except ValueError:
             return row, f"{manifest_path(rel)}: not a JSON manifest (not kept)"
         _atomic_write(store.file(manifest_path(rel)), meta)

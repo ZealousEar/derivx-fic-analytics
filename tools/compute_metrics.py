@@ -52,9 +52,10 @@ summary says how many there are. Outputs: ``walkforward_summary.csv``,
 ``walkforward_daily.csv``, ``walkforward_by_regime.csv``,
 ``walkforward_slices.csv``, ``sessions.csv`` (the index rows used, with
 each file's SHA-256), ``summary.json``, ``METRICS_SUMMARY.md`` and
-``manifest.json``. Everything but the manifest's run time is a function of
-the store's files and the code version, so a rerun on the same sessions
-reproduces it byte for byte. A session uses the latest Treasury curve at
+``manifest.json``. Everything but the manifest (run time, and where and
+when the store was synced or checked out) is a function of the store's
+files and the code version, so a rerun on the same sessions reproduces it
+byte for byte, from a re-synced cache or another checkout too. A session uses the latest Treasury curve at
 most 7 days before it; sessions more than 7 days after the committed curves
 (which end 2026-10-19) are discounted at the flat ``--rate`` unless
 ``--with-cache`` adds the Treasury curves in the download cache (``derivx
@@ -377,21 +378,28 @@ def load_history(
     offline: bool = False,
     first: Optional[str] = None,
     last: Optional[str] = None,
-) -> Tuple[ChainDataset, Dict[str, object], pd.DataFrame]:
-    """(sessions of ``ticker``, provenance, their index rows) from a local
-    checkout ``store_dir`` or the synced copy of ``repo``@``branch``."""
+) -> Tuple[ChainDataset, Dict[str, object], pd.DataFrame, Dict[str, object]]:
+    """(sessions of ``ticker``, provenance, their index rows, the sync)
+    from a local checkout ``store_dir`` or the synced copy of
+    ``repo``@``branch``. The provenance depends only on the stored files
+    (it goes into the reproducible outputs); where and when they were
+    synced or checked out is the fourth item (it goes into the manifest)."""
 
     from derivx.data.snapshots import SnapshotStore, sha256_hex, sync
 
     if store_dir is not None:
-        store = SnapshotStore(store_dir, f"local checkout {store_dir.name}")
-        info: Dict[str, object] = {"source": "local checkout of the data branch"}
+        label = "local checkout of the data branch"  # not the directory: the outputs must not depend on it
+        store = SnapshotStore(store_dir, label)
+        info: Dict[str, object] = {"source": label}
+        run: Dict[str, object] = {"local_checkout": str(store_dir)}
     else:
         result = sync(repo, branch, tickers=[ticker], offline=True if offline else None)
         store = result.store
-        info = {"source": store.label, "url": result.url, "synced_at": result.synced_at, "notices": result.notices}
+        info = {"source": store.label}
+        run = {"url": result.url, "synced_at": result.synced_at, "offline": result.offline, "notices": result.notices,
+               "downloaded": result.downloaded, "cached": result.cached}  # fmt: skip
         if result.failed:
-            info["sync_failed"] = list(result.failed)
+            run["sync_failed"] = list(result.failed)
     index = store.index()
     rows = index[index["ticker"].astype(str) == ticker.upper()].sort_values("session")
     if first:
@@ -410,7 +418,7 @@ def load_history(
             "sessions_sha256": sha256_hex(rows.to_csv(index=False, lineterminator="\n").encode()),
         }
     )
-    return ds, info, rows.reset_index(drop=True)
+    return ds, info, rows.reset_index(drop=True), run
 
 
 def compute_history(
@@ -558,11 +566,14 @@ def main_history(args: argparse.Namespace, argv: Optional[Sequence[str]]) -> int
     from derivx.data.snapshots import SnapshotError
 
     try:
-        ds, info, sessions = load_history(args.ticker, args.store, args.repo, args.branch, args.offline,
-                                          args.first, args.last)  # fmt: skip
+        ds, info, sessions, run = load_history(args.ticker, args.store, args.repo, args.branch, args.offline,
+                                               args.first, args.last)  # fmt: skip
     except (SnapshotError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    failed = run.get("sync_failed")
+    for problem in failed if isinstance(failed, list) else []:
+        print(f"warning: not synced, so not used: {problem}", file=sys.stderr)
     print(f"Loaded {len(ds.chains)} collected session(s) of {ds.ticker} ({ds.rows:,} rows) from {info['source']}")
     discount = discounting_for(ds, args.discount, args.rate, with_cache=args.with_cache)
     try:
@@ -575,7 +586,12 @@ def main_history(args: argparse.Namespace, argv: Optional[Sequence[str]]) -> int
     manifest = build_manifest(
         "metrics_history",
         inputs={"argv": list(argv) if argv is not None else sys.argv[1:], **result["summary"]["filters"]},
-        data={**ds.provenance(), "collection": info, "files": sessions[["path", "sha256"]].to_dict(orient="records")},
+        data={
+            **ds.provenance(),
+            "collection": info,
+            "sync": run,
+            "files": sessions[["path", "sha256"]].to_dict(orient="records"),
+        },
         model=result["summary"]["settings"],
     )
     for path in write_history(result, sessions, args.outdir, manifest):

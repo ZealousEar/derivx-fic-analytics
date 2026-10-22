@@ -14,11 +14,16 @@ index's SHA-256.
 Two uses:
 
 * WALK-FORWARD VALIDATION, source *Collected history*: coverage and
-  provenance of the collected sessions, and the walk-forward once they hold
-  enough origin days (:func:`derivx.data.snapshots.origins_needed`: three
-  per vol-regime tercile, 9 at the defaults; an origin day needs the
-  session ``horizon`` trading days later). Until then the panel says how
-  many sessions are collected and how many origin days are still needed.
+  provenance of the collected sessions (what the rows are comes from each
+  file's manifest: Yahoo's delayed quotes, or SYNTHETIC rows named as
+  such), and the walk-forward on the most recent N of them (SESSIONS: a run
+  takes a few seconds per session, so a long history is not run whole by
+  default; ``tools/compute_metrics.py --history`` runs any range offline)
+  once they hold enough origin days
+  (:func:`derivx.data.snapshots.origins_needed`: three per vol-regime
+  tercile, 9 at the defaults; an origin day needs the session ``horizon``
+  trading days later). Until then the panel says how many sessions are
+  collected and how many origin days are still needed.
 * MARKET DATA, *Collected history*: any collected session as the active
   dataset, so calibration, the vol surface and model comparison run on it.
 """
@@ -41,6 +46,7 @@ from derivx.data.snapshots import (
     default_repo,
     origins_needed,
     scorable_origins,
+    source_label,
     sync,
 )
 from derivx.ui.lab_common import banner, stats
@@ -51,7 +57,10 @@ REPO_KEY = "lab_hist_repo"
 BRANCH_KEY = "lab_hist_branch"
 TICKER_KEY = "lab_hist_ticker"
 MSG_KEY = "lab_hist_message"
+WINDOW_KEY = "lab_hist_window"
 SOURCE_LABEL = "Collected history"
+WINDOWS = (10, 20, 30, 60, 120, 250)  # most recent sessions a walk-forward runs on; plus "all"
+DEFAULT_WINDOW = 30  # about two minutes at the default settings on real SPY chains (about 4 s a session)
 
 
 def _source() -> Tuple[str, str]:
@@ -115,7 +124,7 @@ def _message() -> None:
         getattr(st, level if level in ("error", "warning", "success") else "info")(text)
 
 
-@st.cache_data(max_entries=8, show_spinner=False)
+@st.cache_data(max_entries=4, show_spinner=False)  # a long history is large: keep few copies
 def _load(root: str, label: str, ticker: str, sessions: Tuple[str, ...], index_sha: str) -> ChainDataset:
     """Stored sessions as one validated dataset (cached on the store's
     index content: a re-sync that adds a session is a new key)."""
@@ -134,8 +143,28 @@ def load(store: SnapshotStore, ticker: str, sessions: Optional[Tuple[str, ...]] 
     return _load(str(store.root), store.label, ticker, tuple(days), _index_sha(store))
 
 
-def coverage_parts(cov: Coverage, info: Dict[str, Any], horizon: int = 1) -> Tuple[list, int, int]:
-    """(banner parts, origin days at ``horizon``, origin days needed)."""
+@st.cache_data(max_entries=16, show_spinner=False)
+def _row_sources(root: str, label: str, ticker: str, index_sha: str) -> Tuple[str, ...]:
+    """The rows' sources of every stored file of ``ticker`` (cached on the
+    index content)."""
+
+    return tuple(SnapshotStore(Path(root), label).row_sources(ticker))
+
+
+def data_label(store: SnapshotStore, ticker: str) -> str:
+    """What the stored files of ``ticker`` hold, from their manifests (never
+    assumed: a store of SYNTHETIC sessions says so)."""
+
+    sources = _row_sources(str(store.root), store.label, ticker, _index_sha(store))
+    label = source_label(sources)
+    if label == source_label(["yahoo"]):
+        return "Yahoo Finance delayed quotes (real, one file per session)"
+    return label.upper() if "SYNTHETIC" in label else label
+
+
+def coverage_parts(cov: Coverage, info: Dict[str, Any], horizon: int = 1, data: str = "") -> Tuple[list, int, int]:
+    """(banner parts, origin days at ``horizon``, origin days needed);
+    ``data`` says what the rows are (:func:`data_label`)."""
 
     have = scorable_origins(cov.sessions, horizon)
     need = origins_needed()
@@ -152,16 +181,24 @@ def coverage_parts(cov: Coverage, info: Dict[str, Any], horizon: int = 1) -> Tup
         f"source: {info.get('source')}",
         f"synced {info['synced_at']}" if info.get("synced_at") else "read in place",
         f"{cov.rows:,} quotes, {cov.bytes / 1e6:.2f} MB",
-        "Yahoo Finance delayed quotes (real, one file per session)",
+        data or "what the rows are: see each file's manifest",
     ]
     return parts, have, need
 
 
-def gate_text(cov: Coverage, have: int, need: int, horizon: int = 1) -> str:
-    """Why the walk-forward waits (empty once enough origin days exist)."""
+def gate_text(cov: Coverage, have: int, need: int, horizon: int = 1, collected: Optional[int] = None) -> str:
+    """Why the walk-forward waits (empty once enough origin days exist);
+    ``collected``: all sessions held, when ``cov`` is only the most recent
+    of them."""
 
     if have >= need:
         return ""
+    if collected is not None and collected > cov.n:
+        return (
+            f"The most recent {cov.n} of the {collected} collected sessions ({cov.first} .. {cov.last}) give {have} "
+            f"origin day(s) with the session {horizon} trading day(s) later; the walk-forward needs {need} (three "
+            "origin days in each vol-regime tercile): pick more SESSIONS."
+        )
     return (
         f"{cov.n} session(s) collected ({cov.first} .. {cov.last}) give {have} origin day(s) with the session "
         f"{horizon} trading day(s) later; the walk-forward on collected history waits for {need} (three origin "
@@ -201,24 +238,38 @@ def render_walkforward_source(on_use: Callable[[ChainDataset, Dict[str, Any]], N
     if not tickers:
         st.info(f"{info.get('source')}: the index lists no sessions yet.")
         return
-    ticker = st.selectbox("Ticker", tickers, key=TICKER_KEY, persist_state=PERSIST)
+    c1, c2 = st.columns([1, 1])
+    ticker = c1.selectbox("Ticker", tickers, key=TICKER_KEY, persist_state=PERSIST)
+    window = c2.selectbox(
+        "Sessions", (*WINDOWS, "all"), index=WINDOWS.index(DEFAULT_WINDOW), key=WINDOW_KEY, persist_state=PERSIST,
+        format_func=lambda n: "every collected session" if n == "all" else f"most recent {n}",
+        help="The walk-forward runs on the most recent N collected sessions: a run takes a few seconds per session "
+        "(about 4 s on a real SPY chain at the default settings), so a long history is not run whole by default. "
+        "`python tools/compute_metrics.py --history --first ... --last ...` runs any range offline.",
+    )  # fmt: skip
     cov = store.coverage(ticker)
-    parts, have, need = coverage_parts(cov, info)
-    banner("COLLECTED HISTORY", parts)
-    stats([("SESSIONS", f"{cov.n}"), ("ORIGIN DAYS (1D)", f"{have}"), ("NEEDED", f"{need}"),
-           ("MISSING DAYS", f"{len(cov.gaps)}")])  # fmt: skip
-    waiting = gate_text(cov, have, need)
+    data = data_label(store, ticker)
+    parts, _, need = coverage_parts(cov, info, data=data)
+    banner("COLLECTED HISTORY", parts, synthetic="SYNTHETIC" in data)
+    used = cov if window == "all" or cov.n <= int(window) else store.coverage(ticker, last=int(window))
+    have = scorable_origins(used.sessions)
+    stats([("SESSIONS", f"{cov.n}"), ("IN THE RUN", f"{used.n}"), ("ORIGIN DAYS (1D)", f"{have}"),
+           ("NEEDED", f"{need}"), ("MISSING DAYS", f"{len(cov.gaps)}")])  # fmt: skip
+    waiting = gate_text(used, have, need, collected=cov.n)
     if waiting:
         st.warning(waiting)
         return
-    if st.button(f"Use the collected history ({cov.n} sessions)", key="lab_hist_use", width="stretch"):
-        with st.spinner(f"Loading {cov.n} collected sessions (each checked against the index)..."):
+    span = f"{used.n} sessions, {used.first} .. {used.last}"
+    if st.button(f"Use the collected history ({span})", key="lab_hist_use", width="stretch"):
+        with st.spinner(f"Loading {used.n} collected sessions (each checked against the index)..."):
             try:
-                ds = load(store, ticker)
+                ds = load(store, ticker, tuple(d.isoformat() for d in used.sessions))
             except SnapshotError as exc:
                 st.error(f"The collected history could not be loaded: {exc}")
                 return
-        on_use(ds, {**info, "ticker": ticker, "sessions": cov.n, "index_sha256": _index_sha(store)})
+        on_use(ds, {**info, "ticker": ticker, "sessions": used.n, "sessions_collected": cov.n,
+                    "first": str(used.first), "last": str(used.last), "data": data,
+                    "index_sha256": _index_sha(store)})  # fmt: skip
 
 
 def render_market_data_loader(activate: Callable[..., None]) -> None:
@@ -240,7 +291,7 @@ def render_market_data_loader(activate: Callable[..., None]) -> None:
     with c3:
         st.markdown("&nbsp;", unsafe_allow_html=True)
         clicked = st.button("Load session", key="lab_hist_md_load", width="stretch")
-    st.caption(f"{store.coverage(ticker).describe()}; source {info.get('source')}"
+    st.caption(f"{store.coverage(ticker).describe()}; {data_label(store, ticker)}; source {info.get('source')}"
                + (f", synced {info['synced_at']}" if info.get("synced_at") else "") + ".")  # fmt: skip
     if clicked and day:
         try:

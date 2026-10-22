@@ -79,3 +79,34 @@ def test_history_mode_reads_the_synced_copy_offline_and_a_session_range(tmp_path
     assert summary["collection"]["first"] == "2026-10-06" and summary["coverage"]["sessions"] == 10
     assert cm.main(["--history", "--offline", "--repo", "nobody/none", "--outdir", str(out)]) == 1
     assert cm.main(["--store", str(root), "--ticker", "SYNTH", "--first", "2030-01-01", "--outdir", str(out)]) == 1
+
+
+def test_outputs_do_not_depend_on_where_or_when_the_store_was_synced(tmp_path, capsys):
+    """Another checkout directory, or the same synced copy synced again later,
+    gives the same outputs byte for byte; where and when go to the manifest."""
+
+    import shutil
+
+    store = synthetic_store(tmp_path / "branch", 10)
+    copy = tmp_path / "elsewhere" / "data-snapshots"
+    shutil.copytree(store.root, copy)
+    runs = {}
+    for name, root in (("a", store.root), ("b", copy)):
+        assert cm.main(["--store", str(root), "--ticker", "SYNTH", *FAST, "--outdir", str(tmp_path / name)]) == 0
+        runs[name] = _outputs(tmp_path / name)
+    assert runs["a"] == runs["b"]
+    manifest = json.loads((tmp_path / "b" / "manifest.json").read_text())
+    assert manifest["data"]["sync"] == {"local_checkout": str(copy)}
+    # the synced copy, read twice with a re-sync in between (sync.json records a new time)
+    root = snap.sync_root("owner/repo", "data-snapshots")
+    shutil.copytree(store.root, root)
+    outs = []
+    for i, when in enumerate(("2026-10-21T22:40:00Z", "2026-10-22T22:41:00Z")):
+        (root / snap.SYNC_META).write_text(json.dumps({"synced_at": when}))
+        out = tmp_path / f"synced{i}"
+        args = ["--history", "--offline", "--repo", "owner/repo", "--ticker", "SYNTH", *FAST, "--outdir", str(out)]
+        assert cm.main(args) == 0
+        outs.append(_outputs(out))
+        assert json.loads((out / "manifest.json").read_text())["data"]["sync"]["synced_at"] == when
+    assert outs[0] == outs[1]
+    assert json.loads(outs[0]["summary.json"])["collection"]["source"] == "owner/repo@data-snapshots"

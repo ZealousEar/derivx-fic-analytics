@@ -11,7 +11,9 @@ import functools
 import http.server
 import threading
 import urllib.request
+from pathlib import Path
 
+import pandas as pd
 import pytest
 from _snapshot_store import real_store
 
@@ -23,8 +25,21 @@ SESSIONS = ["2026-10-20", "2026-10-21", "2026-10-23"]
 
 
 class _Quiet(http.server.SimpleHTTPRequestHandler):
+    truncate: set = set()  # paths served with only half of their body (the connection then drops)
+
     def log_message(self, *args):  # keep the test output clean
         pass
+
+    def send_head(self):
+        if self.path not in self.truncate:
+            return super().send_head()
+        body = Path(self.translate_path(self.path)).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body[: len(body) // 2])
+        self.close_connection = True
+        return None
 
 
 @pytest.fixture
@@ -55,7 +70,9 @@ def server(tmp_path, monkeypatch):
         return original(self)
 
     monkeypatch.setattr(_Quiet, "do_GET", counting)
-    yield {"url": f"http://127.0.0.1:{httpd.server_port}", "tree": tree, "requests": requests, "httpd": httpd}
+    monkeypatch.setattr(_Quiet, "truncate", set())
+    yield {"url": f"http://127.0.0.1:{httpd.server_port}", "tree": tree, "requests": requests, "httpd": httpd,
+           "truncate": _Quiet.truncate}  # fmt: skip
     httpd.shutdown()
     httpd.server_close()
 
@@ -102,6 +119,54 @@ def test_a_download_that_does_not_match_the_index_is_not_kept(server, tmp_path):
     assert [d.isoformat() for d in result.store.sessions("SPY")] == ["2026-10-20", "2026-10-23"]
     assert not result.store.file(snap.relative_path("SPY", "2026-10-21")).exists()
     assert result.store.verify() == []
+
+
+def test_a_transfer_cut_short_fails_that_file_and_never_the_sync(server, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(rs.time, "sleep", lambda s: None)  # the CLI's retries back off: not in a test
+    # the server sends half of the body it announced and drops the connection (http.client.IncompleteRead)
+    server["truncate"].add("/options/SPY/2026/SPY_2026-10-21.csv.gz")
+    result = _sync(server, tmp_path)
+    assert result.downloaded == 2 and len(result.failed) == 1
+    assert "SPY_2026-10-21.csv.gz: 127.0.0.1" in result.failed[0] and "IncompleteRead" in result.failed[0]
+    assert [d.isoformat() for d in result.store.sessions("SPY")] == ["2026-10-20", "2026-10-23"]
+    assert result.store.verify() == []
+    server["truncate"].clear()
+    assert _sync(server, tmp_path).downloaded == 1  # the next sync completes the copy
+    # a cut-short index: the cached copy is used, with a notice; with no cache, a clear error
+    server["truncate"].add("/options/index.csv")
+    fallback = _sync(server, tmp_path)
+    assert fallback.offline and "index download failed" in fallback.notices[0]
+    assert len(fallback.store.sessions("SPY")) == 3
+    with pytest.raises(snap.SnapshotError, match="could not be downloaded.*nothing is cached"):
+        snap.sync("owner/repo", "data-snapshots", base_url=server["url"], cache_root=tmp_path / "empty", retries=0)
+    # the CLI reports it (exit 1) instead of a traceback
+    server["truncate"].clear()
+    server["truncate"].add("/options/SPY/2026/SPY_2026-10-23.csv.gz")
+    code = cli.main(["snapshots", "sync", "--repo", "owner/repo", "--cache", str(tmp_path / "c3"), "--base-url",
+                     server["url"]])  # fmt: skip
+    assert code == 1 and "failed: options/SPY/2026/SPY_2026-10-23.csv.gz" in capsys.readouterr().err
+
+
+def test_a_cached_file_without_its_manifest_is_downloaded_again(server, tmp_path):
+    first = _sync(server, tmp_path)
+    meta = first.store.file(snap.manifest_path(snap.relative_path("SPY", "2026-10-21")))
+    meta.unlink()
+    again = _sync(server, tmp_path)
+    assert (again.downloaded, again.cached) == (1, 2) and meta.exists()
+    assert again.store.manifest("SPY", "2026-10-21")["session"] == "2026-10-21"
+    meta.write_text("{not json")
+    assert _sync(server, tmp_path).downloaded == 1 and again.store.manifest("SPY", "2026-10-21")["rows"] > 0
+
+
+def test_an_index_row_that_names_another_sessions_file_is_not_kept(server, tmp_path):
+    path = server["tree"] / "options" / "index.csv"
+    index = pd.read_csv(path, dtype=str)
+    index.loc[index["session"] == "2026-10-21", "path"] = "options/SPY/2026/SPY_2026-10-20.csv.gz"
+    index.to_csv(path, index=False)
+    result = _sync(server, tmp_path)
+    assert result.downloaded == 2 and len(result.failed) == 1
+    assert "the index files (SPY, 2026-10-21) here" in result.failed[0]
+    assert [d.isoformat() for d in result.store.sessions("SPY")] == ["2026-10-20", "2026-10-23"]
 
 
 def test_offline_reads_the_cache_and_a_server_outage_falls_back_to_it(server, tmp_path):
