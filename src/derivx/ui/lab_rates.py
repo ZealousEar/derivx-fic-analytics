@@ -141,10 +141,6 @@ def _upload_controls() -> None:
         if st.session_state.get(K_CURVE_UPLOAD) and st.button("Remove the uploaded history", key="lab_rates_up_rm"):
             st.session_state.pop(K_CURVE_UPLOAD, None)
             st.session_state.pop("lab_rates_up_msg", None)
-        st.caption(
-            "Uploaded par swap rates join the store as 'Your uploaded <CCY> swap-curve history' (rates read in "
-            "the units chosen; auto reads the magnitudes and says so)."
-        )
 
 
 def _curve_controls(store: rh.HistoryStore) -> Optional[Dict[str, Any]]:
@@ -508,11 +504,6 @@ def render_curves_tab() -> None:
     """The Rates Curves tab (see the module docs)."""
 
     st.markdown("### / RATES CURVES: FORECASTS, REGIMES AND MODELS")
-    st.caption(
-        "Real curve histories from the rates store: the committed US Treasury par curve (FRED H.15 and the "
-        "Treasury, month ends 2008-2014 then daily), Bank of England OIS and ECB AAA curves, plus anything the "
-        "RATES page downloaded into the cache (LIVE mode) and your upload."
-    )
     _upload_controls()
     ctx = _curve_controls(_active_store())
     if ctx is None:
@@ -612,12 +603,6 @@ def render_vol_tab() -> None:
     """The Rates Vol History tab (see the module docs)."""
 
     st.markdown("### / RATES VOL HISTORY: SWAPTION / CAP SMILES")
-    st.info(
-        "No free source publishes dated swaption or cap vol quotes (brokers and data vendors license them): "
-        "upload your own daily normal-vol grids (one row per date, expiry, tenor and strike offset from ATM; add "
-        "the ATM forward to score sticky-strike forecasts and the shifted-lognormal model), or run the SYNTHETIC "
-        "demo to see the mechanics."
-    )
     hist = _vh_controls()
     if hist is None:
         return

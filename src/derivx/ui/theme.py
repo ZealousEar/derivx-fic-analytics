@@ -279,7 +279,6 @@ h3 { border-bottom: 1px solid #999999; font-size: 1.2rem; font-weight: 500; }
 .dx-header-title { font-size: clamp(2rem, 7vw, 3rem); font-weight: 700; letter-spacing: 0.1em; line-height: 1.1;
   color: #FFFFFF; }
 .dx-header-sub { margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; }
-.dx-header-sub span:first-child { font-size: 0.75rem; letter-spacing: 0.2em; font-weight: 600; color: #CCCCCC; }
 .dx-header-tag { background: #FF4444; color: #000000; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-weight: 700;
   letter-spacing: 0.1em; }
 </style>
@@ -289,7 +288,7 @@ HEADER_HTML = f"""
 <div class='dx-header'>
   <div class='dx-header-title'>DERIVX</div>
   <div class='dx-header-sub'>
-    <span>FIC DERIVATIVES ANALYTICS</span><span class='dx-header-tag'>v{__version__}</span>
+    <span class='dx-header-tag'>v{__version__}</span>
   </div>
 </div>
 """

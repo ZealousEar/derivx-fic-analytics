@@ -82,8 +82,8 @@ from derivx.fx.smile import (
 from derivx.fx.smile_risk import quote_vegas
 from derivx.fx.smile_risk import sabr_parameter_vegas as sabr_param_vegas
 from derivx.ui import pricer_calc as calc
-from derivx.ui.plot_limits import GUARD_AVAILABLE, axis_limits, bound_axes
-from derivx.ui.pricer_page import PAGE_CSS, ZOOM_HINT
+from derivx.ui.plot_limits import axis_limits, bound_axes
+from derivx.ui.pricer_page import PAGE_CSS
 from derivx.ui.state import PERSIST
 from derivx.ui.theme import ACCENT, FOREGROUND, PLOTLY_2D_CONFIG, PNL_COLORS, SEQUENTIAL_COLORS, SERIES, dark_layout
 
@@ -1196,8 +1196,6 @@ def _smile_chart(inp: FxInputs, sel: Selected, p: Optional[Priced]) -> None:
     st.plotly_chart(fig, width="stretch", key=_k("smile_chart"), config=PLOTLY_2D_CONFIG)
     if off_chart:
         st.caption(off_chart)
-    if GUARD_AVAILABLE:
-        st.caption(ZOOM_HINT)
     ok, min_density, k_min = density_check(smile, smile_strikes(smile, n_sd=float(n_sd)))
     if not ok:
         why = (
@@ -1506,15 +1504,10 @@ def render() -> None:
     _init_state()
     st.markdown(PAGE_CSS + FX_CSS, unsafe_allow_html=True)
     st.markdown("## / FX OPTIONS")
-    st.caption(
-        "Garman-Kohlhagen with FX conventions: vol time trade → expiry, rate time spot → delivery (ACT/365F), "
-        "premium paid on the spot date; smiles from ATM / risk-reversal / butterfly quotes."
-    )
     inp, errors = _sidebar()
     if inp is None:
         for msg in errors:
             st.error(msg)
-        st.info("Fix the inputs in the sidebar to price the option.")
         return
     for msg in date_warnings(inp.pair, inp.dates):
         st.warning(msg)

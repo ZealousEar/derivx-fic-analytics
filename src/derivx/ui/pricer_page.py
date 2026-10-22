@@ -46,7 +46,6 @@ DEFAULT_CAMERA = dict(eye=dict(x=1.6, y=1.6, z=1.2))
 # Ctrl/Cmd + wheel) and 3D pan need its in-page guard, so both are off without
 # it. The 3D zoom tool only moves the camera, which an orthographic view does
 # not show, so it is dropped.
-ZOOM_HINT = "Pinch or Ctrl/⌘ + scroll to zoom (bounded) · home icon resets the view"
 PLOTLY_3D_CONFIG = {
     "displaylogo": False,
     "scrollZoom": GUARD_AVAILABLE,
@@ -354,7 +353,7 @@ def _iv_solver(spec: ModeSpec, inp: calc.Inputs, ccy: Optional[str]) -> None:
     )
     with cols[1]:
         if premium is None:
-            st.caption("Enter a premium to solve for the Black-Scholes vol. " + bounds)
+            st.caption(bounds)
             return
         res = implied_vol_bs(float(premium), inp.S, inp.K, inp.T, inp.r, q=inp.q, is_call=inp.call)
         status = str(res.status)
@@ -543,8 +542,6 @@ def _surface(spec: ModeSpec, inp: calc.Inputs) -> None:
         st.plotly_chart(fig, width="stretch", height="stretch", key=_k(spec, "surface_3d"), config=PLOTLY_3D_CONFIG)
     unit = "premium in price units" if z_label == "VALUE" else grid.z_unit
     st.caption(f"{z_title} ({unit}) for one option on one unit; the red marker is the current input.")
-    if GUARD_AVAILABLE:
-        st.caption(ZOOM_HINT)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -580,8 +577,6 @@ def _finish_smile(spec: ModeSpec, fig: go.Figure, xs, ys) -> None:
     )
     bound_axes(fig, xaxis=axis_limits(xs, floor=0.0), yaxis=axis_limits(ys, pad=0.1, floor=0.0))
     st.plotly_chart(fig, width="stretch", key=_k(spec, "smile_2d"), config=PLOTLY_2D_CONFIG)
-    if GUARD_AVAILABLE:
-        st.caption(ZOOM_HINT)
 
 
 def _params_table(params: Dict[str, float], fixed=()) -> None:
@@ -765,7 +760,6 @@ def _smile(spec: ModeSpec, inp: calc.Inputs) -> None:
         )
     else:
         src = "ILLUSTRATIVE"
-        st.caption("Load an option chain in the ANALYTICS lab to see a MARKET smile here.")
     if src == "MARKET" and chain is not None:
         _market_smile(spec, inp, chain)
     else:
@@ -806,7 +800,6 @@ def render(mode: str) -> None:
     st.markdown(f"## / {spec.name} OPTIONS")
     inp, extras = _sidebar_inputs(spec)
     if inp is None:
-        st.info("Fix the inputs in the sidebar to price the option.")
         return
     for note in calc.input_warnings(inp.T, inp.r, inp.q, inp.sigma):
         st.warning(note)

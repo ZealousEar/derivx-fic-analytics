@@ -315,10 +315,7 @@ def _stripped_inputs(market: Market, terms: Dict[str, object]) -> Dict[str, obje
         "trade's (forward-looking or effective)"
         if terms.get("rate_type") == "compounded" else "spot-start caps, first caplet excluded"
     )  # fmt: skip
-    st.caption(
-        f"Flat normal cap vols (bp) by cap maturity on the selected index: {caps}. "
-        f"Defaults are {ILLUSTRATIVE}; edit the table or paste your broker's quotes."
-    )
+    st.caption(f"Flat normal cap vols (bp) by cap maturity on the selected index: {caps}. Defaults are {ILLUSTRATIVE}.")
     currency = _currency(market)
     try:
         mats, vols, strikes, edited = _quote_tables(market, layout)

@@ -467,10 +467,7 @@ def _load_controls() -> None:
     c_sample, c_upload, c_pull = st.columns(3)
     with c_sample:
         st.markdown("**Bundled sample**")
-        st.caption(
-            "One real SPY chain from Yahoo Finance (delayed quotes), fetched 2026-10-20 20:59 UTC after the close, "
-            "unfiltered (data/examples). A single snapshot: no history."
-        )
+        st.caption("SPY, Yahoo Finance delayed quotes, fetched 2026-10-20 20:59 UTC after the close, unfiltered.")
         if st.button("Load sample", key="lab_load_sample", width="stretch"):
             _activate(load_sample_chain(), "sample", sample_fetch_status())
     with c_upload:
@@ -521,13 +518,10 @@ def _load_controls() -> None:
             step=1,
             key="lab_max_exp",
             persist_state=PERSIST,
+            help=f"Only expiries at least {MIN_FIT_DAYS:g} days away count (after the close Yahoo still lists the "
+            "day's expired one). Yahoo serves only the current, delayed chain.",
         )
         force = st.checkbox("Bypass the 5-minute shared cache", value=False, key="lab_force", persist_state=PERSIST)
-        st.caption(
-            "Yahoo serves only the current (delayed) chain. Rows are stamped with the session the quotes belong "
-            "to and their real fetch time; rate limits are retried with backoff. The nearest expiries at least "
-            f"{MIN_FIT_DAYS:g} days away are requested (after the close Yahoo still lists the day's expired one)."
-        )
         if st.button("Pull current chain", key="lab_pull", width="stretch"):
             try:
                 with st.spinner(f"Fetching {ticker} from Yahoo Finance..."):
@@ -552,7 +546,7 @@ def _load_controls() -> None:
                         "error",
                         f"Yahoo pull failed ({status.get('status')}): {status.get('reason')}",
                     )
-    st.markdown("**Collected history** (one real chain per trading day, saved by the collect-data workflow)")
+    st.markdown("**Collected history** (one chain per trading day)")
     lab_history.render_market_data_loader(_activate)
     msg = st.session_state.get(K_LOAD_MSG)
     if msg:
@@ -709,9 +703,8 @@ def _render_market_data_tab() -> Optional[Dict[str, Any]]:
     )
     st.caption(
         f"{len(raw):,} raw quotes -> {len(filtered):,} after the liquidity filters (calls and puts both kept: "
-        "put-call parity needs them) -> hygiene per expiry below (one OTM quote per strike). Spot is Yahoo's "
-        "regular-market price from the same response as the quotes. The EQUITY page's MARKET smile gets the "
-        "expiries nearest 1W, 1M, 2M, 3M, 6M and 1Y of this filtered chain."
+        "put-call parity needs them) -> one OTM quote per strike after hygiene. Spot is Yahoo's regular-market "
+        "price from the same response as the quotes."
     )
     st.markdown("#### / QUOTE HYGIENE BY EXPIRY")
     st.dataframe(report, hide_index=True, width="stretch")
@@ -979,16 +972,6 @@ def _render_calibration_tab(ctx: Optional[Dict[str, Any]]) -> None:
 
 # -- walk-forward ----------------------------------------------------------------
 
-HISTORY_HELP = (
-    "A walk-forward test needs **genuine daily snapshots**: one chain per trading day, each saved on its own day. "
-    "Yahoo Finance has no history (it serves only the current chain), so the app never saves today's chain under "
-    "a past date. **Collected history** reads the snapshots the scheduled `collect-data` GitHub workflow saves "
-    "every trading day after the close on the repository's `data-snapshots` branch (each stamped with its session, "
-    "real fetch time and spot); the test runs once they hold enough origin days. You can also upload files saved "
-    "by `tools/download_spy_chains.py`. The SYNTHETIC demo shows the mechanics on generated data that is not "
-    "market data."
-)
-
 
 def _use_collected(ds: ChainDataset, info: Dict[str, Any]) -> None:
     st.session_state[K_WF_DATA] = {"dataset": ds, "origin": "collected", "seed": None, "history": info}
@@ -1005,6 +988,9 @@ def _wf_controls() -> None:
         horizontal=True,
         key="lab_wf_source",
         persist_state=PERSIST,
+        help="One chain per trading day, each saved on its own day. Yahoo serves only the current chain, so a "
+        "history is collected (collect-data workflow) or uploaded (tools/download_spy_chains.py); SYNTHETIC is "
+        "generated, not market data.",
     )
     if source == lab_history.SOURCE_LABEL:
         lab_history.render_walkforward_source(_use_collected)
@@ -1116,7 +1102,6 @@ def _prepared_history(ds: ChainDataset, filters: Mapping[str, Any]) -> Dict[pd.T
 
 def _render_walkforward_tab() -> None:
     st.markdown("### / WALK-FORWARD VALIDATION")
-    st.markdown(HISTORY_HELP)
     _wf_controls()
     entry = st.session_state.get(K_WF_DATA)
     if not entry:

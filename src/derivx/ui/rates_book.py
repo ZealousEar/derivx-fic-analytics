@@ -186,12 +186,7 @@ def _blotter(currency: str) -> Tuple[pd.DataFrame, str]:
                             hide_index=True, column_config=_column_config(currency))  # fmt: skip
     st.session_state[CURRENT_KEY] = edited
     source = str(state["source"]) + (" (edited by you)" if not _same(edited, _loaded(state)) else "")
-    st.caption(
-        f"Blotter: {source}. One trade per row; rates, strikes and shifts in %, spreads in bp, vols in bp (normal) "
-        "or % (Black), notionals positive (10mm, 2.5bn and 500k work) with the direction giving the side. Trades "
-        "given by tenor start at spot from the valuation date. Blank vols use the market vols (SWAPTION cube, "
-        "caplet vols stripped from the CAP-FLOOR quotes)."
-    )
+    st.caption(f"Blotter: {source}.")
     with st.expander("COLUMN GUIDE (which columns each trade type reads)"):
         st.dataframe(pf.column_guide(), hide_index=True, width="stretch")
     st.download_button("DOWNLOAD BLOTTER CSV", _text_table(edited).to_csv(index=False), file_name="blotter.csv",

@@ -379,12 +379,6 @@ def render_surface_tab(ctx: Optional[Dict[str, Any]], draw_banner) -> None:
             }
     stored = st.session_state.get(K_SURF)
     if not stored:
-        st.caption(
-            "One power-law SSVI surface across expiries: theta(T) (ATM total variance) non-decreasing, eta (1 + "
-            "|rho|) <= 2 and 0 < gamma <= 1/2, so it has no static arbitrage (Gatheral-Jacquier 2014). With three "
-            "shape parameters for every expiry it fits less closely than one SVI per expiry; it gives sigma(K, T) "
-            "at any T and an arbitrage-free Dupire local vol."
-        )
         return
     if stored.get("error"):
         if stored.get("data_key") == ctx["data_key"]:

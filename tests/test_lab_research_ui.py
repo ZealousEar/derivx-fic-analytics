@@ -155,7 +155,7 @@ def test_an_uploaded_swap_curve_history_joins_the_rates_store():
 
 def test_rates_vol_history_tab_on_synthetic_and_uploaded_grids():
     at = _lab()
-    assert "No free source publishes dated swaption or cap vol quotes" in "\n".join(i.value for i in at.info)
+    assert not any("No free source publishes dated swaption or cap vol quotes" in i.value for i in at.info)
     at.radio(key="lab_vh_source").set_value("SYNTHETIC demo history").run()
     at.slider(key="lab_vh_days").set_value(8).run()
     at.button(key="lab_vh_gen").click().run()

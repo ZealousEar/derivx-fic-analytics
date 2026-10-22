@@ -214,8 +214,7 @@ def render_walkforward_source(on_use: Callable[[ChainDataset, Dict[str, Any]], N
     provenance)`` takes the history once it is long enough."""
 
     c1, c2, c3 = st.columns([2, 1, 1])
-    c1.text_input("Repository (OWNER/NAME)", value=default_repo(), key=REPO_KEY, persist_state=PERSIST,
-                  help="The GitHub repository whose data-snapshots branch holds the collected chains.")  # fmt: skip
+    c1.text_input("Repository (OWNER/NAME)", value=default_repo(), key=REPO_KEY, persist_state=PERSIST)
     c2.text_input("Branch", value=default_branch(), key=BRANCH_KEY, persist_state=PERSIST)
     with c3:
         st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -229,9 +228,9 @@ def render_walkforward_source(on_use: Callable[[ChainDataset, Dict[str, Any]], N
     store, info, why = synced_store()
     if store is None:
         st.info(
-            f"No collected history here yet ({why}). SYNC NOW downloads the index and the daily files (about 150 "
-            "KB a session) from the public data-snapshots branch, which .github/workflows/collect-data.yml fills "
-            "once per trading day after the close; or run `derivx snapshots sync`."
+            f"No collected history here yet ({why}). SYNC NOW downloads the index and daily files from the public "
+            "data-snapshots branch (filled by .github/workflows/collect-data.yml once per trading day); or run "
+            "`derivx snapshots sync`."
         )
         return
     tickers = store.tickers()
@@ -243,9 +242,8 @@ def render_walkforward_source(on_use: Callable[[ChainDataset, Dict[str, Any]], N
     window = c2.selectbox(
         "Sessions", (*WINDOWS, "all"), index=WINDOWS.index(DEFAULT_WINDOW), key=WINDOW_KEY, persist_state=PERSIST,
         format_func=lambda n: "every collected session" if n == "all" else f"most recent {n}",
-        help="The walk-forward runs on the most recent N collected sessions: a run takes a few seconds per session "
-        "(about 4 s on a real SPY chain at the default settings), so a long history is not run whole by default. "
-        "`python tools/compute_metrics.py --history --first ... --last ...` runs any range offline.",
+        help="About 4 s per session on a real SPY chain. `python tools/compute_metrics.py --history --first ... "
+        "--last ...` runs any range offline.",
     )  # fmt: skip
     cov = store.coverage(ticker)
     data = data_label(store, ticker)
@@ -286,8 +284,7 @@ def render_market_data_loader(activate: Callable[..., None]) -> None:
     c1, c2, c3 = st.columns([1, 1, 1])
     ticker = c1.selectbox("Ticker", tickers, key="lab_hist_md_ticker", persist_state=PERSIST)
     days = [d.isoformat() for d in store.sessions(ticker)]
-    day = c2.selectbox("Session", list(reversed(days)), key=f"lab_hist_md_day_{ticker}",
-                       help="Every collected session (newest first).")  # fmt: skip
+    day = c2.selectbox("Session", list(reversed(days)), key=f"lab_hist_md_day_{ticker}")
     with c3:
         st.markdown("&nbsp;", unsafe_allow_html=True)
         clicked = st.button("Load session", key="lab_hist_md_load", width="stretch")
