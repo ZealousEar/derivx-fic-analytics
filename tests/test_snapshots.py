@@ -173,6 +173,46 @@ def test_merge_copies_only_new_sessions_and_verify_finds_tampering(tmp_path):
     pd.testing.assert_frame_equal(after.iloc[:2].reset_index(drop=True), rows_before.reset_index(drop=True))
 
 
+def test_an_index_row_that_names_another_sessions_file_is_refused(tmp_path):
+    store = real_store(tmp_path, ["2026-10-20", "2026-10-21"])
+    index = store.index()
+    first = index["session"] == "2026-10-20"
+    index.loc[~first, ["path", "sha256"]] = index.loc[first, ["path", "sha256"]].to_numpy()  # 10-21 -> 10-20's file
+    store.write_index(index)
+    problems = " | ".join(store.verify())
+    assert "the index files (SPY, 2026-10-21) here, the layout puts it at options/SPY/2026/SPY_2026-10-21.csv.gz" in (
+        problems
+    )
+    with pytest.raises(snap.SnapshotError, match="the layout puts it at"):
+        store.load("SPY", ["2026-10-21"])
+    assert len(store.load("SPY", ["2026-10-20"]).chains) == 1  # the row that is right still loads
+    # a file in its right place that holds another session (an edited or mis-built file) is refused too
+    other = real_store(tmp_path / "other", ["2026-10-22"])
+    wrong = snap.build_snapshot(fake_session_fetch("2026-10-23"))
+    target = other.file(snap.relative_path("SPY", "2026-10-22"))
+    target.write_bytes(wrong.data)
+    index = other.index()
+    index["sha256"] = wrong.manifest["sha256"]
+    other.write_index(index)
+    with pytest.raises(snap.SnapshotError, match="holds the session.s. 2026-10-23, not 2026-10-22"):
+        other.load("SPY")
+
+
+def test_manifests_say_what_the_rows_are():
+    real = snap.build_snapshot(fake_session_fetch("2026-10-21"))
+    assert real.manifest["row_sources"] == ["yahoo"] and real.manifest["source"] == snap.SOURCE_LABEL
+    from _snapshot_store import chain_fetch
+
+    from derivx.data.synthetic import synthetic_history
+
+    chain = next(iter(synthetic_history(1).values()))
+    fake = snap.build_snapshot(chain_fetch(chain, "SYNTH"))
+    assert fake.manifest["row_sources"] == ["synthetic"] and fake.manifest["source"] == snap.SYNTHETIC_LABEL
+    assert fake.manifest["manifest"]["data"]["source"] == snap.SYNTHETIC_LABEL
+    assert snap.source_label(["yahoo", "synthetic"]) == snap.SYNTHETIC_LABEL  # never hidden by real rows
+    assert snap.source_label(["cboe"]) == "rows from cboe"
+
+
 def test_store_paths_cannot_escape_the_store(tmp_path):
     store = snap.SnapshotStore(tmp_path)
     for bad in ("../x.csv.gz", "/etc/passwd", "elsewhere/SPY.csv.gz"):
@@ -291,6 +331,48 @@ def test_collect_never_stores_a_partial_chain_or_another_session(tmp_path):
     assert not (tmp_path / "b").exists() and wrong.exit_code == 1
 
 
+def test_a_run_after_midnight_new_york_still_requests_the_expiry_one_day_after_the_session(tmp_path):
+    # 00:30 EDT on Wednesday 2026-10-21 (a delayed run, or a manual one): the Tuesday 2026-10-20 session is due;
+    # the fetch counts min_days from its own New York date, so the collector shifts it to start at the session
+    fake = FakeTicker()
+    late = pd.Timestamp("2026-10-21T04:30:00Z")
+    report = snap.collect(["SPY"], tmp_path / "s", fetch=fake_fetch(fake, start="2026-10-21T04:30:00Z"), now=late)
+    (out,) = report.outcomes
+    assert (out.state, out.session) == ("saved", "2026-10-20")
+    assert "2026-10-21" in fake.requests and "2026-10-20" not in fake.requests  # the session's own expiry: not
+    stored = snap.SnapshotStore(tmp_path / "s").load("SPY").single()
+    assert pd.Timestamp("2026-10-21") in set(stored["expiry"])  # 1 day after the session: within the limits, kept
+    on_time = snap.collect(["SPY"], tmp_path / "t", fetch=fake_fetch(FakeTicker()), now=AFTER_CLOSE)
+    assert on_time.outcomes[0].rows == out.rows  # the same quotes as a run on the evening of the session
+
+
+def test_a_fetch_that_raises_fails_that_ticker_after_its_retries_and_the_others_are_collected(tmp_path, capsys):
+    good = fake_fetch(FakeTicker())
+    calls = []
+
+    def fetch(ticker, **kw):
+        if ticker == "QQQ":
+            calls.append(ticker)
+            raise KeyError("calls")  # e.g. a response yfinance cannot parse
+        return good(ticker, **kw)
+
+    waits = []
+    report = snap.collect(["QQQ", "SPY"], tmp_path / "s", fetch=fetch, now=AFTER_CLOSE, attempts=2, wait_s=5,
+                          sleep=waits.append)  # fmt: skip
+    assert [o.state for o in report.outcomes] == ["failed", "saved"] and report.exit_code == 1
+    assert calls == ["QQQ", "QQQ"] and waits == [5.0]
+    assert "attempt 2: KeyError: 'calls'" in report.outcomes[0].reason
+    assert snap.SnapshotStore(tmp_path / "s").tickers() == ["SPY"]
+    assert "| QQQ | 2026-10-20 | **FAILED** |" in report.markdown()
+    # the refusal of an incomplete fetch names the status once and the expiries that failed
+    partial = fake_fetch(FakeTicker(failures={"2026-10-23": -1}))("SPY", min_days=1.0, backoff=snap_backoff())
+    with pytest.raises(ValueError) as exc:
+        snap.build_snapshot(partial)
+    refused = str(exc.value)
+    assert "the fetch is not complete (PARTIAL:" in refused and "failed expiries: 2026-10-23: rate_limited" in refused
+    assert "PARTIAL: PARTIAL" not in refused
+
+
 def test_one_failing_ticker_fails_the_run_but_the_complete_ones_are_kept(tmp_path):
     good = fake_fetch(FakeTicker())
     bad = fake_fetch(FakeTicker(failures={"options": -1}))
@@ -372,3 +454,15 @@ def test_download_tool_writes_the_compact_store(tmp_path, capsys):
     assert snap.SnapshotStore(tmp_path).verify() == [] and snap.SnapshotStore(tmp_path).sessions("SPY")
     assert tool.main(["--store", str(tmp_path)], fetch=wrapped, now=pd.Timestamp("2026-10-20T21:00:00Z")) == 0
     assert "kept" in capsys.readouterr().out
+
+
+def test_a_manifest_without_row_sources_is_not_guessed_real(tmp_path):
+    store = real_store(tmp_path, ["2026-10-20", "2026-10-21"])
+    assert store.row_sources("SPY") == ["yahoo"]
+    meta = store.file(snap.manifest_path(snap.relative_path("SPY", "2026-10-21")))
+    legacy = json.loads(meta.read_text())
+    del legacy["row_sources"]  # a file written before row sources were kept
+    meta.write_text(json.dumps(legacy))
+    assert store.row_sources("SPY") == ["unrecorded", "yahoo"]
+    assert "do not record" in snap.source_label(store.row_sources("SPY"))
+    assert store.row_sources("SPY", ["2026-10-20"]) == ["yahoo"]

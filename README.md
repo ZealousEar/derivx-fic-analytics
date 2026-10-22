@@ -258,9 +258,11 @@ Yahoo serves only the current chain, so a real history has to be saved one sessi
   status, path). Commits are made by `github-actions[bot]` and pushed with `GITHUB_TOKEN` (`contents: write`, one
   run at a time). A rejected push is rebuilt on the branch's new tip, up to 3 attempts.
 - **Failures.** Every Yahoo request retries with backoff, and the whole chain is fetched up to 3 times (1 and
-  then 2 minutes apart). A partial chain, or the chain of another session, is never written, and a stored session
-  is never rewritten. The job summary says what happened to each ticker. The job fails only when a trading day
-  produced nothing for a ticker, so a missed day shows red.
+  then 2 minutes apart); a fetch that raises is retried the same way and the other tickers are still collected. A
+  partial chain (the summary names the expiries that failed), or the chain of another session, is never written,
+  and a stored session is never rewritten. The job summary says what happened to each ticker. The job fails only
+  when a trading day produced nothing for a ticker, so a missed day shows red. A run after midnight New York
+  still requests expiries from 1 day after the session, not after the run's own date.
 - **Schema and limits.** 14 columns (trade_date, expiry, option_type, strike, bid, ask, implied_vol (Yahoo's, 5
   decimals), underlying_price, volume, last_trade_date, fetched_at_utc, spot_time_utc, ticker, source). Expiries
   are kept from 1 to 730 calendar days and strikes from 0.4 to 1.6 times spot (`--max-days`, `--moneyness`). The
@@ -283,22 +285,30 @@ python tools/compute_metrics.py --history --ticker SPY --outdir data/metrics/spy
 python tools/compute_metrics.py --store ../data-snapshots --ticker SPY --first 2026-11-02 --horizon 1 --outdir ...
 ```
 
-`sync` checks every file's SHA-256 against the index before keeping it, and reuses files it already has. The repo
+`sync` checks every file's SHA-256 and its place in the layout (`options/<TICKER>/<YYYY>/<TICKER>_<session>`)
+against the index before keeping it, and reuses files it already has (a cached file whose manifest is missing is
+downloaded again). A transfer cut short fails only that file, which the next sync completes. The repo
 and branch default to `$DERIVX_SNAPSHOT_REPO` / `$DERIVX_SNAPSHOT_BRANCH`, else this repository and
 `data-snapshots`. In the lab, WALK-FORWARD VALIDATION's default source is **Collected history**: the synced copy
 (a SYNC NOW button fetches it) or, with `$DERIVX_SNAPSHOT_DIR` set, a local checkout of the branch. It shows
-coverage and provenance (sessions, first and last, missing trading days, quotes and size, source and sync time;
-the run's banner and manifest add the index SHA-256). Until the sessions give 9 origin days at the chosen horizon
-(three per vol-regime tercile; 10 consecutive sessions at 1 day), it says how many there are and how many more
-are needed, and the run stays disabled. MARKET DATA loads any collected session as the active dataset, so
+coverage and provenance (sessions, first and last, missing trading days, quotes and size, source and sync time,
+and what the rows are, read from each file's manifest: Yahoo's delayed quotes, or SYNTHETIC rows named and edged
+as such; the run's banner and manifest add the index SHA-256). SESSIONS picks the most recent 10 to 250 sessions
+or all of them (default 30): a run takes about 4 s a session on a real SPY chain at the default settings (12
+sessions: 44 s), so a year of history would take about 15 minutes in the browser; `compute_metrics.py --history
+--first ... --last ...` runs any range offline. Until the chosen sessions give 9 origin days at the chosen
+horizon (three per vol-regime tercile; 10 consecutive sessions at 1 day), it says how many there are and how many
+more are needed, and the run stays disabled. MARKET DATA loads any collected session as the active dataset, so
 PRODUCTION CALIBRATION, VOL SURFACE and MODEL COMPARISON run on it.
 `compute_metrics.py --history` (or `--store DIR`) writes the walk-forward summary, daily and regime tables,
 `sessions.csv` with every file's SHA-256, `summary.json`, `METRICS_SUMMARY.md` and a manifest. A rerun on the
-same sessions reproduces every file but the manifest byte for byte. Run on a store of the two real sessions held
-here (2026-10-20 bundled and 2026-10-21 from the dry run), it reports `walk-forward: not run (2 session(s) give
-1 origin day(s) ... collect at least 8 more trading day(s))`. A session more than 7 days after the committed
-Treasury curves (which end 2026-10-19) is discounted at the flat `--rate` unless `--with-cache` adds the cached
-Treasury curves, and the summary names the curve or rate of every trade date.
+same sessions reproduces every file but the manifest byte for byte, also from another checkout directory or a
+re-synced cache: where and when the store was checked out or synced is recorded in the manifest only. Run on a
+store of the two real sessions held here (2026-10-20 bundled and 2026-10-21 from the dry run), it reports
+`walk-forward: not run (2 session(s) give 1 origin day(s) ... collect at least 8 more trading day(s))`. A session
+more than 7 days after the committed Treasury curves (which end 2026-10-19) is discounted at the flat `--rate`
+unless `--with-cache` adds the cached Treasury curves, and the summary names the curve or rate of every trade
+date.
 
 `tools/download_spy_chains.py` still saves one chain by hand (`--outdir` in the full schema, or `--store DIR` in
 the compact store layout). It refuses past dates, keeps an existing session file unless `--replace`, and exits 0
@@ -458,17 +468,16 @@ hosted app's wake-up check).
 
 ## Tests and validation
 
-Test run on this revision (code at 7190bc5; the commit after it changes only the README and a docstring):
-`pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,527 tests from 79 files and took 20
-minutes here on 4 cores; run single files while iterating.
+Test run on this revision: `pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,540 tests
+from 79 files and took about 22 minutes here on 4 cores; run single files while iterating.
 
 | Environment | Result |
 |---|---|
-| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,527 passed, 0 skipped, 0 failed |
+| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,540 passed, 0 skipped, 0 failed |
 | `pytest --nbmake notebooks` (Python 3.11.17, numpy 2.4.6, pandas 2.3.3, SciPy 1.17.1; run on the previous revision, and the notebooks use none of the modules changed since) | 3 passed |
 | `ruff check .` and `ruff format --check .` (ruff 0.17.1, the CI pin) | clean (219 files formatted) |
 | `mypy` (2.4.0, the CI pin, on the local versions above) | clean (no issues in 105 source files) |
-| `actionlint` 1.7.12 on `.github/workflows/*` | clean |
+| `actionlint` 1.7.12 with shellcheck 0.11.0 on `.github/workflows/*` | clean |
 
 - **QuantLib golden fixtures.** `tools/gen_golden.py` with the modules in `tools/golden/` writes the 15 files
   `tests/golden/<area>.json` from QuantLib 1.44 (calendars, curves, multi-curve, swaps, caps/floors including
@@ -510,6 +519,11 @@ a real SYNC NOW (the expected 404 message, 1.2 s), two real sessions (held back)
 22-23 s). Also checked were MARKET DATA loading a collected session and PRODUCTION CALIBRATION on it, and RATES >
 BOOK and RESEARCH > VAR on a euro book reported in USD with FX moving and held. They showed the same absence of
 exceptions, console or page errors, error alerts (apart from the intended sync failure) and horizontal overflow.
+After the review fixes, 10 views per width were driven again at 1280 and 390 px: 14 SYNTHETIC sessions (labelled
+SYNTHETIC with the orange edge), SESSIONS = most recent 10 and its run (13 s), a real collected SPY session
+(labelled as Yahoo's delayed quotes, held back, then loaded in MARKET DATA), a server with nothing synced, and
+RATES > BOOK and RESEARCH > VAR with FX; none showed an exception, a console or page error, an error alert or
+horizontal overflow.
 
 ---
 
@@ -670,10 +684,13 @@ Platform
 - pandas 3 and numpy 2.5 are not supported yet (capped). mypy runs in CI with a lenient config (11 error codes
   off, an `attr-defined` baseline of 18 modules).
 - The GitHub workflows have not run on this revision (see [CI](#tests-and-validation)). `collect-data.yml` has
-  never run on GitHub. It passes actionlint 1.7.12 (its shell steps were not shellchecked), and its git steps
-  (orphan branch, merge, commit, rebuilt push) are tested against a local bare repository. The `data-snapshots`
-  branch appears with its first run on `main`; until then `derivx snapshots sync` and the lab's SYNC NOW report a
-  404.
+  never run on GitHub. It passes actionlint 1.7.12 with shellcheck 0.11.0, and its git steps (orphan branch,
+  merge, commit, rebuilt push) are tested against a local bare repository. Its step scripts were also run end to
+  end here, unchanged, against a local bare origin with real Yahoo pulls of the 2026-10-21 session: a first run
+  with two tickers (the orphan branch, one commit), the same session again (no fetch, no commit), Thanksgiving
+  and a Saturday (no commit), Yahoo unreachable (red, no commit), a valid and an invalid ticker (the valid one
+  committed, the run red) and a dry run (nothing pushed). The `data-snapshots` branch appears with its first run
+  on `main`; until then `derivx snapshots sync` and the lab's SYNC NOW report a 404.
 - Inputs survive mode switches, but the selected tab inside a page is not kept.
 - Yahoo rate-limits shared IPs; lab pulls back off and say so. Yahoo's terms of use govern its data.
 

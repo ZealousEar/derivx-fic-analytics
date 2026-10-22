@@ -117,3 +117,48 @@ def test_market_data_loads_any_collected_session(tmp_path, monkeypatch, day):
     assert any("Collected session" in s.value and "quotes kept" in s.value for s in at.success)
     banner = " ".join(m.value for m in at.markdown if "ACTIVE DATASET" in m.value)
     assert f"session {day}" in banner and "collected history" in banner
+
+
+def test_the_banner_says_what_the_rows_are_from_their_manifests(tmp_path, monkeypatch):
+    synthetic_store(tmp_path / "synthetic", 3)
+    monkeypatch.setenv(lab_history.LOCAL_ENV, str(tmp_path / "synthetic"))
+    text = _texts(_collected(_lab()))
+    assert "SYNTHETIC (GENERATED, NOT MARKET DATA)" in text and "Yahoo Finance delayed quotes (real" not in text
+    real_store(tmp_path / "real", ["2026-10-20", "2026-10-21"])
+    monkeypatch.setenv(lab_history.LOCAL_ENV, str(tmp_path / "real"))
+    assert "Yahoo Finance delayed quotes (real, one file per session)" in _texts(_collected(_lab()))
+
+
+def test_the_walk_forward_runs_on_the_most_recent_sessions(tmp_path, monkeypatch):
+    store = synthetic_store(tmp_path / "branch", 14)
+    monkeypatch.setenv(lab_history.LOCAL_ENV, str(tmp_path / "branch"))
+    at = _collected(_lab())
+    assert at.selectbox(key=lab_history.WINDOW_KEY).value == 30  # the default: every one of the 14 here
+    at.selectbox(key=lab_history.WINDOW_KEY).set_value(10).run()
+    assert not at.exception
+    stats = " ".join(m.value for m in at.markdown if "dx-lab-stats" in m.value)
+    assert "<span>SESSIONS</span><b>14</b>" in stats and "<span>IN THE RUN</span><b>10</b>" in stats
+    at.button(key="lab_hist_use").click().run()
+    assert not at.exception
+    entry = at.session_state[lab.K_WF_DATA]
+    days = [d.isoformat() for d in store.sessions("SYNTH")]
+    assert [d.date().isoformat() for d in entry["dataset"].trade_dates] == days[-10:]
+    assert (entry["history"]["sessions"], entry["history"]["sessions_collected"]) == (10, 14)
+    assert entry["history"]["first"] == days[-10] and "SYNTHETIC" in entry["history"]["data"]
+
+
+def test_a_window_too_short_for_the_walk_forward_says_to_pick_more_sessions(tmp_path, monkeypatch):
+    store = synthetic_store(tmp_path / "branch", 14)
+    index = store.index()
+    gone = index.iloc[[-3]]  # a missing day inside the 10 most recent sessions leaves 8 origin days in them
+    for path in gone["path"]:
+        (store.root / path).unlink()
+    store.write_index(index.drop(gone.index))
+    monkeypatch.setenv(lab_history.LOCAL_ENV, str(store.root))
+    at = _collected(_lab())
+    at.selectbox(key=lab_history.WINDOW_KEY).set_value(10).run()
+    assert any("The most recent 10 of the 13 collected sessions" in w.value and "pick more SESSIONS" in w.value
+               for w in at.warning)  # fmt: skip
+    assert not [b for b in at.button if b.key == "lab_hist_use"]
+    at.selectbox(key=lab_history.WINDOW_KEY).set_value("all").run()
+    assert [b for b in at.button if b.key == "lab_hist_use"]  # 13 sessions with one gap: 11 origin days

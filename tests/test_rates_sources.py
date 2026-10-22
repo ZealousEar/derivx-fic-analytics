@@ -273,6 +273,20 @@ def test_http_get_retries_with_backoff_then_gives_up(serve, monkeypatch):
         rs.http_get("https://example.org/a", retries=2)
 
 
+def test_http_get_retries_a_transfer_cut_short_then_gives_up_with_a_source_error(serve):
+    import http.client
+
+    cut = http.client.IncompleteRead(b"x" * 10, 90)  # 10 bytes of a 100-byte body, then the connection dropped
+    server = serve({"example.org": [cut, b"ok"]})
+    assert rs.http_get("https://example.org/a", retries=1) == b"ok" and len(server.urls) == 2
+    serve({"example.org": [http.client.IncompleteRead(b"", 5), http.client.RemoteDisconnected("closed")]})
+    with pytest.raises(rs.SourceError, match=r"unreachable after 2 attempts \(closed\)"):
+        rs.http_get("https://example.org/a", retries=1)
+    serve({"example.org": [http.client.IncompleteRead(b"ab", 3)]})
+    with pytest.raises(rs.SourceError, match=r"IncompleteRead\(2 bytes read, 3 more expected\)"):
+        rs.http_get("https://example.org/a", retries=0)
+
+
 def test_http_get_does_not_retry_refusals(serve):
     server = serve({"example.org": [http_error(403), b"never"]})
     with pytest.raises(rs.SourceBlocked, match="403"):

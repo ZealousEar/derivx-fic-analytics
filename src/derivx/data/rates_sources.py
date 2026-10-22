@@ -41,6 +41,7 @@ Sources and their terms (all free, no key):
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import io
 import json
 import math
@@ -273,9 +274,10 @@ def _urlopen(request: urllib.request.Request, timeout: float):
 
 def http_get(url: str, timeout: float = DEFAULT_TIMEOUT, retries: int = 2, backoff: float = 1.0) -> bytes:
     """GET ``url``: up to ``retries`` extra attempts on timeouts, connection
-    errors, HTTP 429 and 5xx, sleeping ``backoff * 2**attempt`` seconds in
-    between. HTTP 403/407 raise :class:`SourceBlocked` at once; other 4xx
-    raise :class:`SourceError`."""
+    errors, transfers cut short (a body shorter than its Content-Length, a
+    malformed response), HTTP 429 and 5xx, sleeping ``backoff * 2**attempt``
+    seconds in between. HTTP 403/407 raise :class:`SourceBlocked` at once;
+    other 4xx raise :class:`SourceError`."""
 
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     last: Optional[Exception] = None
@@ -290,8 +292,8 @@ def http_get(url: str, timeout: float = DEFAULT_TIMEOUT, retries: int = 2, backo
             if exc.code != 429 and exc.code < 500:
                 raise SourceError(f"HTTP {exc.code} from {_host(url)}") from exc
             last = exc
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-            last = exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as exc:
+            last = exc  # HTTPException: IncompleteRead (a truncated body) and other broken responses
         if attempt < retries:
             time.sleep(backoff * 2**attempt)
     raise SourceError(f"{_host(url)} unreachable after {retries + 1} attempts ({_reason(last)})")
