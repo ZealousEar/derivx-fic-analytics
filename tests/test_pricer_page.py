@@ -328,7 +328,8 @@ def test_mode_round_trip_keeps_values_and_modes_do_not_share_keys():
     at.slider(key="eq_surf_res").set_value(31).run()
     premium = _premium(at)
     at.sidebar.radio[0].set_value("[ FX ]").run()
-    assert at.number_input(key="fx_spot_EURUSD").value == pytest.approx(1.1215)  # not the equity market
+    # the FX page's own default (the ECB rate of the bundled history's latest day, 2026-10-21), not the equity market
+    assert at.number_input(key="fx_spot_EURUSD").value == pytest.approx(1.1234)
     at.number_input(key="fx_spot_EURUSD").set_value(1.0123).run()
     at.sidebar.radio[0].set_value("[ RATES ]").run()
     at.sidebar.radio[0].set_value("[ EQUITY ]").run()
