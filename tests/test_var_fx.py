@@ -252,13 +252,17 @@ def test_cli_scenario_replays_fx_unless_held(tmp_path, capsys):
     pd.concat([pf.example_blotter("EUR"), pf.example_blotter("USD")]).to_csv(blotter, index=False)
     args = ["scenario", "--trades", str(blotter), "--asof", "2026-10-19", "--conventions", "all",
             "--illustrative-vols", "--shock", "historical:2022-hiking-cycle"]  # fmt: skip
-    outs = {}
+    outs, printed = {}, {}
     for hold in (False, True):
         out = tmp_path / f"grid_{hold}.csv"
         code = cli.main(args + ["--out", str(out)] + (["--hold-fx"] if hold else []))
-        assert code in (0, 3), capsys.readouterr().err
-        outs[hold] = pd.read_csv(out).iloc[0]
-    capsys.readouterr()
+        captured = capsys.readouterr()
+        assert code in (0, 3), captured.err
+        outs[hold], printed[hold] = pd.read_csv(out).iloc[0], captured.out
+    # each replay names the FX moves it applies; with --hold-fx it applies none and says so
+    assert "FX moves in 2022 hiking cycle: EURUSD -14.31%, GBPUSD -17.82%" in printed[False]
+    assert "historical and window replays by the ECB rates of their dates" in printed[False]
+    assert "FX moves in" not in printed[True] and "--hold-fx holds FX in historical and window replays" in printed[True]
     moved, held = outs[False], outs[True]
     assert moved["TOTAL EUR"] == pytest.approx(held["TOTAL EUR"], rel=1e-12)
     assert moved["TOTAL USD"] == pytest.approx(held["TOTAL USD"], rel=1e-12)

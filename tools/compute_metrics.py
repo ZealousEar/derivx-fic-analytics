@@ -259,7 +259,9 @@ def _discount_text(desc: Dict[str, object]) -> str:
     if mode == "rate" or not curves:
         return f"flat rate {float(desc.get('flat_rate_cc', 0.0)):.2%} cc (an input, not market data)"
     head = "put-call parity per expiry where it passes its gates, else " if mode == "parity" else ""
-    return head + "; ".join(labels) + f" (trade date to expiry; {len(curves)} trade date(s))"
+    # a long history has one curve per trade date: name the first and the last (summary.json lists every one)
+    named = "; ".join(labels) if len(labels) <= 3 else f"{len(labels)} curves, {labels[0]} .. {labels[-1]}"
+    return head + named + f" (trade date to expiry; {len(curves)} trade date(s))"
 
 
 def report_markdown(summary: Dict[str, object]) -> str:
