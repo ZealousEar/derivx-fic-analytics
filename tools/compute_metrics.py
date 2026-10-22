@@ -54,10 +54,12 @@ summary says how many there are. Outputs: ``walkforward_summary.csv``,
 each file's SHA-256), ``summary.json``, ``METRICS_SUMMARY.md`` and
 ``manifest.json``. Everything but the manifest's run time is a function of
 the store's files and the code version, so a rerun on the same sessions
-reproduces it byte for byte. Sessions after the committed Treasury curves
-(2026-10-19) are discounted at the flat ``--rate`` unless ``--with-cache``
-adds the Treasury curves in the download cache (``derivx pull fred --ids
-ust``); the summary names the curve or rate of every trade date.
+reproduces it byte for byte. A session uses the latest Treasury curve at
+most 7 days before it; sessions more than 7 days after the committed curves
+(which end 2026-10-19) are discounted at the flat ``--rate`` unless
+``--with-cache`` adds the Treasury curves in the download cache (``derivx
+pull fred --ids ust`` or ``derivx pull treasury``); the summary names the
+curve or rate of every trade date.
 
     python tools/compute_metrics.py --history --ticker SPY --outdir data/metrics/spy_history
 """
