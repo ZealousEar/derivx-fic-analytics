@@ -1,0 +1,39 @@
+# Streamlit settings for every way the app runs: `streamlit run` from the
+# repository root, the Docker image (WORKDIR /app), Render, Procfile hosts,
+# the devcontainer and Streamlit Community Cloud all read this file.
+# Secrets never go here: they belong in .streamlit/secrets.toml, which
+# .gitignore and .dockerignore keep out of git and out of the image.
+# Per-host settings (port, address) come from the command line or from
+# STREAMLIT_* environment variables, which override this file: the Docker
+# image and render.yaml set STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=type and the
+# Procfile passes --client.showErrorDetails=type, so public viewers see an
+# exception's type, not a traceback with server paths. Local runs keep
+# Streamlit's default (full details).
+
+[global]
+# derivx.ui.state writes each kept input back onto its key at the start of a
+# run (UIE-04: inputs survive a trip through the other modes), by design for
+# widgets that also pass a default value; without this Streamlit logs a
+# 30-line stack trace once per server process on the first mode round trip,
+# which reads like an error in the server log and says nothing new.
+disableWidgetStateDuplicationWarning = true
+
+[server]
+# Cross-site request forgery and CORS protection stay at Streamlit's safe
+# defaults (on). The app has file uploaders; never turn these off to work
+# around a proxy - open the app in its own browser tab instead.
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# The app is drawn black on purpose (src/derivx/ui/theme.py). Without a dark
+# base theme Streamlit keeps its light theme underneath: a white 60px header
+# band and #31333F widget labels on black (UIE-08).
+base = "dark"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#1A1A1A"
+textColor = "#FFFFFF"
+primaryColor = "#FF4444"

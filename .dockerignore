@@ -1,0 +1,24 @@
+# Build context for the Dockerfile: only what the image needs. Secrets stay out.
+.git
+.github
+.worktrees
+.devcontainer
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+**/.ipynb_checkpoints
+*.egg-info
+src/*.egg-info
+build
+dist
+.streamlit/*
+!.streamlit/config.toml
+data/cache
+data/metrics
+docs
+notebooks
+tools

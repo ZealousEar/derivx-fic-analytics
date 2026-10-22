@@ -2,24 +2,155 @@ name: ci
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [master, main]
   pull_request:
-    branches: [ master, main ]
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install deps
+          python-version: "3.11"
+      # The same ruff as the dev extra; rules and line length come from [tool.ruff] in pyproject.toml.
+      - run: python -m pip install "ruff==0.17.1"
+      - name: ruff check (E, F, W, I over src, tests, tools and notebooks)
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      # The Docker lock's tested resolution, so new numpy or Streamlit type stubs cannot turn the job red on
+      # their own; the same mypy as the dev extra.
+      - name: Install the locked runtime dependencies and mypy
+        run: python -m pip install -r requirements-lock.txt "mypy==2.4.0"
+      - name: mypy over src/derivx (lenient start; the codes still off are listed in [tool.mypy] in pyproject.toml)
+        run: mypy
+
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # QuantLib publishes wheels for all four, so the live QuantLib checks run everywhere
+        # (the golden-fixture tests need no QuantLib at all).
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the newest versions the pyproject ranges allow, plus the dev extra
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -e .[dev]
-      - name: Tests
-        run: pytest -q
+          python -m pip install -e ".[dev]"
+          python -m pip check
+      - name: Tests (golden fixtures, live QuantLib checks, AppTest UI tests); deprecations and runtime warnings are errors
+        run: python -m pytest -W error::DeprecationWarning -W error::RuntimeWarning
 
+  oldest:
+    name: test (Python 3.10, oldest supported versions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install every direct dependency at its lower bound
+        run: |
+          python -m pip install uv
+          uv pip install --python "$(command -v python)" --resolution lowest-direct -e ".[dev]"
+      - name: Tests; deprecations and runtime warnings are errors
+        run: python -m pytest -W error::DeprecationWarning -W error::RuntimeWarning
 
+  notebooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install with the dev and notebooks extras only (what the notebooks declare they need)
+        run: python -m pip install -e ".[dev,notebooks]"
+      - name: Execute every notebook (nbmake fails on any error or failed assert)
+        run: python -m pytest --nbmake --nbmake-timeout=600 notebooks
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the test stage (runtime layout + UI tests and a live server check, run inside the image)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: derivx:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+      - name: Run it and wait for the healthcheck
+        run: |
+          docker run -d --name derivx -p 8501:8501 derivx:ci
+          for _ in $(seq 1 40); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' derivx)
+            [ "$status" = healthy ] && break
+            sleep 3
+          done
+          docker inspect -f '{{.State.Health.Status}}' derivx | grep -qx healthy
+          test "$(curl -fsS http://127.0.0.1:8501/_stcore/health)" = ok
+      - name: XSRF and CORS protection are on in the running container
+        run: |
+          # An upload without an XSRF token is refused (403; 400 would mean XSRF is off).
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -F "file=@LICENSE" \
+            http://127.0.0.1:8501/_stcore/upload_file/session/file)
+          test "$code" = 403
+          # No CORS header that admits a foreign origin. The headers are captured first, so a failed
+          # request fails the step (a `! curl | grep` pipeline would pass when curl itself fails).
+          headers=$(curl -fsS -D - -o /dev/null -H 'Origin: https://evil.example' \
+            http://127.0.0.1:8501/_stcore/health)
+          if printf '%s\n' "$headers" | grep -qiE '^access-control-allow-origin: *(\*|https://evil\.example)'; then
+            echo "CORS protection is off: $headers"
+            exit 1
+          fi
+      - name: Container log
+        if: always()
+        run: docker logs derivx || true

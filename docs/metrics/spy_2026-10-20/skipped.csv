@@ -1,0 +1,3 @@
+trade_date,expiry,reason
+2026-10-20,2026-10-20,0 day(s) to expiry < min_days=2
+2026-10-20,2026-10-21,1 day(s) to expiry < min_days=2

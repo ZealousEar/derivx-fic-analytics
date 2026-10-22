@@ -1,0 +1,1288 @@
+"""``derivx`` command line.
+
+    derivx pull fred --ids DGS2,DGS10 --start 2015-01-01
+    derivx pull fred --ids ust,ice --start 2000-01-01   # groups: ust, ice, fixings
+    derivx pull treasury --year 2026
+    derivx pull nyfed --rate sofr --last 30
+    derivx pull ecb-estr --start 2026-01-01
+    derivx pull ecb-yc --curve AAA --measure par --tenors 2Y,10Y,30Y --last 20
+    derivx pull boe-ois --archive daily --start 2022-09-01 --end 2022-10-31
+    derivx pull ecb-fx --start 2015-01-01   # ECB euro reference rates (FX history)
+    derivx pull latest                 # every fast live source, as the app's LIVE mode
+    derivx pull fred --ids DGS10 --offline --out dgs10.csv
+
+``pull`` downloads into the cache (``data/cache`` or ``$DERIVX_CACHE_DIR``)
+and prints what it got: rows, series, date range, fetch time and the
+payload's SHA-256. ``--offline`` reads only the cache. ``--out`` writes the
+normalised long format (CSV or Parquet).
+
+Curves, books and scenarios (no network: the committed history sample plus
+whatever ``pull`` cached)::
+
+    derivx curve build --quotes q.csv --asof 2026-10-19 --interp loglinear --out curve.json
+    derivx curve build --asof 2026-10-19 --conventions "EUR ESTR" --out eur.json   # the app's quotes
+    derivx curve show --curve curve.json --nodes nodes.csv
+    derivx book example --currency USD --out trades.csv
+    derivx risk --trades trades.csv --curve curve.json --illustrative-vols --out risk.csv --manifest run.json
+    derivx risk --trades trades.csv --asof 2026-10-19 --hedge 2Y,5Y,10Y,30Y --bid-ask 0.25 --move 5
+    derivx risk --trades mixed.csv --asof 2026-10-19 --conventions all --report-ccy EUR --illustrative-vols
+    derivx scenario --trades trades.csv --asof 2026-10-19 --shock parallel:+25 --shock historical:2022-hiking-cycle
+    derivx scenario --trades mixed.csv --asof 2026-10-19 --conventions all --shock fx:EURUSD=+10
+
+``curve build`` writes the curve set as JSON (quotes, nodes and a run
+manifest); ``risk`` and ``scenario`` rebuild it from its quotes and refuse a
+file whose quotes no longer give its nodes. Exit codes: 0 ok, 1 a data
+source failed, 2 bad arguments, 3 some blotter rows or trades were left out
+(the rest were priced).
+
+Currencies: every trade's numbers are in its currency (US Treasuries in
+USD, the rest in the swap curve's). ``risk`` and ``scenario`` total each
+currency and add the whole book converted into ``--report-ccy`` (default
+USD; ``ALL IN USD``) at the ECB euro reference rates of the latest day on
+or before the valuation date (the bundled daily history since 2015 plus any
+``pull ecb-fx`` download) or at ``--fx`` rates, printing the rates used.
+``--conventions all`` (with ``--asof``) prices each currency's trades on
+that currency's market (USD SOFR, EUR ESTR, GBP SONIA; Treasuries on the
+US Treasury curve), so one blotter can hold all three.
+Hedges and key-rate ladders stay per currency. FX spots are held unless a
+shock moves them (``fx:EURUSD=+10``, ``--fx-move``, and historical or window
+replays, which move them by the ECB reference rates of their own dates
+unless ``--hold-fx``).
+
+Each subcommand registers itself with :func:`command`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence
+
+import pandas as pd
+
+from derivx.data import rates_sources as rs
+from derivx.data.cache import DiskCache
+
+Register = Callable[[argparse.ArgumentParser], None]
+COMMANDS: Dict[str, Register] = {}
+EXIT_SOURCE_ERROR = 1
+
+
+def command(name: str) -> Callable[[Register], Register]:
+    """Decorator: ``register(parser)`` fills the subcommand's parser and
+    sets ``func`` (``args -> exit code``) with ``parser.set_defaults``."""
+
+    def wrap(register: Register) -> Register:
+        COMMANDS[name] = register
+        return register
+
+    return wrap
+
+
+def _date(text: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date; use YYYY-MM-DD") from None
+
+
+def _list(text: str) -> List[str]:
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _units(text: str) -> Dict[str, str]:
+    """``ID=unit[,ID=unit]`` -> ``{ID: unit}`` (units as in
+    :data:`derivx.data.rates_sources.UNIT_SCALE`, or ``index``)."""
+
+    allowed = sorted(rs.UNIT_SCALE) + ["index"]
+    out: Dict[str, str] = {}
+    for part in _list(text):
+        sid, sep, unit = part.partition("=")
+        if not sep or not sid.strip() or unit.strip() not in allowed:
+            raise argparse.ArgumentTypeError(f"{part!r}: use SERIES=UNIT with UNIT one of {', '.join(allowed)}")
+        out[sid.strip().upper()] = unit.strip()
+    return out
+
+
+FRED_GROUPS = {
+    "UST": rs.UST_FRED_IDS,  # Treasury par (CMT) yields, 1M-30Y
+    "ICE": rs.ICE_SWAP_FRED_IDS,  # ICE USD swap rates, 2000-07 to 2016-10-28
+    "FIXINGS": ("SOFR", "EFFR", "OBFR", "IUDSOIA", "ECBESTRVOLWGTTRMDMNRT"),
+}
+
+
+def _fred_ids(text: str) -> List[str]:
+    """Comma-separated FRED ids; ``ust``, ``ice`` and ``fixings`` expand to
+    their series."""
+
+    out: List[str] = []
+    for part in _list(text):
+        out += list(FRED_GROUPS.get(part.upper(), (part,)))
+    return list(dict.fromkeys(out))
+
+
+# --------------------------------------------------------------------------
+# pull
+# --------------------------------------------------------------------------
+
+
+def _summary(fetched: rs.Fetched, show: int) -> str:
+    frame = fetched.frame
+    how = "from the cache" if fetched.from_cache else "downloaded"
+    lines = [f"{fetched.source}: {len(frame)} rows {how} (fetched {fetched.fetched_at}, sha256 {fetched.sha256[:12]})"]
+    if len(frame):
+        for series, rows in frame.groupby("series", sort=False):
+            first, last = min(rows["asof"]), max(rows["asof"])
+            latest = rows.loc[rows["asof"] == last].iloc[-1]
+            tenor = latest["tenor"] or "-"
+            lines.append(
+                f"  {series:<40} {tenor:>5}  {len(rows):>6} obs  {first} .. {last}  "
+                f"last {latest['value_original']:g} {latest['unit_original']} ({latest['measure']})"
+            )
+    lines += [f"  note: {n}" for n in fetched.notices]
+    if show and len(frame):  # the latest N rows, whatever order the source returned them in
+        lines.append(frame.sort_values("asof", kind="stable").tail(show).to_string(index=False))
+    return "\n".join(lines)
+
+
+def _write(frame: pd.DataFrame, out: Optional[Path]) -> Optional[str]:
+    if out is None:
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix.lower() == ".parquet":
+        frame.to_parquet(out, index=False)
+    else:
+        frame.to_csv(out, index=False)
+    return f"wrote {len(frame)} rows to {out}"
+
+
+def _fetch(args: argparse.Namespace) -> rs.Fetched:
+    common = dict(
+        offline=args.offline or None, max_age=args.max_age, cache=DiskCache(args.cache) if args.cache else None
+    )
+    if args.timeout is not None:
+        common["timeout"] = args.timeout
+    source = args.source
+    if source == "fred":
+        return rs.fred_series(args.ids, args.start, args.end, units=args.units, vintage=args.vintage, **common)
+    if source == "treasury":
+        return rs.treasury_par_curve(args.year, **common)
+    if source == "nyfed":
+        if args.start is None and args.last is None:
+            args.last = 30
+        return rs.nyfed_rate(args.rate, last_n=args.last, start=args.start, end=args.end, **common)
+    if source == "ecb-estr":
+        return rs.ecb_estr(args.start, args.end, args.last, **common)
+    if source == "ecb-yc":
+        return rs.ecb_yield_curve(args.tenors, args.curve, args.measure, args.start, args.end, args.last, **common)
+    if source == "boe-ois":
+        return rs.boe_ois_curve(args.archive, args.start, args.end, **common)
+    if source == "ecb-fx":
+        return rs.ecb_fx(args.currencies, args.start, args.end, args.last, **common)
+    raise ValueError(f"unknown source {source!r}")
+
+
+def _pull(args: argparse.Namespace) -> int:
+    if args.source == "latest":
+        from derivx.data.rates_history import refresh_live
+
+        result = refresh_live(
+            max_age=args.max_age if args.max_age is not None else 0.0,
+            timeout=args.timeout or 8.0,
+            offline=args.offline or None,
+            cache=DiskCache(args.cache) if args.cache else None,
+        )
+        for name, ok in result.ok.items():
+            print(f"{'ok  ' if ok else 'FAIL'} {name}")
+        for notice in result.notices:
+            print(f"  note: {notice}")
+        return 0 if all(result.ok.values()) else EXIT_SOURCE_ERROR
+    try:
+        fetched = _fetch(args)
+    except rs.SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    print(_summary(fetched, args.show))
+    message = _write(fetched.frame, args.out)
+    if message:
+        print(message)
+    return 0
+
+
+@command("pull")
+def _register_pull(parser: argparse.ArgumentParser) -> None:
+    """download rates market data into the cache (FRED, Treasury, NY Fed, ECB, BoE)"""
+
+    sources = parser.add_subparsers(dest="source", required=True, metavar="SOURCE")
+
+    def add(name: str, help_text: str) -> argparse.ArgumentParser:
+        sub = sources.add_parser(name, help=help_text, description=help_text)
+        sub.add_argument("--offline", action="store_true", help="read only the cache, never the network")
+        sub.add_argument("--max-age", type=float, help="reuse a cached copy younger than this many seconds")
+        sub.add_argument("--timeout", type=float, help="seconds per request attempt")
+        sub.add_argument("--cache", type=Path, help="cache directory (default data/cache or $DERIVX_CACHE_DIR)")
+        sub.add_argument("--out", type=Path, help="write the long-format rows to a .csv or .parquet file")
+        sub.add_argument("--show", type=int, default=0, help="print the last N rows")
+        sub.set_defaults(func=_pull)
+        return sub
+
+    fred = add("fred", "FRED series via the keyless fredgraph.csv (the JSON API if $FRED_API_KEY is set)")
+    fred.add_argument(
+        "--ids",
+        type=_fred_ids,
+        required=True,
+        help="comma-separated series ids, e.g. DGS2,DGS10; 'ust', 'ice' and 'fixings' expand to their series",
+    )
+    fred.add_argument("--start", type=_date)
+    fred.add_argument("--end", type=_date)
+    fred.add_argument("--units", type=_units, help="units of unknown series, e.g. MYSERIES=percent,OTHER=bp")
+    fred.add_argument("--vintage", type=_date, help="data as known on this date (ALFRED; needs $FRED_API_KEY)")
+    treasury = add("treasury", "US Treasury daily par yield curve CSV for one year (slow endpoint)")
+    treasury.add_argument("--year", type=int, default=dt.date.today().year)
+    nyfed = add("nyfed", "NY Fed reference rates: sofr, effr, obfr, tgcr, bgcr or sofrai (averages and index)")
+    nyfed.add_argument("--rate", choices=sorted(rs.NYFED_RATES), default="sofr")
+    nyfed.add_argument("--last", type=int, help="the last N publications (default 30)")
+    nyfed.add_argument("--start", type=_date)
+    nyfed.add_argument("--end", type=_date)
+    estr = add("ecb-estr", "euro short-term rate (ECB Data Portal)")
+    estr.add_argument("--last", type=int)
+    estr.add_argument("--start", type=_date)
+    estr.add_argument("--end", type=_date)
+    yc = add("ecb-yc", "euro area government yield curve (ECB, Svensson fit)")
+    yc.add_argument("--curve", choices=sorted(rs.ECB_CURVES), default="AAA")
+    yc.add_argument("--measure", choices=sorted(rs.ECB_MEASURES), default="par")
+    yc.add_argument("--tenors", type=_list, default=list(rs.ECB_TENORS))
+    yc.add_argument("--last", type=int)
+    yc.add_argument("--start", type=_date)
+    yc.add_argument("--end", type=_date)
+    fxr = add("ecb-fx", "ECB euro foreign exchange reference rates (EXR, daily; FX history for conversions and VaR)")
+    fxr.add_argument("--currencies", type=_list, default=list(rs.ECB_FX_CURRENCIES),
+                     help="currencies per 1 EUR (default USD,GBP,JPY,CHF,CAD,AUD,NZD)")  # fmt: skip
+    fxr.add_argument("--last", type=int)
+    fxr.add_argument("--start", type=_date)
+    fxr.add_argument("--end", type=_date)
+    boe = add("boe-ois", "Bank of England fitted UK OIS (SONIA) spot curve")
+    boe.add_argument("--archive", choices=sorted(rs.BOE_ARCHIVES), default="latest")
+    boe.add_argument("--start", type=_date)
+    boe.add_argument("--end", type=_date)
+    add("latest", "every fast live source the app's LIVE (CACHED) mode uses")
+
+
+# --------------------------------------------------------------------------
+# Market inputs shared by curve, risk and scenario
+# --------------------------------------------------------------------------
+
+
+def _store(cache: Optional[Path]):
+    """The committed history sample plus whatever ``derivx pull`` cached (no
+    network)."""
+
+    from derivx.data import rates_history as rh
+
+    frames = [rh.bundled_frame()] + rh.cached_frames(DiskCache(cache) if cache else None)
+    return rh.build_store(frames, "bundled snapshot + download cache")
+
+
+def _hw(text: str):
+    from derivx.rates.indices import HullWhite
+
+    parts = _list(text)
+    try:
+        a, sigma = (float(p) for p in parts)
+        return HullWhite(a / 100.0, sigma / 1e4)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r}: give MEAN_REVERSION_PCT,SIGMA_BP (e.g. 3,85): {exc}") from None
+
+
+ALL_MARKETS = "all"
+
+
+def _fx_quotes(text: str) -> Dict[str, float]:
+    """``EURUSD=1.08,GBPUSD=1.27`` -> ``{pair: rate}`` (USD per 1 EUR and
+    per 1 GBP)."""
+
+    out: Dict[str, float] = {}
+    for part in _list(text):
+        pair, sep, value = part.partition("=")
+        code = pair.strip().upper().replace("/", "")
+        try:
+            rate = float(value)
+        except ValueError:
+            rate = float("nan")
+        if not sep or code not in ("EURUSD", "GBPUSD") or not rate > 0:
+            raise argparse.ArgumentTypeError(f"{part!r}: write EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP)")
+        out[code] = rate
+    if set(out) != {"EURUSD", "GBPUSD"}:
+        raise argparse.ArgumentTypeError("give both EURUSD and GBPUSD, e.g. EURUSD=1.08,GBPUSD=1.27")
+    return out
+
+
+def _fx_moves(text: str) -> Dict[str, float]:
+    """``EURUSD=+10,GBPUSD=-5`` -> ``{pair: % move}``."""
+
+    out: Dict[str, float] = {}
+    for part in _list(text):
+        pair, sep, value = part.partition("=")
+        code = pair.strip().upper().replace("/", "")
+        try:
+            pct = float(value)
+        except ValueError:
+            pct = float("nan")
+        if not sep or code not in ("EURUSD", "GBPUSD") or not pct > -100.0:
+            raise argparse.ArgumentTypeError(f"{part!r}: write EURUSD=+10 or GBPUSD=-5 (% moves, above -100)")
+        out[code] = pct
+    return out
+
+
+def _market_options(parser: argparse.ArgumentParser, curve_file: bool = True) -> None:
+    group = parser.add_argument_group("market")
+    if curve_file:
+        group.add_argument("--curve", type=Path, help="curve set JSON from 'derivx curve build'")
+    group.add_argument("--asof", type=_date, help="valuation date: build the market the app starts from that day")
+    group.add_argument("--conventions", default="USD SOFR", choices=["USD SOFR", "EUR ESTR", "GBP SONIA", ALL_MARKETS],
+                       help="swap curve (with --asof); 'all' prices each currency's trades on its own market "
+                       "(USD SOFR, EUR ESTR, GBP SONIA), Treasuries on the US Treasury curve")  # fmt: skip
+    group.add_argument("--interp", default="loglinear", help="loglinear, linear_zero or monotone_convex (with --asof)")
+    group.add_argument("--hw", type=_hw, help="futures convexity: Hull-White MEAN_REVERSION_PCT,SIGMA_BP (3,85)")
+    group.add_argument("--cache", type=Path, help="download cache directory (default data/cache or $DERIVX_CACHE_DIR)")
+    rep = parser.add_argument_group("reporting currency")
+    rep.add_argument("--report-ccy", default="USD", choices=["USD", "EUR", "GBP"],
+                     help="convert book totals into this currency (totals stay per currency too)")  # fmt: skip
+    rep.add_argument("--fx", type=_fx_quotes,
+                     help="FX spots EURUSD=1.08,GBPUSD=1.27 (USD per 1 EUR / per 1 GBP); default: the ECB euro "
+                     "reference rates of the latest day on or before the valuation date (the bundled daily history "
+                     "since 2015 plus 'derivx pull ecb-fx' downloads)")  # fmt: skip
+
+
+@dataclass
+class _Book:
+    """Trades priced on one market: ``currency`` is that market's when the
+    blotter is split by currency (``--conventions all``), else None."""
+
+    currency: Optional[str]
+    market: object
+    sources: Dict[str, str]
+    data: Dict[str, object]
+    notes: List[str]
+    trades: list
+
+
+def _books(args: argparse.Namespace, trades) -> List[_Book]:
+    """The market(s) to price ``trades`` on: the one of --curve or
+    --asof/--conventions, or one per currency with ``--conventions all``."""
+
+    if args.conventions != ALL_MARKETS:
+        market, sources, data, notes = _market(args)
+        return [_Book(None, market, sources, data, notes, list(trades))]
+    if getattr(args, "curve", None) is not None or args.asof is None:
+        raise ValueError("--conventions all builds each currency's market for a date: give --asof, not --curve")
+    from derivx.rates import curve_io
+    from derivx.rates.manifest import market_record
+    from derivx.rates.portfolio import OIS_CONVENTIONS
+    from derivx.risk.reporting import ordered
+
+    store = _store(args.cache)
+    by_ccy: Dict[str, list] = {}
+    for trade in trades:
+        by_ccy.setdefault("USD" if trade.type == "bond" else trade.currency, []).append(trade)
+    out = []
+    for ccy in ordered(list(by_ccy)):
+        market, sources, notes = curve_io.default_market(store, args.asof, OIS_CONVENTIONS[ccy], args.interp,
+                                                         args.hw or curve_io.HW_DEFAULT)  # fmt: skip
+        out.append(_Book(ccy, market, sources, market_record(market, sources, store), notes, by_ccy[ccy]))
+    if not out:
+        raise ValueError("the blotter has no valid trades")
+    return out
+
+
+def _reporting(args: argparse.Namespace, asof: dt.date):
+    """The reporting currency and the FX spots that convert into it."""
+
+    from derivx.risk.reporting import Reporting, default_reporting, entered_spots
+
+    if args.fx is not None:
+        return Reporting(args.report_ccy, entered_spots(args.fx, None, "FX rates given with --fx"))
+    return default_reporting(asof, args.report_ccy, store=_store(getattr(args, "cache", None)))
+
+
+def _print_fx(reporting, currencies, asof: dt.date, shocks: Sequence = (), hold_fx: bool = False) -> None:
+    """Print the FX spots that convert the book, what moves them, and the
+    FX moves (% of each spot against the dollar) of each scenario that has
+    any; nothing when every amount is already in the reporting currency."""
+
+    if not reporting.needs_conversion(currencies):
+        return
+    movers = ("fx: shocks and --fx-move only; --hold-fx holds FX in historical and window replays" if hold_fx else
+              "fx: shocks, --fx-move, and historical and window replays by the ECB rates of their dates")  # fmt: skip
+    print(f"FX: {reporting.label} converts at {reporting.describe(currencies)}; FX spots held unless a shock moves "
+          f"them ({movers})")  # fmt: skip
+    if reporting.fx.asof is not None and reporting.fx.asof != asof:
+        print(f"  note: the FX spots are of {reporting.fx.asof}, not of the valuation date {asof} (pass --fx for "
+              "rates of that date)")  # fmt: skip
+    for shock in shocks:
+        if shock.moves_fx:
+            print(f"  FX moves in {shock.name}: " + ", ".join(f"{pair} {pct:+.2f}%" for pair, pct in shock.fx))
+
+
+def _market(args: argparse.Namespace):
+    """(market, {curve: source}, data record, notes) from --curve or --asof."""
+
+    from derivx.rates import curve_io
+    from derivx.rates.manifest import market_record, sha256_bytes
+
+    if getattr(args, "curve", None) is not None:
+        if args.asof is not None:
+            raise ValueError("give --curve or --asof, not both")
+        market, sources, manifest = curve_io.read_curve_set(args.curve)
+        data = market_record(market, sources)
+        data["curve_file"] = {"path": str(args.curve), "sha256": sha256_bytes(args.curve.read_bytes()),
+                              "built": manifest.get("created_at_utc"), "data": manifest.get("data", {})}  # fmt: skip
+        return market, sources, data, []
+    if args.asof is None:
+        raise ValueError("give the market: --curve curve.json or --asof YYYY-MM-DD")
+    store = _store(args.cache)
+    market, sources, notes = curve_io.default_market(store, args.asof, args.conventions, args.interp,
+                                                     args.hw or curve_io.HW_DEFAULT)  # fmt: skip
+    return market, sources, market_record(market, sources, store), notes
+
+
+def _print_curves(market, sources) -> None:
+    for key in market.curve_keys:
+        if key not in ("curve", "govt") and market.projections.is_discount(key):
+            continue
+        curve = market.get_curve(key)
+        worst = max((abs(r["error_bp"]) for r in curve.repricing()), default=0.0)
+        print(
+            f"  {key:<11} {len(curve.quotes):>3} quotes  max repricing error {worst:.1e}bp  2Y zero "
+            f"{100 * curve.zero_rate(2.0):.4f}%  10Y zero {100 * curve.zero_rate(10.0):.4f}%  | "
+            f"{sources.get(key, '')}"
+        )
+
+
+def _write_table(frame: pd.DataFrame, path: Optional[Path], what: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    print(f"wrote {what} ({len(frame)} rows) to {path}")
+
+
+def _write_manifest(manifest, path: Optional[Path]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(manifest.to_json())
+    print(f"wrote the run manifest to {path}")
+
+
+# --------------------------------------------------------------------------
+# curve
+# --------------------------------------------------------------------------
+
+
+def _curve_build(args: argparse.Namespace) -> int:
+    from derivx.rates import curve_io
+    from derivx.rates.curves import CONVENTIONS
+    from derivx.rates.exports import market_tables
+    from derivx.rates.manifest import market_record, run_manifest, sha256_bytes
+
+    store = _store(args.cache)
+    hw = args.hw or curve_io.HW_DEFAULT
+    inputs = {"asof": args.asof, "conventions": args.conventions, "interpolation": args.interp, "units": args.units,
+              "hull_white": {"mean_reversion": hw.mean_reversion, "sigma": hw.sigma}}  # fmt: skip
+    if args.quotes is None:
+        market, sources, notes = curve_io.default_market(store, args.asof, args.conventions, args.interp, hw)
+        inputs["quotes"] = "the app's starting quotes for the date (see the sources)"
+    else:
+        payload = args.quotes.read_bytes()
+        quotes, errors, notes = curve_io.read_quotes(payload, args.conventions, args.asof, args.units)
+        if errors:
+            for error in errors:
+                print(f"error: {error}", file=sys.stderr)
+            return 2
+        sources = {key: f"{args.quotes.name}" for key in quotes}
+        if "govt" not in quotes and args.treasury:
+            try:
+                quotes["govt"] = curve_io.treasury_curve_quotes(store, args.asof)
+            except ValueError as exc:
+                raise ValueError(f"{exc}: add TREASURY rows to the quotes file or pass --no-treasury") from None
+            sources["govt"] = f"US Treasury par yields ({store.origin('UST_PAR', args.asof)})"
+        currency = CONVENTIONS[args.conventions].currency
+        market = curve_io.build_market(args.asof, quotes, args.conventions, args.interp, hw,
+                                       curve_io.ois_fixings(store, currency, args.asof))  # fmt: skip
+        inputs["quotes"] = {"path": str(args.quotes), "sha256": sha256_bytes(payload)}
+    for note in notes:
+        print(f"  note: {note}")
+    manifest = run_manifest(
+        "curve build", inputs, market_record(market, sources, store),
+        {"bootstrap": "every quote reprices exactly; curve time ACT/365F", "interpolation": args.interp},
+    )  # fmt: skip
+    print(f"curve set on {market.asof}:")
+    _print_curves(market, sources)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        curve_io.write_curve_set(args.out, market, sources, manifest.to_dict())
+        print(f"wrote the curve set to {args.out}")
+    tables = market_tables(market)
+    _write_table(tables["curve_nodes"], args.nodes, "curve nodes")
+    _write_table(tables["curve_grid"], args.grid, "curve grid (DFs, zero rates, forwards)")
+    return 0
+
+
+def _curve_show(args: argparse.Namespace) -> int:
+    from derivx.rates import curve_io
+    from derivx.rates.exports import market_tables
+
+    market, sources, manifest = curve_io.read_curve_set(args.curve)
+    code = manifest.get("code", {})
+    print(f"curve set on {market.asof} (built {manifest.get('created_at_utc', '?')}, code {code.get('sha', '?')}); "
+          "rebuilt from its quotes and checked against its nodes:")  # fmt: skip
+    _print_curves(market, sources)
+    tables = market_tables(market)
+    _write_table(tables["curve_nodes"], args.nodes, "curve nodes")
+    _write_table(tables["curve_grid"], args.grid, "curve grid (DFs, zero rates, forwards)")
+    return 0
+
+
+@command("curve")
+def _register_curve(parser: argparse.ArgumentParser) -> None:
+    """bootstrap a curve set from quotes and save it as JSON, or show one"""
+
+    actions = parser.add_subparsers(dest="action", required=True, metavar="ACTION")
+    build = actions.add_parser("build", help="bootstrap from a quotes CSV (or the app's quotes for --asof)",
+                               description="Bootstrap the swap curve, any EURIBOR projection curves and the Treasury "
+                               "curve. Quotes CSV: [curve,] instrument, tenor, rate.")  # fmt: skip
+    build.add_argument("--quotes", type=Path, help="quotes CSV (default: the app's starting quotes for the date)")
+    build.add_argument("--asof", type=_date, required=True, help="valuation date YYYY-MM-DD")
+    build.add_argument("--conventions", default="USD SOFR", choices=["USD SOFR", "EUR ESTR", "GBP SONIA"])
+    build.add_argument("--interp", default="loglinear", help="loglinear, linear_zero or monotone_convex")
+    build.add_argument("--units", default="auto", choices=["auto", "percent", "decimal", "bp"],
+                       help="rate units of the quotes file (auto reads them from the magnitudes)")  # fmt: skip
+    build.add_argument(
+        "--treasury",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="add the US Treasury par curve for the date from the history store (default on)",
+    )
+    build.add_argument("--hw", type=_hw, help="futures convexity: Hull-White MEAN_REVERSION_PCT,SIGMA_BP (3,85)")
+    build.add_argument("--cache", type=Path, help="download cache directory")
+    build.add_argument("--out", type=Path, help="write the curve set JSON here")
+    build.add_argument("--nodes", type=Path, help="write the curve nodes CSV (pillars, DFs, zero rates)")
+    build.add_argument("--grid", type=Path, help="write a dated grid CSV (DFs, zero rates, 3M forwards)")
+    build.set_defaults(func=_curve_build)
+    show = actions.add_parser("show", help="load a curve set JSON, check it and export its nodes")
+    show.add_argument("--curve", type=Path, required=True)
+    show.add_argument("--nodes", type=Path)
+    show.add_argument("--grid", type=Path)
+    show.set_defaults(func=_curve_show)
+
+
+# --------------------------------------------------------------------------
+# book, risk and scenario
+# --------------------------------------------------------------------------
+
+EXIT_TRADES = 3  # some blotter rows had errors or could not be priced (the rest were)
+DEFAULT_HEDGE_MOVE_BP = 5.0  # the BOOK tab's default curve move for the cost-penalised hedge
+
+
+def _trades(path: Path):
+    from derivx.rates import portfolio as pf
+
+    table, read_issues = pf.read_blotter_csv(path.read_bytes())
+    trades, issues = pf.parse_blotter(table)
+    issues = read_issues + issues
+    for issue in issues:
+        stream = sys.stderr if issue.level == "error" else sys.stdout
+        print(f"{issue.level}: {path.name} {issue}", file=stream)
+    return trades, any(i.level == "error" for i in issues)
+
+
+def _vol_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("vols for trades without a flat vol")
+    group.add_argument("--swaption-vols", type=Path, help="swaption normal vol grid CSV (bp; wide or long, as the app)")
+    group.add_argument("--cap-vols", type=Path, help="flat ATM normal cap vols CSV: maturity, vol_bp")
+    group.add_argument("--illustrative-vols", action="store_true",
+                       help="use the built-in ILLUSTRATIVE swaption and cap quotes (not market data)")  # fmt: skip
+
+
+def _vols(args: argparse.Namespace, market, trades):
+    from derivx.rates import portfolio as pf
+    from derivx.rates.swaption_vol import parse_vol_grid
+    from derivx.rates.vol_examples import illustrative_cap_atm, illustrative_swaption_grid
+
+    currency = market.curve.conventions.currency if market.curve.conventions else "USD"
+    grid = cap_quotes = None
+    cap_source = ""
+    inputs = {}
+    if args.swaption_vols is not None:
+        raw = pd.read_csv(args.swaption_vols, dtype=str, keep_default_na=False, na_values=[""], sep=None,
+                          engine="python")  # fmt: skip
+        grid, issues = parse_vol_grid(raw, "normal", "bp", source=f"uploaded: {args.swaption_vols.name}")
+        errors = [i.message for i in issues if i.level == "error"]
+        if errors:
+            raise ValueError(f"{args.swaption_vols}: " + "; ".join(errors))
+        inputs["swaption_vols"] = str(args.swaption_vols)
+    elif args.illustrative_vols:
+        grid = illustrative_swaption_grid(currency)
+        inputs["swaption_vols"] = grid.source
+    if args.cap_vols is not None:
+        cap_quotes = pd.read_csv(args.cap_vols)
+        missing = {"maturity", "vol_bp"} - set(cap_quotes.columns)
+        if missing:
+            raise ValueError(f"{args.cap_vols}: needs columns maturity and vol_bp (missing {', '.join(missing)})")
+        cap_source = f"uploaded: {args.cap_vols.name}"
+        inputs["cap_vols"] = str(args.cap_vols)
+    elif args.illustrative_vols:
+        cap_quotes, cap_source = illustrative_cap_atm(currency), f"ILLUSTRATIVE {currency} flat ATM cap normal vols"
+        inputs["cap_vols"] = cap_source
+    hw = args.hw or None
+    vols, notes = pf.build_vols(market, trades, grid, cap_quotes, cap_source, hull_white=hw)
+    for note in notes:
+        print(f"  note: {note}")
+    return vols, inputs
+
+
+def _skipped(risk) -> None:
+    for trade, reason in risk.skipped:
+        hint = ""
+        if "vol cube" in reason or "caplet vols" in reason:
+            hint = " (or pass --swaption-vols / --cap-vols / --illustrative-vols)"
+        elif "switch the swap curve to" in reason:
+            conventions = reason.rsplit("switch the swap curve to ", 1)[1].split(" to price it")[0]
+            hint = (f" (here: --asof with --conventions {conventions!r}, or --conventions all to price every "
+                    "currency on its own market, or a curve set built with them)")  # fmt: skip
+        print(f"skipped: {trade.id} ({trade.type}): {reason}{hint}", file=sys.stderr)
+    for note in risk.notes:
+        print(f"  note: priced beyond the market data: {note}")
+
+
+def _money(value: float) -> str:
+    return f"{round(value, 2) + 0.0:,.2f}"
+
+
+def _risk(args: argparse.Namespace) -> int:
+    from derivx.rates import exports
+    from derivx.rates import portfolio as pf
+    from derivx.rates.manifest import run_manifest, sha256_bytes
+
+    trades, bad_rows = _trades(args.trades)
+    books = _books(args, trades)
+    priced = []
+    for book in books:
+        where = f" ({book.currency} market)" if book.currency else ""
+        for note in book.notes:
+            print(f"  note{where}: {note}")
+        vols, vol_inputs = _vols(args, book.market, book.trades)
+        risk = pf.price_book(book.trades, book.market, vols)
+        _skipped(risk)
+        priced.append((book, risk, vols, vol_inputs))
+    asof = books[0].market.asof
+    reporting = _reporting(args, asof)
+    risks = [risk for _, risk, _, _ in priced]
+    currencies = [c for risk in risks for c in risk.currencies]
+    summary = pf.summary_table(risks, reporting)
+    shown = summary.copy()
+    for column in ("pv", "pv01", "gamma", "vega"):
+        shown[column] = shown[column].map(_money)
+    n_priced, n_skipped = sum(len(r.trades) for r in risks), sum(len(r.skipped) for r in risks)
+    print(f"book on {asof}: {n_priced} trades priced, {n_skipped} skipped; values in each trade's currency, signed "
+          "to the holder, with a TOTAL per currency; PV01 and gamma for +1bp on every rate quote of every curve, vega "
+          "per +1bp normal vol")  # fmt: skip
+    _print_fx(reporting, currencies, asof)
+    print(shown.to_string(index=False))
+    for book, risk, _, _ in priced:
+        totals = risk.ladder_totals()
+        where = f" ({book.currency} market)" if book.currency else ""
+        if args.ladder_all:
+            print(totals.to_string(index=False))
+        else:
+            loaded = totals[totals["pv01"].abs() > 0.005]
+            print(f"key-rate PV01 of the book{where} (P&L per +1bp of one quote, in the curve's currency; buckets "
+                  "under half a cent left out):")  # fmt: skip
+            print(loaded.assign(pv01=loaded["pv01"].map(_money)).drop(columns=["gamma"]).to_string(index=False))
+    hedges = []
+    move = args.move
+    if args.hedge:
+        if args.bid_ask is not None and move is None:
+            move = DEFAULT_HEDGE_MOVE_BP
+            print(f"  note: --bid-ask without --move: the cost penalty hedges against {move:g}bp curve moves (the "
+                  "app's default; set it with --move)")  # fmt: skip
+        elif args.bid_ask is None and move is not None:
+            print("  note: --move only sizes the cost penalty, and there is none without --bid-ask: least-squares "
+                  "hedge")  # fmt: skip
+        for book, risk, _, _ in priced:
+            bench = {key: list(args.hedge) for key in pf.default_benchmarks(risk, book.market)}
+            if not bench:
+                continue
+            costs = {}
+            if args.bid_ask is not None:
+                costs = {k: args.bid_ask for k in pf.assumed_bid_ask(book.market, bench)}
+            instruments = pf.hedge_instruments(book.market, bench, bid_ask_bp=costs)
+            hedge = pf.hedge_book(risk, book.market, instruments, move)
+            hedges.append(hedge)
+            for ccy, part in hedge.by_currency.items():
+                label = "hedge" if len(hedge.by_currency) == 1 and len(priced) == 1 else f"hedge, {ccy} curves"
+                print(f"{label}: residual risk {_money(part.risk_after)} vs {_money(part.risk_before)} {ccy} per bp "
+                      f"(root sum of squares of the key-rate ladder, {100 * part.risk_removed:.2f}% of its square "
+                      f"removed), bid/ask cost {_money(part.cost)} {ccy}; notional > 0 receives fixed, receives the "
+                      "spread leg or buys the bond; pv01 per +1bp on every quote")  # fmt: skip
+            table = hedge.table[hedge.table["notional"] != 0.0].copy()
+            for column in ("notional", "cost", "pv01"):
+                table[column] = table[column].map(_money)
+            table["par"] = table["par"].map(lambda v: f"{100 * v:.4f}%")  # par rate, basis spread or coupon
+            print(table.to_string(index=False))
+    report = exports.risk_report(risks, reporting=reporting)
+    _write_table(report, args.out, "risk report")
+    _write_table(pd.concat([r.ladder() for r in risks], ignore_index=True), args.ladder, "key-rate ladder by trade")
+    if hedges:
+        _write_table(pd.concat([h.ladder for h in hedges], ignore_index=True), args.hedge_out, "hedge ladder")
+    data = books[0].data if len(books) == 1 else {"markets": {b.currency: b.data for b in books}}
+    vol_inputs = priced[0][3] if len(priced) == 1 else {b.currency: v for b, _, _, v in priced}
+    vol_sources = dict(priced[0][2].sources) if len(priced) == 1 else {b.currency: dict(v.sources)
+                                                                       for b, _, v, _ in priced}  # fmt: skip
+    manifest = run_manifest(
+        "book risk",
+        {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes()),
+                    "rows_valid": len(trades)}, "vols": vol_inputs, "reporting": _reporting_record(reporting,
+                                                                                                    currencies),
+         "markets": "one per currency" if len(books) > 1 or books[0].currency else "one",
+         "hedge": None if not hedges else {"tenors": list(args.hedge), "move_bp": move, "bid_ask_bp": args.bid_ask}},
+        data,
+        {"bump_bp": pf.BP, "risk": "central differences on full revaluation, curves rebuilt",
+         "vol_sources": vol_sources, "fx": "spots held; totals per currency and converted at the stated spots"},
+    )  # fmt: skip
+    _write_manifest(manifest, args.manifest)
+    return EXIT_TRADES if bad_rows or n_skipped else 0
+
+
+def _reporting_record(reporting, currencies) -> Dict[str, object]:
+    from derivx.risk.reporting import ordered
+
+    return {"reporting_currency": reporting.currency, "position_currencies": ordered(currencies),
+            "fx": {p: reporting.fx.quote(p) for p in ("EURUSD", "GBPUSD", "EURGBP")},
+            "fx_source": reporting.fx.source, "fx_asof": reporting.fx.asof,
+            "converted": reporting.needs_conversion(currencies)}  # fmt: skip
+
+
+def _shock_years(text: str) -> float:
+    from derivx.rates.conventions import parse_tenor
+
+    try:
+        return float(text)
+    except ValueError:
+        return parse_tenor(text).years
+
+
+def parse_shock(spec: str, market, store, fx: bool = True) -> List[object]:
+    """One ``--shock`` spec -> shocks (see ``derivx scenario --help``);
+    historical shocks move FX by the ECB reference rates of their dates
+    unless ``fx`` is False."""
+
+    from derivx.risk import scenarios as sc
+
+    kind, _, rest = spec.strip().partition(":")
+    kind = kind.strip().lower()
+    parts = [p.strip() for p in rest.split(":")] if rest else []
+    try:
+        if kind == "parallel":
+            return [sc.parallel(float(parts[0]))]
+        if kind == "twist":
+            pivot, short_bp, long_bp = _shock_years(parts[0]), float(parts[1]), float(parts[2])
+            return [sc.twist(pivot, short_bp, long_bp)]
+        if kind in ("fly", "butterfly"):
+            body, body_bp = _shock_years(parts[0]), float(parts[1])
+            wing_bp = float(parts[2]) if len(parts) > 2 else 0.0
+            wings = (_shock_years(parts[3]), _shock_years(parts[4])) if len(parts) > 4 else (2.0, 10.0)
+            return [sc.butterfly(wing_bp, body_bp, body, wings=wings)]
+        if kind in ("keyrate", "keyrates"):
+            moves = {}
+            for item in _list(rest):
+                tenor, sep, bp = item.partition("=")
+                if not sep:
+                    raise ValueError(f"{item!r}: write TENOR=BP, e.g. 2Y=+10")
+                moves[tenor.strip().upper()] = float(bp)
+            return [sc.key_rates(moves)]
+        if kind == "pca":
+            factor, n_sigma = int(parts[0]), float(parts[1]) if len(parts) > 1 else 2.0
+            days = int(parts[2]) if len(parts) > 2 else 1
+            return [sc.pca_factor(factor, n_sigma, store, end=market.asof, days=days)]
+        if kind == "historical":
+            wanted = parts[0].lower().replace("-", " ").replace("_", " ")
+            names = {n.lower(): n for n in sc.historical_episodes()}
+            if wanted not in names:
+                raise ValueError(f"unknown episode {parts[0]!r}; one of: {'; '.join(sc.historical_episodes())}")
+            return [sc.historical(names[wanted], float(parts[1]) if len(parts) > 1 else 1.0, store=store, fx=fx)]
+        if kind == "window":
+            start, end = dt.date.fromisoformat(parts[0]), dt.date.fromisoformat(parts[1])
+            return [sc.history_window(start, end, float(parts[2]) if len(parts) > 2 else 1.0, store=store, fx=fx)]
+        if kind == "basis":
+            return [sc.ibor_ois_basis(float(parts[0]))]
+        if kind == "tenorbasis":
+            return [sc.tenor_basis(float(parts[0]))]
+        if kind == "fx":
+            return [sc.fx_spot(_fx_moves(rest))]
+        if kind == "library":
+            shocks = sc.standard_library(store, fx=fx)
+            if market.is_multi_curve:
+                shocks += [sc.ibor_ois_basis(10.0), sc.tenor_basis(5.0)]
+            return shocks + sc.pca_library(store, end=market.asof)
+    except (IndexError, ValueError, argparse.ArgumentTypeError) as exc:
+        detail = str(exc) if isinstance(exc, (ValueError, argparse.ArgumentTypeError)) else "missing a field"
+        raise ValueError(f"--shock {spec!r}: {detail} (see derivx scenario --help)") from None
+    raise ValueError(f"--shock {spec!r}: unknown shock type {kind!r} (see derivx scenario --help)")
+
+
+SHOCK_HELP = """shock specs (bp unless stated; tenors as years or 2Y/10Y):
+  parallel:BP                         every quote BP
+  twist:PIVOT:SHORT_BP:LONG_BP        zero at PIVOT, SHORT_BP at the shortest quote, LONG_BP at the longest
+  fly:BODY:BODY_BP[:WING_BP[:LEFT:RIGHT]]   butterfly (wings 2Y and 10Y by default)
+  keyrate:2Y=+10,10Y=-5               key-rate moves, linear in between, flat beyond
+  pca:FACTOR[:N_SIGMA[:DAYS]]         PC1 level / PC2 slope / PC3 curvature of daily US Treasury changes
+  historical:NAME[:SCALE]             a named episode, e.g. historical:2022-hiking-cycle (FX spots move by the
+                                      ECB reference rates of the same dates; --hold-fx holds them)
+  window:START:END[:SCALE]            the curve and FX changes between two dates of the history store
+  basis:BP / tenorbasis:BP            IBOR-OIS basis / tenor basis spreads (multi-curve markets)
+  fx:EURUSD=+10[,GBPUSD=-5]           FX spots only, % moves (moves only totals converted to --report-ccy)
+  library                             the app's scenario library (parallel, twists, fly, episodes, PCA)
+
+Each trade's P&L is in its currency; TOTAL columns add one currency's trades, ALL IN <CCY> converts the book
+into --report-ccy (plus the FX translation of FX moves)."""
+
+
+def _scenario(args: argparse.Namespace) -> int:
+    from dataclasses import replace as dc_replace
+
+    from derivx.rates import portfolio as pf
+    from derivx.rates.manifest import run_manifest, sha256_bytes
+    from derivx.risk import reporting as rp
+    from derivx.risk import scenarios as sc
+
+    trades, bad_rows = _trades(args.trades)
+    books = _books(args, trades)
+    for book in books:
+        where = f" ({book.currency} market)" if book.currency else ""
+        for note in book.notes:
+            print(f"  note{where}: {note}")
+    store = _store(args.cache)
+    parse_on = next((b.market for b in books if b.market.is_multi_curve), books[0].market)
+    shocks = [s for spec in args.shock for s in parse_shock(spec, parse_on, store, fx=not args.hold_fx)]
+    if not shocks:
+        raise ValueError("give at least one --shock (see derivx scenario --help)")
+    settings: Dict[str, object] = {"horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
+                                   "lognormal_vol_pts": args.vol_lognormal}  # fmt: skip
+    # --fx-move adds to each shock's own FX moves (an fx: shock keeps its moves) and names itself in the label
+    shocks = [sc.add_fx(dc_replace(s, **settings), args.fx_move or {}) for s in shocks]
+    asof = books[0].market.asof
+    reporting = _reporting(args, asof)
+    parts: List[tuple] = []
+    failed: Dict[str, str] = {}  # shock name -> reason it could not be applied
+    skipped = 0
+    vol_inputs: Dict[str, object] = {}
+    vol_sources: Dict[str, object] = {}
+    for book in books:
+        vols, inputs = _vols(args, book.market, book.trades)
+        vol_inputs[book.currency or ""] = inputs
+        vol_sources[book.currency or ""] = dict(vols.sources)
+        risk = pf.price_book(book.trades, book.market, vols, vega=False)
+        _skipped(risk)
+        skipped += len(risk.skipped)
+        positions = list(risk.positions)
+        if not positions:
+            continue
+        rows = {}
+        for shock in shocks:
+            moved = dc_replace(shock, govt=False) if book.market.govt is None else shock
+            try:
+                rows[shock.name] = sc.scenario_grid(positions, book.market, [moved]).iloc[0, : len(positions)]
+            except ValueError as exc:
+                failed.setdefault(shock.name, f"{shock.name}: {exc}")
+        base = [float(p.pv(book.market)) for p in positions]
+        parts.append((book, positions, rows, base, list(risk.currencies)))
+    if not parts:
+        raise ValueError("no trade could be priced")
+    for reason in failed.values():
+        print(f"not revalued: {reason}", file=sys.stderr)
+    kept = [s for s in shocks if s.name not in failed]
+    names = sc._unique([s.name for s in kept])
+    local = pd.concat([pd.DataFrame([rows[s.name] for s in kept], index=names) for _, _, rows, _, _ in parts], axis=1)
+    currencies = [c for *_, ccys in parts for c in ccys]
+    base = [v for _, _, _, values, _ in parts for v in values]
+    grid = rp.add_total_columns(local, currencies, reporting, base, [s.fx for s in kept]) if kept else local
+    grid.index.name = "scenario"
+    if not grid.empty:
+        print(f"full-revaluation P&L on {asof} (value at the horizon + cash - value today, each trade's currency, "
+              f"signed to the holder, a TOTAL per currency; horizon {args.horizon} days):")  # fmt: skip
+        _print_fx(reporting, currencies, asof, kept, args.hold_fx)
+        if any(s.moves_fx for s in kept) and not reporting.needs_conversion(currencies):
+            print(f"  note: every amount is in {reporting.currency}: FX moves change nothing")
+        print(grid.map(_money).to_string())
+    _write_table(grid.rename_axis("scenario").reset_index(), args.out, "scenario grid")
+    if args.explain is not None:
+        explain = []
+        for shock in kept:
+            rows = []
+            for book, positions, _, _, _ in parts:
+                moved = dc_replace(shock, govt=False) if book.market.govt is None else shock
+                try:
+                    rows += sc.run_scenario(positions, book.market, moved)
+                except ValueError as exc:
+                    print(f"no explain for {shock.name}: {exc}", file=sys.stderr)
+            explain += _explain_rows(shock, rows, reporting)
+        _write_table(pd.DataFrame(explain), args.explain, "P&L explain")
+    markets = books[0].data if len(books) == 1 else {"markets": {b.currency: b.data for b in books}}
+    manifest = run_manifest(
+        "scenario grid",
+        {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes())},
+         "shocks": list(args.shock), "horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
+         "lognormal_vol_pts": args.vol_lognormal, "fx_move_pct": args.fx_move or {}, "hold_fx": args.hold_fx,
+         "vols": vol_inputs if len(books) > 1 else next(iter(vol_inputs.values())),
+         "reporting": _reporting_record(reporting, currencies)},
+        {**markets, "scenario_sources": [{"shock": s.name, "sources": [vars(x) for x in s.sources]} for s in shocks]},
+        {"revaluation": "quotes shocked, curves rebuilt, every trade revalued",
+         "vol_sources": vol_sources if len(books) > 1 else next(iter(vol_sources.values())),
+         "fx": "local P&L does not move with FX; converted totals at today's spots plus the FX translation"},
+    )  # fmt: skip
+    _write_manifest(manifest, args.manifest)
+    return EXIT_TRADES if bad_rows or skipped or failed else 0
+
+
+def _explain_rows(shock, rows: List[Dict[str, object]], reporting) -> List[Dict[str, object]]:
+    """Explain rows of one scenario as CSV records: per trade, a total per
+    currency and the book converted (with the FX translation of FX moves)."""
+
+    from derivx.risk import reporting as rp
+    from derivx.risk.scenarios import EXPLAIN_COLUMNS
+
+    if not rows:
+        return []
+    by_curve = [r.get("delta_by_curve", {}) for r in rows]
+    frame = pd.DataFrame([{k: v for k, v in r.items() if k != "delta_by_curve"} for r in rows])
+    for k in sorted({k for d in by_curve for k in d}):
+        frame[f"delta_{k}"] = [d.get(k, 0.0) for d in by_curve]
+    currencies = [str(c) for c in frame["currency"]]
+    extra = None
+    if shock.moves_fx and reporting.needs_conversion(currencies):
+        frame["fx"] = float("nan")
+        extra = rp.explain_fx(frame["shocked_pv"], frame["cash"], currencies, reporting, shock.fx)
+    values = ["base_pv", "shocked_pv", "cash", "pnl", *EXPLAIN_COLUMNS] + [c for c in frame if c.startswith("delta_")]
+    table = rp.add_total_rows(frame, values, "position", "currency", reporting, extra)
+    table.insert(0, "scenario", shock.name)
+    return table.to_dict("records")
+
+
+def _book_example(args: argparse.Namespace) -> int:
+    from derivx.rates import portfolio as pf
+
+    table = pf.example_blotter(args.currency)
+    if args.out is None:
+        print(table.to_csv(index=False), end="")
+    else:
+        _write_table(table, args.out, f"EXAMPLE {args.currency} book (illustrative trades)")
+    return 0
+
+
+def _book_check(args: argparse.Namespace) -> int:
+    trades, bad_rows = _trades(args.trades)
+    print(f"{len(trades)} valid trades" + (" (rows with errors left out)" if bad_rows else ""))
+    return EXIT_TRADES if bad_rows else 0
+
+
+@command("book")
+def _register_book(parser: argparse.ArgumentParser) -> None:
+    """write an example trade blotter or validate one"""
+
+    actions = parser.add_subparsers(dest="action", required=True, metavar="ACTION")
+    example = actions.add_parser("example", help="an EXAMPLE book of illustrative trades as CSV")
+    example.add_argument("--currency", default="USD", choices=["USD", "EUR", "GBP"])
+    example.add_argument("--out", type=Path, help="write it here (default: print)")
+    example.set_defaults(func=_book_example)
+    check = actions.add_parser("check", help="validate a blotter CSV and list its problems")
+    check.add_argument("--trades", type=Path, required=True)
+    check.set_defaults(func=_book_check)
+
+
+@command("risk")
+def _register_risk(parser: argparse.ArgumentParser) -> None:
+    """price a trade blotter: PV, PV01, key-rate ladders, vega and hedges"""
+
+    parser.add_argument("--trades", type=Path, required=True, help="blotter CSV (see derivx book example)")
+    _market_options(parser)
+    _vol_options(parser)
+    parser.add_argument("--out", type=Path, help="write the long risk report CSV (PV, PV01, key rates, vega)")
+    parser.add_argument("--ladder", type=Path, help="write the key-rate ladder by trade CSV")
+    parser.add_argument("--ladder-all", action="store_true", help="print every key-rate bucket, zeros included")
+    parser.add_argument("--hedge", type=_list, help="hedge with par instruments at these tenors, e.g. 2Y,5Y,10Y,30Y")
+    parser.add_argument("--move", type=float,
+                        help=f"with --bid-ask: hedge against curve moves of this size (bp; default "
+                        f"{DEFAULT_HEDGE_MOVE_BP:g})")  # fmt: skip
+    parser.add_argument("--bid-ask", type=float, help="bid/ask (bp of the hedge's quote) of every hedge")
+    parser.add_argument("--hedge-out", type=Path, help="write the book / hedge / residual ladder CSV")
+    parser.add_argument("--manifest", type=Path, help="write the run manifest JSON")
+    parser.set_defaults(func=_risk)
+
+
+@command("scenario")
+def _register_scenario(parser: argparse.ArgumentParser) -> None:
+    """full-revaluation scenario P&L of a trade blotter"""
+
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    parser.epilog = SHOCK_HELP
+    parser.add_argument("--trades", type=Path, required=True, help="blotter CSV (see derivx book example)")
+    parser.add_argument("--shock", action="append", default=[], help="a shock spec (repeat for more); see below")
+    parser.add_argument("--horizon", type=int, default=0, help="calendar days to roll the market forward first")
+    parser.add_argument("--vol-normal", type=float, default=0.0, help="normal vol shock (bp)")
+    parser.add_argument("--vol-lognormal", type=float, default=0.0, help="lognormal vol shock (vol points)")
+    parser.add_argument("--hold-fx", action="store_true",
+                        help="hold FX spots in historical and window replays (by default they move by the ECB "
+                        "reference rates of the same dates)")  # fmt: skip
+    parser.add_argument("--fx-move", type=_fx_moves,
+                        help="FX moves added to every shock, e.g. EURUSD=+10,GBPUSD=-5 (%%; only converted totals "
+                        "move; added to an fx: shock's own move of the same pair; named in each scenario)")  # fmt: skip
+    _market_options(parser)
+    _vol_options(parser)
+    parser.add_argument("--out", type=Path, help="write the scenario grid CSV (scenarios x trades)")
+    parser.add_argument("--explain", type=Path, help="write the P&L explain CSV (delta, gamma, vol, carry, residual)")
+    parser.add_argument("--manifest", type=Path, help="write the run manifest JSON")
+    parser.set_defaults(func=_scenario)
+
+
+# --------------------------------------------------------------------------
+# snapshots: daily option-chain history
+# --------------------------------------------------------------------------
+
+
+def _tickers(text: str) -> List[str]:
+    from derivx.data.snapshots import TICKER_RE
+
+    out = [t.upper() for t in _list(text.replace(" ", ","))]
+    bad = [t for t in out if not TICKER_RE.match(t)]
+    if not out or bad:
+        raise argparse.ArgumentTypeError(f"{text!r}: give tickers as SPY or SPY,QQQ (letters, digits, . ^ = -)")
+    return list(dict.fromkeys(out))
+
+
+def _band(text: str):
+    parts = _list(text)
+    try:
+        lo, hi = (float(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: give LOW,HIGH strike / spot, e.g. 0.4,1.6") from None
+    return lo, hi
+
+
+def _limits(args: argparse.Namespace):
+    from derivx.data.snapshots import StoreLimits
+
+    return StoreLimits(max_days=args.max_days, moneyness=args.moneyness)
+
+
+def _snapshots_collect(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotStore, collect
+
+    store = SnapshotStore(args.store, "the data branch") if args.store is not None else None
+    now = pd.Timestamp(args.now) if args.now else None
+    report = collect(args.tickers, args.staging, store, limits=_limits(args), attempts=args.attempts,
+                     wait_s=args.wait, dry_run=args.dry_run, now=now)  # fmt: skip
+    print(f"{report.now_utc}: {report.reason}")
+    for o in report.outcomes:
+        size = f", {o.bytes / 1e3:,.0f} KB" if o.bytes else ""
+        print(f"  {o.ticker} {o.session or '-'}: {o.state.upper()}{size} in {o.seconds:.1f}s"
+              f"{' - ' + o.reason if o.reason else ''}")  # fmt: skip
+    if args.summary is not None:
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write(report.markdown())
+    if args.report is not None:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report.as_dict(), indent=2) + "\n")
+    if report.failed:
+        print(f"error: {len(report.failed)} ticker(s) produced nothing for the {report.session} session",
+              file=sys.stderr)  # fmt: skip
+    return report.exit_code
+
+
+def _snapshots_merge(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError, SnapshotStore
+
+    target = SnapshotStore(args.into)
+    try:
+        done = target.merge_from(SnapshotStore(args.source))
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    for ticker, session, state in done:
+        print(f"{state:<5} {ticker} {session}")
+    added = sum(1 for *_, state in done if state == "added")
+    print(f"{added} file(s) added to {args.into}, {len(done) - added} already there (kept)")
+    return 0
+
+
+def _snapshots_index(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotStore
+
+    store = SnapshotStore(args.store)
+    if not args.check:
+        store.rebuild_index()
+    problems = store.verify()
+    for problem in problems:
+        print(f"problem: {problem}", file=sys.stderr)
+    print(f"{len(store.index())} file(s) indexed in {store.index_path}; {len(problems)} problem(s)")
+    return EXIT_SOURCE_ERROR if problems else 0
+
+
+def _snapshot_store(args: argparse.Namespace):
+    """The store ``list`` and ``sync`` read: a local checkout, or the synced
+    copy of --repo/--branch in the cache (``sync`` downloads it first)."""
+
+    from derivx.data.snapshots import SnapshotStore, sync
+
+    if args.local is not None:
+        if not (args.local / "options").exists():
+            raise ValueError(f"{args.local} is not a snapshot store (no options/ directory)")
+        return SnapshotStore(args.local, f"local checkout {args.local}"), None
+    result = sync(args.repo, args.branch, tickers=args.tickers, offline=True if args.offline else None,
+                  cache_root=args.cache, base_url=args.base_url)  # fmt: skip
+    return result.store, result
+
+
+def _print_coverage(store, tickers) -> None:
+    from derivx.data.snapshots import coverage_table
+
+    table = coverage_table(store, tickers)
+    if table.empty:
+        print(f"{store.label}: no sessions stored")
+        return
+    for ticker in table["ticker"]:
+        print(store.coverage(ticker).describe())
+    print(table.to_string(index=False))
+
+
+def _snapshots_sync(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError
+
+    try:
+        store, result = _snapshot_store(args)
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    if result is not None:
+        how = "cache only" if result.offline else f"{result.downloaded} downloaded, {result.cached} already cached"
+        print(f"{store.label} -> {store.root} ({how}; synced {result.synced_at})")
+        for notice in result.notices:
+            print(f"  note: {notice}")
+        for problem in result.failed:
+            print(f"  failed: {problem}", file=sys.stderr)
+    else:
+        print(f"{store.label}: read in place, nothing downloaded")
+    _print_coverage(store, args.tickers)
+    return EXIT_SOURCE_ERROR if result is not None and result.failed else 0
+
+
+def _snapshots_list(args: argparse.Namespace) -> int:
+    from derivx.data.snapshots import SnapshotError
+
+    args.offline = True  # list never downloads: `derivx snapshots sync` does
+    try:
+        store, result = _snapshot_store(args)
+    except SnapshotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SOURCE_ERROR
+    print(f"{store.label} (synced {result.synced_at}) in {store.root}" if result is not None else store.label)
+    _print_coverage(store, args.tickers)
+    if args.sessions:
+        for ticker in args.tickers or store.tickers():
+            print(f"{ticker}: {' '.join(d.isoformat() for d in store.sessions(ticker))}")
+    return 0
+
+
+@command("snapshots")
+def _register_snapshots(parser: argparse.ArgumentParser) -> None:
+    """collect, publish and read daily option-chain snapshots (the data-snapshots branch)"""
+
+    from derivx.data.snapshots import DATA_BRANCH, StoreLimits
+
+    actions = parser.add_subparsers(dest="action", required=True, metavar="ACTION")
+    defaults = StoreLimits()
+    collect = actions.add_parser(
+        "collect", help="save the due session's chain of each ticker into a staging store (Yahoo, network)",
+        description="Save the chain of the session that closed most recently (16:15 New York, collected 10 minutes "
+        "to 12 hours after) for each ticker, in the compact storage schema, into --staging. Nothing is fetched on "
+        "a weekend, an NYSE holiday or during a session, or for a session --store already holds. Exit 0: saved, "
+        "already stored or nothing due; 1: a session was due and some ticker produced nothing.",
+    )  # fmt: skip
+    collect.add_argument("--tickers", type=_tickers, default=["SPY"], help="comma-separated tickers (default SPY)")
+    collect.add_argument("--staging", type=Path, required=True, help="directory to write the new snapshots into")
+    collect.add_argument("--store", type=Path, help="the published store (a data-branch checkout): sessions it holds "
+                         "are not fetched again")  # fmt: skip
+    collect.add_argument("--max-days", type=int, default=defaults.max_days,
+                         help=f"keep expiries up to this many calendar days (default {defaults.max_days})")  # fmt: skip
+    collect.add_argument("--moneyness", type=_band, default=defaults.moneyness,
+                         help="keep strikes with LOW <= strike / spot <= HIGH (default 0.4,1.6)")  # fmt: skip
+    collect.add_argument("--attempts", type=int, default=3, help="whole-chain fetch attempts per ticker (default 3)")
+    collect.add_argument("--wait", type=float, default=60.0, help="seconds before the 2nd attempt (doubles after)")
+    collect.add_argument("--summary", type=Path, help="append a Markdown summary (e.g. $GITHUB_STEP_SUMMARY)")
+    collect.add_argument("--report", type=Path, help="write the run report as JSON")
+    collect.add_argument("--dry-run", action="store_true", help="label the summary as a dry run (nothing committed)")
+    collect.add_argument("--now", help=argparse.SUPPRESS)  # tests: the clock
+    collect.set_defaults(func=_snapshots_collect)
+    merge = actions.add_parser("merge", help="copy staged snapshots the store lacks into it and append the index")
+    merge.add_argument("source", type=Path, help="the staging store")
+    merge.add_argument("into", type=Path, help="the published store (a data-branch checkout)")
+    merge.set_defaults(func=_snapshots_merge)
+    index = actions.add_parser("index", help="add missing index rows from the manifests and verify every file")
+    index.add_argument("--store", type=Path, required=True)
+    index.add_argument("--check", action="store_true", help="only verify (exit 1 on any problem)")
+    index.set_defaults(func=_snapshots_index)
+    for name, help_text in (
+        ("sync", "download the published store (index and files) into the cache, or read a local checkout"),
+        ("list", "coverage of the synced store or a local checkout: sessions, first, last, gaps (no network)"),
+    ):
+        sub = actions.add_parser(name, help=help_text, description=help_text)
+        sub.add_argument("--repo", help="OWNER/NAME on GitHub (default $DERIVX_SNAPSHOT_REPO or "
+                         "ZealousEar/derivx-fic-analytics)")  # fmt: skip
+        sub.add_argument("--branch", help=f"data branch (default $DERIVX_SNAPSHOT_BRANCH or {DATA_BRANCH})")
+        sub.add_argument("--tickers", type=_tickers, help="only these tickers")
+        sub.add_argument("--local", type=Path, help="read this local checkout of the data branch instead")
+        sub.add_argument("--cache", type=Path, help="cache directory (default data/cache or $DERIVX_CACHE_DIR)")
+        sub.add_argument("--base-url", help=argparse.SUPPRESS)  # tests and mirrors: instead of raw.githubusercontent
+        if name == "sync":
+            sub.add_argument("--offline", action="store_true", help="read only the cache, never the network")
+            sub.set_defaults(func=_snapshots_sync)
+        else:
+            sub.add_argument("--sessions", action="store_true", help="also print every session date")
+            sub.set_defaults(func=_snapshots_list, offline=True)
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="derivx", description="DerivX FIC analytics command line")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    for name, register in COMMANDS.items():
+        summary = (register.__doc__ or name).strip().splitlines()[0]
+        sub = commands.add_parser(name, help=summary, description=summary)
+        register(sub)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    try:
+        return int(args.func(args))
+    except ValueError as exc:  # bad combinations of arguments the parser cannot see
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:  # a file to read is missing or unreadable, or one to write cannot be
+        where = f": {exc.filename}" if getattr(exc, "filename", None) else ""
+        print(f"error: {exc.strerror or exc}{where}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

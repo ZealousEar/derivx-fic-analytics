@@ -1,0 +1,127 @@
+{
+  "data": {
+    "source": "bundled sample: real SPY chain from Yahoo Finance (delayed quotes), one snapshot",
+    "ticker": "SPY",
+    "trade_dates": [
+      "2026-10-20"
+    ],
+    "fetched_at_utc": "2026-10-20T20:59:39+00:00",
+    "rows": 10040,
+    "expiries": 31,
+    "slices": 31,
+    "row_sources": [
+      "yahoo"
+    ],
+    "files": [
+      "data/examples/spy_2026-10-20.csv.gz"
+    ],
+    "data_sha256": "2fa7d599651ed6564caa6a3d4501dd228bffec7b1f30dfbbed660b30be3188b9"
+  },
+  "filters": {
+    "min_volume": 10,
+    "min_mid": 0.1,
+    "max_spread": 0.4
+  },
+  "settings": {
+    "discounting": {
+      "mode": "curve",
+      "what": "the trade date's discount curve (US Treasury par curve, bootstrapped)",
+      "flat_rate_cc": 0.0,
+      "curves": {
+        "2026-10-20": {
+          "asof": "2026-10-19",
+          "label": "US Treasury par curve of 2026-10-19 (US Treasury, bundled snapshot), bootstrapped",
+          "interpolation": "loglinear",
+          "pillars": 14
+        }
+      }
+    },
+    "min_days": 2.0,
+    "max_days": null,
+    "sabr_beta": 1.0,
+    "cv_folds": 5,
+    "std_band_sd": 3.0,
+    "min_points": 8,
+    "expiries": "all"
+  },
+  "snapshots": 1,
+  "model_comparison": {
+    "metric": "rmse_cv_bp: k-fold CV RMSE on interior strikes, vol bp",
+    "slices_scored": 29,
+    "slices_skipped": 2,
+    "per_model": [
+      {
+        "model": "svi",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 5.099700441559445,
+        "mean_rmse_cv_bp": 9.325345256456224,
+        "max_rmse_cv_bp": 52.34197037175561,
+        "best_on": 1
+      },
+      {
+        "model": "sabr",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 16.18602870506687,
+        "mean_rmse_cv_bp": 18.30853462232203,
+        "max_rmse_cv_bp": 58.80937755259433,
+        "best_on": 0
+      },
+      {
+        "model": "spline",
+        "slices": 29,
+        "failed": 0,
+        "median_rmse_cv_bp": 1.7271076469177677,
+        "mean_rmse_cv_bp": 5.7747718954468095,
+        "max_rmse_cv_bp": 71.87898223878571,
+        "best_on": 28
+      }
+    ],
+    "pairwise": {
+      "svi_vs_sabr": {
+        "slices": 29,
+        "a_better": 25,
+        "b_better": 4,
+        "ties": 0,
+        "median_diff": -10.63737843851018
+      },
+      "svi_vs_spline": {
+        "slices": 29,
+        "a_better": 1,
+        "b_better": 28,
+        "ties": 0,
+        "median_diff": 3.2357910290932623
+      },
+      "sabr_vs_spline": {
+        "slices": 29,
+        "a_better": 1,
+        "b_better": 28,
+        "ties": 0,
+        "median_diff": 14.226798270214404
+      }
+    },
+    "statements": [
+      "SVI has the lower out-of-sample RMSE on 25 of 29 expiries (median SVI - SABR = -10.6 vol bp; SVI better at the median).",
+      "IV spline has the lower out-of-sample RMSE on 28 of 29 expiries (median SVI - IV spline = +3.2 vol bp; IV spline better at the median).",
+      "IV spline has the lower out-of-sample RMSE on 28 of 29 expiries (median SABR - IV spline = +14.2 vol bp; IV spline better at the median)."
+    ]
+  },
+  "calibration": {
+    "slices": 29,
+    "median_rmse_bp": 5.958140435295284,
+    "max_rmse_bp": 41.967909673540326,
+    "butterfly_ok": "29 of 29",
+    "lee_ok": "29 of 29",
+    "calendar_ok": "25 of 28 adjacent expiry pairs",
+    "calendar_failures": [
+      "2027-03-19",
+      "2027-06-30",
+      "2027-12-17"
+    ]
+  },
+  "walk_forward": {
+    "status": "not run",
+    "reason": "1 snapshot(s): a walk-forward test needs daily snapshots one trading day apart. Yahoo has no history; collect one snapshot per trading day with tools/download_spy_chains.py."
+  }
+}

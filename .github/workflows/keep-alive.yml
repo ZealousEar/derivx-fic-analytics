@@ -1,73 +1,71 @@
-name: Keep Streamlit App Alive
+name: keep-alive
+
+# Wakes the Streamlit Community Cloud app and fails when it is down.
+#
+# A plain HTTP check cannot fail: the live app and a nonexistent
+# *.streamlit.app both answer 303 to share.streamlit.io's auth page. Only a
+# real browser follows that redirect, opens the app's websocket (the traffic
+# that keeps a Community Cloud app awake) and can see whether the app's own UI
+# renders. tools/keep_alive/main.py drives headless Chrome, clicks the wake
+# button when the app sleeps and exits 1 unless the app's sidebar appears, so a
+# red run here means the app is really down.
+#
+# No commits: GitHub disables scheduled workflows in a repository with no
+# activity for 60 days. Instead of pushing a timestamp file (which filled the
+# history with bot commits), the last step re-enables this workflow through
+# the API on every scheduled run. If GitHub ever stops counting that, the
+# schedule is disabled after 60 quiet days and GitHub emails the owner; one
+# click on "Enable workflow" (or `gh workflow enable keep-alive.yml`)
+# restores it. Either way no run reports "alive" for an app that is down.
+#
+# collect-data.yml now adds a data commit to the data-snapshots branch every
+# trading day, which is repository activity too. That does not make this
+# workflow redundant: it is the only check that the hosted app is up, and it
+# keeps its own re-enable step because GitHub does not document whether
+# activity on a branch other than the default one counts for the 60 days.
 
 on:
   schedule:
-    # Run every 6 hours (at 00:00, 06:00, 12:00, 18:00 UTC)
-    - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger from Actions tab
+    - cron: "17 */6 * * *"  # every 6 hours, off the top of the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
 
 jobs:
-  ping-app:
+  wake:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write
-
+      contents: read
+      actions: write  # only for re-enabling this workflow's schedule
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Ping Streamlit App
-        run: |
-          echo "Pinging derivx.streamlit.app at $(date)"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/keep_alive/requirements.txt
 
-          set +e
-          response=$(curl -s -o /dev/null -w "%{http_code}" https://derivx.streamlit.app)
-          curl_exit=$?
-          set -e
+      - name: Install Selenium
+        run: python -m pip install -r tools/keep_alive/requirements.txt
 
-          if [ "$curl_exit" -ne 0 ]; then
-            echo "❌ curl failed with exit code $curl_exit"
-            exit "$curl_exit"
-          fi
+      # ubuntu-latest ships Google Chrome; Selenium Manager (Selenium >= 4.6)
+      # downloads the chromedriver that matches it.
+      - name: Wake the app and check that it renders
+        env:
+          STREAMLIT_APP_URL: https://derivx.streamlit.app/
+          STREAMLIT_APP_MARKER: NAVIGATION
+          STREAMLIT_WAKE_TIMEOUT: "300"
+        run: python tools/keep_alive/main.py
 
-          echo "HTTP Response Code: $response"
-
-          if [ "$response" -ge 200 ] && [ "$response" -lt 400 ]; then
-            echo "✅ App is alive and responding!"
-          else
-            echo "⚠️ App returned unexpected status code: $response"
-            exit 1
-          fi
-
-      - name: Refresh repo activity (monthly)
-        if: success()
-        run: |
-          STAMP_FILE=.github/last-ping.txt
-          THIS_MONTH=$(date -u +%Y-%m)
-          LAST_MONTH=""
-          if [ -f "$STAMP_FILE" ]; then
-            LAST_MONTH=$(head -c 7 "$STAMP_FILE" 2>/dev/null || true)
-          fi
-          if [ "$THIS_MONTH" = "$LAST_MONTH" ]; then
-            echo "Activity stamp already refreshed this month ($LAST_MONTH); skipping commit."
-            exit 0
-          fi
-          mkdir -p .github
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAMP_FILE"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$STAMP_FILE"
-          if git diff --cached --quiet; then
-            echo "No staged changes; nothing to commit."
-            exit 0
-          fi
-          git commit -m "chore(keepalive): refresh activity timestamp"
-          git push
-
-      - name: Send Success Notification
-        if: success()
-        run: echo "App pinged successfully at $(date)"
-
-      - name: Send Failure Notification
-        if: failure()
-        run: echo "Failed to ping app at $(date)"
+      - name: Keep the schedule enabled (no commits)
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable keep-alive.yml --repo "$GITHUB_REPOSITORY"

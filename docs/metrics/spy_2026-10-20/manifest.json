@@ -1,0 +1,76 @@
+{
+  "manifest_version": 1,
+  "kind": "metrics",
+  "created_at_utc": "2026-10-21T19:03:42+00:00",
+  "code": {
+    "sha": "77a10acbf923eb93097024cbcb663835b2cfaad1",
+    "dirty": false,
+    "package": "derivx"
+  },
+  "packages": {
+    "python": "3.11.17",
+    "derivx": "0.1.0",
+    "numpy": "1.26.4",
+    "scipy": "1.17.1",
+    "pandas": "2.1.4",
+    "streamlit": "1.66.0",
+    "plotly": "7.1.0",
+    "yfinance": "0.2.66",
+    "pyarrow": "13.0.0"
+  },
+  "platform": {
+    "system": "Linux",
+    "machine": "x86_64",
+    "python": "3.11.17"
+  },
+  "inputs": {
+    "argv": [
+      "--outdir",
+      "docs/metrics/spy_2026-10-20"
+    ],
+    "min_volume": 10,
+    "min_mid": 0.1,
+    "max_spread": 0.4
+  },
+  "data": {
+    "source": "bundled sample: real SPY chain from Yahoo Finance (delayed quotes), one snapshot",
+    "ticker": "SPY",
+    "trade_dates": [
+      "2026-10-20"
+    ],
+    "fetched_at_utc": "2026-10-20T20:59:39+00:00",
+    "rows": 10040,
+    "expiries": 31,
+    "slices": 31,
+    "row_sources": [
+      "yahoo"
+    ],
+    "files": [
+      "data/examples/spy_2026-10-20.csv.gz"
+    ],
+    "data_sha256": "2fa7d599651ed6564caa6a3d4501dd228bffec7b1f30dfbbed660b30be3188b9"
+  },
+  "model": {
+    "discounting": {
+      "mode": "curve",
+      "what": "the trade date's discount curve (US Treasury par curve, bootstrapped)",
+      "flat_rate_cc": 0.0,
+      "curves": {
+        "2026-10-20": {
+          "asof": "2026-10-19",
+          "label": "US Treasury par curve of 2026-10-19 (US Treasury, bundled snapshot), bootstrapped",
+          "interpolation": "loglinear",
+          "pillars": 14
+        }
+      }
+    },
+    "min_days": 2.0,
+    "max_days": null,
+    "sabr_beta": 1.0,
+    "cv_folds": 5,
+    "std_band_sd": 3.0,
+    "min_points": 8,
+    "expiries": "all"
+  },
+  "seed": null
+}
