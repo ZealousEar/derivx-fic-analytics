@@ -4,7 +4,15 @@ import logging
 
 import streamlit as st
 
-from derivx.ui import (
+from derivx.ui import code_reload
+
+# Streamlit Community Cloud pulls new commits into this running process: drop the package's cached modules when
+# their source changed, before importing the pages, so a deploy never mixes old and new code (see code_reload).
+if code_reload.drop_changed_modules():
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+from derivx.ui import (  # noqa: E402 - after the reload check, so the pages import the current code
     analytics_lab,
     fx_page,
     pricer_page,
@@ -17,11 +25,14 @@ from derivx.ui import (
     rates_swap,
     rates_swaption,
 )
-from derivx.ui.plot_limits import mount_zoom_guard
-from derivx.ui.state import keep_widget_values, restore_widget_values
-from derivx.ui.theme import apply_app_style
+from derivx.ui.plot_limits import mount_zoom_guard  # noqa: E402
+from derivx.ui.state import keep_widget_values, restore_widget_values  # noqa: E402
+from derivx.ui.theme import apply_app_style  # noqa: E402
 
 st.set_page_config(page_title="DERIVX / FIC ANALYTICS", layout="wide", initial_sidebar_state="auto")
+if st.session_state.setdefault("_derivx_code_generation", code_reload.generation()) != code_reload.generation():
+    st.session_state.clear()  # this session's state was made by code that has since been replaced
+    st.session_state["_derivx_code_generation"] = code_reload.generation()
 restore_widget_values()  # before any page draws: inputs of a mode switched back to show their kept values
 
 # Minimalist mode selector - architectural, no emojis
@@ -80,3 +91,4 @@ finally:
     except Exception:  # noqa: BLE001 - defensive: never mask the page's own exception
         logging.getLogger(__name__).exception("keep_widget_values failed")
     mount_zoom_guard()
+    code_reload.record_loaded_modules()  # every module this run imported, for the next run's check

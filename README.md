@@ -597,7 +597,11 @@ reduced to the exception type.
 front matter.
 
 **Streamlit Community Cloud**: main file `src/derivx/ui/streamlit_app.py`. It installs `requirements.txt`
-(including `-e .`) and reads the committed config. Community Cloud controls its own error-detail setting.
+(including `-e .`) and reads the committed config. Community Cloud controls its own error-detail setting. It pulls
+each new commit into the running app without restarting it; `derivx.ui.code_reload` then re-imports the package's
+changed modules on the next run (otherwise a new page importing a name from a cached old module fails with
+`ImportError`). A commit that changes `requirements.txt` still needs **Manage app → Reboot app** so the new
+dependencies are installed. Pick Python 3.10-3.13 in the app's settings.
 
 **Devcontainer / Codespaces**: the app opens in a real browser tab; the editor's preview pane can block the XSRF
 cookie that file uploads need.
