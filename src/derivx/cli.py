@@ -409,14 +409,23 @@ def _reporting(args: argparse.Namespace, asof: dt.date):
     return default_reporting(asof, args.report_ccy, store=_store(getattr(args, "cache", None)))
 
 
-def _print_fx(reporting, currencies, asof: dt.date) -> None:
+def _print_fx(reporting, currencies, asof: dt.date, shocks: Sequence = (), hold_fx: bool = False) -> None:
+    """Print the FX spots that convert the book, what moves them, and the
+    FX moves (% of each spot against the dollar) of each scenario that has
+    any; nothing when every amount is already in the reporting currency."""
+
     if not reporting.needs_conversion(currencies):
         return
+    movers = ("fx: shocks and --fx-move only; --hold-fx holds FX in historical and window replays" if hold_fx else
+              "fx: shocks, --fx-move, and historical and window replays by the ECB rates of their dates")  # fmt: skip
     print(f"FX: {reporting.label} converts at {reporting.describe(currencies)}; FX spots held unless a shock moves "
-          "them (fx: shocks, --fx-move, and historical replays by the ECB rates of their dates)")  # fmt: skip
+          f"them ({movers})")  # fmt: skip
     if reporting.fx.asof is not None and reporting.fx.asof != asof:
         print(f"  note: the FX spots are of {reporting.fx.asof}, not of the valuation date {asof} (pass --fx for "
               "rates of that date)")  # fmt: skip
+    for shock in shocks:
+        if shock.moves_fx:
+            print(f"  FX moves in {shock.name}: " + ", ".join(f"{pair} {pct:+.2f}%" for pair, pct in shock.fx))
 
 
 def _market(args: argparse.Namespace):
@@ -907,7 +916,7 @@ def _scenario(args: argparse.Namespace) -> int:
     if not grid.empty:
         print(f"full-revaluation P&L on {asof} (value at the horizon + cash - value today, each trade's currency, "
               f"signed to the holder, a TOTAL per currency; horizon {args.horizon} days):")  # fmt: skip
-        _print_fx(reporting, currencies, asof)
+        _print_fx(reporting, currencies, asof, kept, args.hold_fx)
         if any(s.moves_fx for s in kept) and not reporting.needs_conversion(currencies):
             print(f"  note: every amount is in {reporting.currency}: FX moves change nothing")
         print(grid.map(_money).to_string())
@@ -929,7 +938,7 @@ def _scenario(args: argparse.Namespace) -> int:
         "scenario grid",
         {"trades": {"path": str(args.trades), "sha256": sha256_bytes(args.trades.read_bytes())},
          "shocks": list(args.shock), "horizon_days": args.horizon, "normal_vol_bp": args.vol_normal,
-         "lognormal_vol_pts": args.vol_lognormal, "fx_move_pct": args.fx_move or {},
+         "lognormal_vol_pts": args.vol_lognormal, "fx_move_pct": args.fx_move or {}, "hold_fx": args.hold_fx,
          "vols": vol_inputs if len(books) > 1 else next(iter(vol_inputs.values())),
          "reporting": _reporting_record(reporting, currencies)},
         {**markets, "scenario_sources": [{"shock": s.name, "sources": [vars(x) for x in s.sources]} for s in shocks]},

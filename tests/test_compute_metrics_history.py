@@ -44,6 +44,11 @@ def test_history_mode_is_reproducible_and_complete(tmp_path, capsys):
     md = a["METRICS_SUMMARY.md"].decode()
     assert md.startswith("# Walk-forward on collected history") and "SYNTHETIC DATA, NOT MARKET DATA" in md
     assert "| svi_sticky_strike |" in md and "Origin days at the 1-day horizon: 9 (needed: 9)" in md
+    # one discount curve per session: the summary names the first and the last, summary.json keeps them all
+    curves = summary["settings"]["discounting"]["curves"]
+    labels = sorted({c["label"] for c in curves.values()})
+    assert len(curves) == 10 and len(labels) == 9  # the last session discounts on the latest curve, of the day before
+    assert f"Discounting: 9 curves, {labels[0]} .. {labels[-1]} (trade date to expiry; 10 trade date(s))" in md
     manifest = json.loads((tmp_path / "a" / "manifest.json").read_text())
     files = manifest["data"]["files"]
     assert len(files) == 10 and all(len(f["sha256"]) == 64 for f in files)
