@@ -80,15 +80,15 @@ checks when QuantLib is installed.
 | Swaption vol cube: SABR per expiry x tenor with alpha from ATM, variance-time ATM interpolation, vega buckets | approximate | [tests/test_swaption_vol.py](tests/test_swaption_vol.py) (smiles equal `ql.shiftedSabrVolatility`; no full SABR parameter cube, Greeks sticky strike) |
 | Treasury bonds: clean/dirty, accrued, yield, durations, convexity, DV01, 32nds, Z/G/I/asset-swap spreads | implemented | golden: [tests/test_bonds.py](tests/test_bonds.py) |
 | Scenarios: parallel, pivoted twist, butterfly, key-rate, IBOR-OIS and tenor basis, PCA factor, historical episode and any-window replay; vol shocks; FX shocks; P&L explain (delta, gamma, vol, carry, residual) | implemented | [tests/test_scenarios.py](tests/test_scenarios.py), [tests/test_historical_replay.py](tests/test_historical_replay.py) (explain against full revaluation) |
-| Historical replay with each curve's own history; per-curve source flags | approximate | [tests/test_historical_replay.py](tests/test_historical_replay.py) (USD swap curves move with Treasuries after 2016: no free swap history) |
+| Historical replay with each curve's own history; per-curve source flags; FX spots move by the ECB reference rates of the episode's dates (HOLD FX SPOTS / `--hold-fx` holds them) | approximate | [tests/test_historical_replay.py](tests/test_historical_replay.py), [tests/test_var_fx.py](tests/test_var_fx.py), [tests/test_rates_fx_var_ui.py](tests/test_rates_fx_var_ui.py) (USD swap curves move with Treasuries after 2016: no free swap history) |
 | RV: 2s10s, 5s30s, 2s5s10s and custom spreads/flies, z-scores, percentiles, AR(1) half-life, PCA-neutral weights | implemented | [tests/test_rv.py](tests/test_rv.py) (independent numpy recomputation) |
 | Carry and roll-down for bonds and swaps | implemented | [tests/test_carry.py](tests/test_carry.py) (live QuantLib cross-check of bond carry) |
 | PCA of daily curve changes, rolling loadings, factor risk | implemented | [tests/test_pca.py](tests/test_pca.py) (77.9 / 12.9 / 5.4% on the committed sample) |
-| One-day historical VaR and expected shortfall (delta+gamma or full revaluation), delta-normal cross-check; a risk report with key-rate PV01, gamma, vega by bucket and VaR | approximate | [tests/test_var.py](tests/test_var.py), [tests/test_rates_research_ui.py](tests/test_rates_research_ui.py) (vols and FX held constant; the sensitivity method misses cross-gammas) |
+| One-day historical VaR and expected shortfall (delta+gamma or full revaluation), delta-normal cross-check; FX spots as a risk factor of the converted book (ECB reference rates of the same dates; FX-held and FX-only rows, FX in the delta-normal check; FX can be held); a risk report with key-rate PV01, gamma, vega by bucket and VaR | approximate | [tests/test_var.py](tests/test_var.py), [tests/test_var_fx.py](tests/test_var_fx.py), [tests/test_rates_research_ui.py](tests/test_rates_research_ui.py), [tests/test_rates_fx_var_ui.py](tests/test_rates_fx_var_ui.py) (vols held constant; the sensitivity method misses cross-gammas; no FX move on a TARGET holiday) |
 | Trade blotter (swaps, basis swaps, FRAs, futures, bonds, caps, floors, swaptions): PV, PV01, ladders, vega matrix, scenarios, VaR, a hedge optimiser that hedges each currency's curves with that currency's instruments | implemented | golden: [tests/test_portfolio.py](tests/test_portfolio.py) ([portfolio.json](tests/golden/portfolio.json)) |
-| Multi-currency books: totals per currency, the book converted to USD, EUR or GBP at ECB reference rates or typed FX spots, FX shocks on converted totals (UI and CLI) | approximate | [tests/test_reporting.py](tests/test_reporting.py), [tests/test_rates_book_ui.py](tests/test_rates_book_ui.py), [tests/test_cli.py](tests/test_cli.py) (FX held unless a scenario shocks it; no FX risk in VaR; the UI prices one swap-curve currency plus USD Treasuries) |
+| Multi-currency books: totals per currency, the book converted to USD, EUR or GBP at ECB reference rates or typed FX spots, FX shocks on converted totals, FX moves in VaR and historical replay (UI and CLI) | approximate | [tests/test_reporting.py](tests/test_reporting.py), [tests/test_rates_book_ui.py](tests/test_rates_book_ui.py), [tests/test_cli.py](tests/test_cli.py), [tests/test_var_fx.py](tests/test_var_fx.py) (FX held in curve shocks unless the scenario shocks it; the UI prices one swap-curve currency plus USD Treasuries) |
 | Seasoned trades in the blotter (past fixings) | planned | rejected with an explanation today |
-| Rates market data: FRED, US Treasury, NY Fed, ECB and BoE fetchers, a dated cache and a history store; BoE spot curves converted to par OIS | implemented | [tests/test_rates_sources.py](tests/test_rates_sources.py) and [tests/test_rates_history.py](tests/test_rates_history.py) (recorded fixtures, no network); golden: [tests/test_market_quotes.py](tests/test_market_quotes.py) |
+| Rates market data: FRED, US Treasury, NY Fed, ECB (curves, €STR, EXR FX reference rates) and BoE fetchers, a dated cache and a history store; BoE spot curves converted to par OIS | implemented | [tests/test_rates_sources.py](tests/test_rates_sources.py), [tests/test_rates_history.py](tests/test_rates_history.py) and [tests/test_fx_history.py](tests/test_fx_history.py) (recorded fixtures, no network); golden: [tests/test_market_quotes.py](tests/test_market_quotes.py) |
 | Run manifests and CSV/ZIP exports on every Rates tab; `curve.json` round trip; the `derivx` CLI | implemented | [tests/test_rates_exports.py](tests/test_rates_exports.py), [tests/test_cli.py](tests/test_cli.py) |
 | Rates strategy backtester (carry/roll, steepener and PCA signals, DV01-neutral) | planned | - (audit item G18) |
 | Meeting-date STIR curve: FOMC / ECB meeting calendar, step forward curve, hike and cut probabilities | planned | - (audit item G19; SR1/SR3 and EURIBOR futures with Hull-White convexity exist as curve inputs and trades) |
@@ -104,7 +104,7 @@ checks when QuantLib is installed.
 | Hagan SABR (lognormal and normal, any beta, shifted), calibration | implemented | golden: [tests/test_sabr.py](tests/test_sabr.py) (matches `ql.sabrVolatility` to 1e-12 relative) |
 | SVI in total variance with butterfly, Lee and calendar checks; constrained no-arbitrage fit | implemented | golden: [tests/test_svi.py](tests/test_svi.py), [tests/test_svi_performance.py](tests/test_svi_performance.py) |
 | SSVI surface (power law, Gatheral-Jacquier conditions) and Dupire local vol, on the lab's VOL SURFACE tab | approximate | [tests/test_ssvi.py](tests/test_ssvi.py), [tests/test_lab_research_ui.py](tests/test_lab_research_ui.py) (one rho, eta and gamma for every expiry, so it fits each expiry less closely than one SVI per expiry) |
-| ECB reference rates for FX spot, with a bundled offline fallback | implemented | [tests/test_fx_market_data.py](tests/test_fx_market_data.py) |
+| ECB reference rates for FX spot: a bundled daily history (every TARGET business day 2015-01-02 to 2026-10-21, month ends from 2008), extended by downloads; cross rates derived through the euro | implemented | [tests/test_fx_market_data.py](tests/test_fx_market_data.py), [tests/test_fx_history.py](tests/test_fx_history.py) |
 | FX conventions: spot/expiry/delivery dates, joint calendars, forward points | implemented | golden: [tests/test_fx_conventions.py](tests/test_fx_conventions.py) (every day of 2025-2027) |
 | FX Garman-Kohlhagen with two times, delta conventions, ATM types, strike from delta | implemented | golden: [tests/test_fx_pricing.py](tests/test_fx_pricing.py) (QuantLib BlackDeltaCalculator) |
 | FX smiles from ATM/RR/BF quotes: SABR (beta = 1) or vanna-volga | approximate | [tests/test_fx_smile.py](tests/test_fx_smile.py), [tests/test_fx_performance.py](tests/test_fx_performance.py) (Hagan expansion; SABR cannot fit every RR/BF combination and reports the misfit) |
@@ -118,7 +118,8 @@ checks when QuantLib is installed.
 | Option-chain schema, validated uploads (CSV, CSV.GZ, parquet), lineage and SHA-256 | implemented | [tests/test_chain_schema.py](tests/test_chain_schema.py) |
 | Yahoo Finance chains with retries, backoff and a fetch status | implemented | [tests/test_market_data.py](tests/test_market_data.py) (recorded fake, no network) |
 | Production SVI calibration with arbitrage repair and k-fold CV against an IV spline; a per-expiry progress bar; identical runs reused across sessions | implemented | [tests/test_calibration_production.py](tests/test_calibration_production.py), [tests/test_analytics_lab.py](tests/test_analytics_lab.py) |
-| Walk-forward test against persistence / sticky-moneyness benchmarks, Diebold-Mariano, regimes; SVI and SABR parameter history with robust jump flags | implemented | [tests/test_backtest.py](tests/test_backtest.py), [tests/test_walkforward_tab.py](tests/test_walkforward_tab.py), [tests/test_parameter_stability.py](tests/test_parameter_stability.py) (checked on a seeded SYNTHETIC history; no real multi-day history is bundled, see [Lab metrics](#lab-metrics-reproducible)) |
+| Walk-forward test against persistence / sticky-moneyness benchmarks, Diebold-Mariano, regimes; SVI and SABR parameter history with robust jump flags | implemented | [tests/test_backtest.py](tests/test_backtest.py), [tests/test_walkforward_tab.py](tests/test_walkforward_tab.py), [tests/test_parameter_stability.py](tests/test_parameter_stability.py) (checked on a seeded SYNTHETIC history; the real history is collected from the merge to `main` on, see [Lab metrics](#lab-metrics-reproducible)) |
+| Daily option-chain collection: a scheduled workflow saves each session's chain on the `data-snapshots` branch (compact gzip CSV, a manifest per file, an index with SHA-256); `derivx snapshots sync / list`; the lab's **Collected history** source; `compute_metrics.py --history` | implemented | [tests/test_snapshots.py](tests/test_snapshots.py), [tests/test_collect_workflow.py](tests/test_collect_workflow.py) (the workflow's git steps against a local bare repository), [tests/test_snapshot_sync.py](tests/test_snapshot_sync.py), [tests/test_lab_history_ui.py](tests/test_lab_history_ui.py), [tests/test_compute_metrics_history.py](tests/test_compute_metrics_history.py) (the workflow has not run on GitHub yet) |
 | Model comparison (SVI, SABR, IV spline) | implemented | [tests/test_model_comparison.py](tests/test_model_comparison.py), [tests/test_compute_metrics.py](tests/test_compute_metrics.py) |
 | Rates curve walk-forward (random walk against Diebold-Li NS AR(1), NS-curve AR(1) and PCA AR(1)) and curve-model comparison (Nelson-Siegel, Diebold-Li, Svensson, spline; leave-one-out) on the bundled Treasury, BoE and ECB histories, the cache or an upload | implemented | [tests/test_curve_forecast.py](tests/test_curve_forecast.py), [tests/test_curve_models.py](tests/test_curve_models.py), [tests/test_lab_research_ui.py](tests/test_lab_research_ui.py) |
 | Rates vol history: normal-SABR walk-forward, normal against shifted-lognormal SABR against a spline, daily SABR parameters; realised against implied ATM normal vol | implemented | [tests/test_vol_history.py](tests/test_vol_history.py); golden: [tests/test_realised_implied.py](tests/test_realised_implied.py) (forward swap rates equal QuantLib to 1e-12). No free source publishes dated swaption or cap vols: the tab runs on an upload or a labelled SYNTHETIC demo |
@@ -144,8 +145,9 @@ uses it.
 | €STR fixings; euro area AAA government curve (par and spot) | `rates_history/fixings.csv`, `eur_aaa_ecb*.csv` | ECB Data Portal (no key); reuse allowed with "Source: ECB" | real (daily only from 2026-08-19 in the bundle) |
 | SONIA; UK OIS fitted spot curve | `rates_history/fixings.csv`, `gbp_ois_boe.csv` | Bank of England (yield-curve archive; SONIA via FRED), with attribution | real (daily only from 2026-08-19 in the bundle) |
 | ICE USD swap rates (DSWP*), 2013 episode windows only | `rates_history/usd_swap_ice.csv` | ICE Benchmark Administration, republished by FRED until 2016-10-28. ICE's terms apply; only a few historical rows are bundled for the 2013 replay | real, ends 2016 |
-| ECB euro FX reference rates, 2026-10-16, 10-19 and 10-20 | `ecb_fx_reference_rates.csv` | ECB Data Portal, dataset EXR. Indicative, not dealable | real (reference rates) |
+| ECB euro FX reference rates (USD, GBP, JPY, CHF, CAD, AUD, NZD per EUR): every TARGET business day 2015-01-02 to 2026-10-21, month ends and the replay episodes' windows 2008-2014 | `rates_history/fx_ecb.csv` (187 KB) | ECB Data Portal, dataset EXR (`D.<CCY>.EUR.SP00.A`, values as published); reuse allowed with "Source: ECB". Indicative, not dealable | real (reference rates) |
 | SPY option chain, one snapshot, 2026-10-20 after the close | `spy_2026-10-20.csv.gz` (+ `.json` fetch status) | Yahoo Finance delayed quotes via yfinance. Yahoo's terms of use apply (personal and research use); kept for reproducibility | real, one day |
+| SPY option chains, one per NYSE session, saved daily by `collect-data.yml` | not bundled: branch `data-snapshots` (`options/SPY/<YYYY>/SPY_<session>.csv.gz`), read with `derivx snapshots sync` | Yahoo Finance via yfinance, as above | real, from the first collected session (none yet) |
 | USD SOFR OIS swap quotes | `usd_sofr_ois_example.csv`, `rates_quotes.csv` | none: no free SOFR swap feed exists | **ILLUSTRATIVE** |
 | EUR €STR swap quotes | derived at run time | built from the ECB AAA government curve | **PROXY** |
 | EURIBOR deposits, FRAs, futures, swaps, 3s6s basis | `src/derivx/rates/multicurve.py` | none: no free EURIBOR quotes | **ILLUSTRATIVE** |
@@ -174,9 +176,14 @@ before 2016-10-28; BoE OIS for GBP; an uploaded swap history) and flag a proxy o
 curves move with Treasuries (swap spreads held), and the per-curve source table on SCENARIOS says so.
 
 FX spots for the reporting currency (RATES sidebar, **REPORTING CURRENCY**, default USD): **ECB REFERENCE RATES**
-(the bundled snapshot; a valuation date it does not hold uses the latest day before it, or its first day for an
-earlier date, with a warning naming the day used) or **ENTER RATES** (EURUSD and GBPUSD typed in). FX is held
-unless SCENARIOS shocks it (FX SHOCK EURUSD / GBPUSD, or the FX +/-10% rows of the scenario library).
+(the rates of the valuation date from the bundled history, extended by LIVE (CACHED) downloads; a date with no
+fixing, such as a weekend or a TARGET holiday, uses the latest day before it, and a date before 2008-01-31 the
+first day held, with a warning naming the day used) or **ENTER RATES** (EURUSD and GBPUSD typed in). Cross rates
+(GBPUSD, USDJPY, USDCHF) are derived through the euro. The same history makes FX a risk factor: in VaR and in
+historical replay, FX spots move by the ECB rates of the same dates (FX IN VAR = HELD on RESEARCH > VAR, HOLD FX
+SPOTS on SCENARIOS, or `--hold-fx` hold them). Only the converted totals (`ALL IN <CCY>`) move with FX: each
+position's P&L and the per-currency totals do not. SCENARIOS FX shocks (FX SHOCK EURUSD / GBPUSD, the FX +/-10%
+rows of the scenario library) still work and add to a replay's FX moves.
 
 Rebuild or extend the bundled history: `python tools/build_rates_snapshot.py`. Pull more into the cache with
 the CLI (below), for example the whole ICE swap history or the full BoE daily archive (about 12 MB).
@@ -235,18 +242,68 @@ Black-76. 29 of 31 expiries are scored (same-day and 1-day expiries skipped).
 - SABR parameter recovery from exact quotes: `pytest tests/test_sabr.py -k recovers` (alpha and nu to 1e-5
   relative, rho to 1e-5 absolute, F from 1.08 to 15,800, T from 1W to 5Y).
 
-**Walk-forward results on real data do not exist yet.** Yahoo serves only the current chain, so a real history has
-to be collected one session at a time. The Walk-Forward tab runs on uploaded daily snapshots or on a labelled,
-seeded SYNTHETIC demo. To build a real history, run once per trading day after the close (for example from cron
-with `CRON_TZ=America/New_York` and `25 16 * * 1-5`):
+**Walk-forward results on real data do not exist yet: the history is collected from the merge to `main` on.**
+Yahoo serves only the current chain, so a real history has to be saved one session at a time.
+`.github/workflows/collect-data.yml` does that:
+
+- **When.** Cron `35 21 * * 1-5` (UTC), which is 17:35 New York in summer (EDT) and 16:35 in winter (EST), after the
+  16:15 options close in both, plus a manual run (inputs `tickers`, default `SPY`, and `dry_run`). The collector
+  (`derivx snapshots collect`) takes the session that closed 10 minutes to 12 hours before the run. On a weekend,
+  an NYSE holiday, during a session or for a session already stored it fetches nothing and the run commits
+  nothing. GitHub runs schedules only from the default branch, so collection starts once the workflow is on
+  `main`.
+- **Where.** The orphan branch `data-snapshots`, created by the first run that saves a session, append-only:
+  `options/<TICKER>/<YYYY>/<TICKER>_<session>.csv.gz`, a JSON manifest per file (fetch status, limits, rows dropped
+  by each rule, SHA-256) and `options/index.csv` (session, ticker, rows, expiries, sha256, bytes, fetched_at, spot,
+  status, path). Commits are made by `github-actions[bot]` and pushed with `GITHUB_TOKEN` (`contents: write`, one
+  run at a time). A rejected push is rebuilt on the branch's new tip, up to 3 attempts.
+- **Failures.** Every Yahoo request retries with backoff, and the whole chain is fetched up to 3 times (1 and
+  then 2 minutes apart). A partial chain, or the chain of another session, is never written, and a stored session
+  is never rewritten. The job summary says what happened to each ticker. The job fails only when a trading day
+  produced nothing for a ticker, so a missed day shows red.
+- **Schema and limits.** 14 columns (trade_date, expiry, option_type, strike, bid, ask, implied_vol (Yahoo's, 5
+  decimals), underlying_price, volume, last_trade_date, fetched_at_utc, spot_time_utc, ticker, source). Expiries
+  are kept from 1 to 730 calendar days and strikes from 0.4 to 1.6 times spot (`--max-days`, `--moneyness`). The
+  gzip header has no timestamp, so equal quotes give equal bytes.
+- **Sizes, measured on real chains.** The bundled 2026-10-20 chain is 357,609 bytes in the 18-column chain schema,
+  181,472 compact with every quote, and 152,576 within the limits (8,352 of 10,040 quotes and 28 of 31 expiries
+  kept: 954 quotes outside the expiry window, 734 outside the moneyness band). A dry run of the collector on the
+  2026-10-21 session (22:36 UTC) kept 8,102 of 9,543 quotes over 27 expiries in 147,866 bytes. It took 31 Yahoo
+  requests with 1 retry, 20.2 s of fetching and 21.5 s for the whole command. That is about 37 MB a year for SPY
+  (252 sessions).
+
+Using the history:
 
 ```bash
-python tools/download_spy_chains.py --ticker SPY --outdir data/market/spy   # one spy_<session>.parquet + .json per day
-python tools/compute_metrics.py --chain-dir data/market/spy --outdir data/metrics
+derivx snapshots sync                    # index + files from raw.githubusercontent.com into data/cache/snapshots/
+derivx snapshots sync --offline          # the cached copy only (--repo OWNER/NAME, --branch, --tickers)
+derivx snapshots list --sessions         # sessions, first, last, missing NYSE trading days (no network)
+derivx snapshots list --local ../data-snapshots   # a local checkout (git worktree add ../data-snapshots data-snapshots)
+python tools/compute_metrics.py --history --ticker SPY --outdir data/metrics/spy_history
+python tools/compute_metrics.py --store ../data-snapshots --ticker SPY --first 2026-11-02 --horizon 1 --outdir ...
 ```
 
-`download_spy_chains.py` refuses past dates, keeps an existing session file unless `--replace`, and exits 0
-(saved), 1 (nothing saved) or 3 (saved but partial). `data/**/*.parquet` and `data/metrics/` are gitignored.
+`sync` checks every file's SHA-256 against the index before keeping it, and reuses files it already has. The repo
+and branch default to `$DERIVX_SNAPSHOT_REPO` / `$DERIVX_SNAPSHOT_BRANCH`, else this repository and
+`data-snapshots`. In the lab, WALK-FORWARD VALIDATION's default source is **Collected history**: the synced copy
+(a SYNC NOW button fetches it) or, with `$DERIVX_SNAPSHOT_DIR` set, a local checkout of the branch. It shows
+coverage and provenance (sessions, first and last, missing trading days, quotes and size, source and sync time;
+the run's banner and manifest add the index SHA-256). Until the sessions give 9 origin days at the chosen horizon
+(three per vol-regime tercile; 10 consecutive sessions at 1 day), it says how many there are and how many more
+are needed, and the run stays disabled. MARKET DATA loads any collected session as the active dataset, so
+PRODUCTION CALIBRATION, VOL SURFACE and MODEL COMPARISON run on it.
+`compute_metrics.py --history` (or `--store DIR`) writes the walk-forward summary, daily and regime tables,
+`sessions.csv` with every file's SHA-256, `summary.json`, `METRICS_SUMMARY.md` and a manifest. A rerun on the
+same sessions reproduces every file but the manifest byte for byte. Run on a store of the two real sessions held
+here (2026-10-20 bundled and 2026-10-21 from the dry run), it reports `walk-forward: not run (2 session(s) give
+1 origin day(s) ... collect at least 8 more trading day(s))`. A session more than 7 days after the committed
+Treasury curves (which end 2026-10-19) is discounted at the flat `--rate` unless `--with-cache` adds the cached
+Treasury curves, and the summary names the curve or rate of every trade date.
+
+`tools/download_spy_chains.py` still saves one chain by hand (`--outdir` in the full schema, or `--store DIR` in
+the compact store layout). It refuses past dates, keeps an existing session file unless `--replace`, and exits 0
+(saved), 1 (nothing saved) or 3 (partial: with `--store` nothing is written). `data/**/*.parquet` and
+`data/metrics/` are gitignored.
 
 Walk-forward method: each origin is scored against the snapshot exactly N NYSE trading days later, matching quotes
 on (expiry, strike, option type); the calibration window pools the last W snapshots. Predictors: SVI sticky
@@ -310,9 +367,16 @@ derivx pull treasury --year 2026                       # can be slow
 derivx pull nyfed --rate sofr --last 30
 derivx pull ecb-estr
 derivx pull ecb-yc --curve AAA --measure par
+derivx pull ecb-fx --start 2026-10-01                  # ECB reference rates per EUR [--currencies USD,GBP --last N]
 derivx pull boe-ois --archive daily                    # about 12 MB
-derivx pull latest                                     # what LIVE (CACHED) uses
+derivx pull latest                                     # what LIVE (CACHED) uses (ECB FX included)
 #   options: --offline, --out file.csv|parquet, --max-age, --cache, --show N, --timeout
+
+# the daily option-chain history on the data-snapshots branch (see Lab metrics)
+derivx snapshots sync [--offline] [--repo OWNER/NAME] [--branch data-snapshots] [--tickers SPY]
+derivx snapshots list [--sessions] [--local DIR]
+derivx snapshots collect --staging DIR [--store DIR] [--tickers SPY] [--dry-run]   # what collect-data.yml runs
+derivx snapshots merge STAGING STORE && derivx snapshots index --store STORE --check
 
 # curves
 derivx curve build --asof 2026-10-19 --interp loglinear --out curve.json   # [--quotes q.csv] [--conventions "EUR ESTR"]
@@ -333,6 +397,8 @@ derivx risk --trades mixed.csv --asof 2026-10-19 --conventions all --illustrativ
             [--fx EURUSD=1.10,GBPUSD=1.30]
 derivx scenario --trades mixed.csv --asof 2026-10-19 --conventions all --illustrative-vols \
             --shock parallel:+25 --shock fx:EURUSD=+10,GBPUSD=-5 [--fx-move EURUSD=+2]
+derivx scenario --trades mixed.csv --asof 2026-10-19 --conventions all --illustrative-vols \
+            --shock historical:2022-hiking-cycle --shock window:2025-04-01:2025-04-30 [--hold-fx]
 ```
 
 Every command above was run on this revision. On 2026-10-21 FRED (api.stlouisfed.org and fred.stlouisfed.org)
@@ -340,7 +406,14 @@ served a maintenance page, so both `pull fred` lines exited 1 with `FRED: unexpe
 key), the `--vintage` line run without a key exited 2 with `FRED vintages (ALFRED) need a free API key`, and
 `pull latest` exited 1 after naming the two FRED series it left to the cache or the snapshot. Every other pull
 succeeded (the BoE daily archive in about 11 s). The `scenario` example needs `--illustrative-vols` (or vols) for
-its cap and swaptions; without it they are skipped and it exits 3.
+its cap and swaptions; without it they are skipped and it exits 3. The commands added with the collection and FX
+history were run on this revision too. `pull ecb-fx --start 2026-10-01` downloaded 105 rows (15 days x 7
+currencies; EURUSD 1.1234 on 2026-10-21). `snapshots sync` exited 1 with `the index could not be downloaded (HTTP
+404 from raw.githubusercontent.com) and nothing is cached`, because the branch does not exist until the workflow
+first runs on `main`. `snapshots list --local` on the two-session store printed `SPY: 2 session(s) 2026-10-20 ..
+2026-10-21; no missing trading days; 16,454 quotes, 0.30 MB`. On the USD + EUR + GBP example books, the 2022
+hiking cycle replay moved EURUSD -14.31% and GBPUSD -17.82%. It gave `ALL IN USD` 1,160,838 with those moves and
+1,367,277 with `--hold-fx`, with `TOTAL USD`, `TOTAL EUR` and `TOTAL GBP` identical in both runs (each about 8 s).
 
 Shock specs (`derivx scenario --help`): `parallel:BP`, `twist:PIVOT:SHORT_BP:LONG_BP`,
 `fly:BODY:BODY_BP[:WING_BP[:LEFT:RIGHT]]`, `keyrate:2Y=+10,10Y=-5`, `pca:FACTOR[:N_SIGMA[:DAYS]]`,
@@ -349,14 +422,15 @@ crisis week, 2023 SVB), `window:START:END[:SCALE]`, `basis:BP`, `tenorbasis:BP`,
 (% moves of FX spots), `library`.
 
 Currencies: every trade's numbers are in its currency, with a `TOTAL <CCY>` per currency. `--report-ccy
-{USD,EUR,GBP}` (default USD) adds `ALL IN <CCY>`, the book converted at the bundled ECB reference rates of the
-latest day on or before the valuation date (the first day held, for an earlier date; a note names the day when it
-is another one) or at `--fx` spots.
+{USD,EUR,GBP}` (default USD) adds `ALL IN <CCY>`, the book converted at the ECB reference rates (the bundled
+history plus any `pull ecb-fx` in the cache) of the latest day on or before the valuation date (the first day
+held, for an earlier date; a note names the day when it is another one) or at `--fx` spots.
 `--conventions all` prices each currency's trades on its own market (USD SOFR, EUR ESTR, GBP SONIA; Treasuries on
-the US Treasury curve). FX moves change only the converted totals: `fx:` shocks move spots per scenario, and
-`--fx-move` adds its moves to every scenario, on top of an `fx:` shock's own move of the same pair (an
-`fx:EURUSD=+10` shock with `--fx-move EURUSD=+2` moves EURUSD +12%), and is named in each scenario label. A total
-move of -100% or less is refused. Spots are held otherwise.
+the US Treasury curve). FX moves change only the converted totals. `historical:` and `window:` replays move spots
+by the ECB rates of the episode's dates (`--hold-fx` holds them), `fx:` shocks move spots per scenario, and
+`--fx-move` adds its moves to every scenario, on top of a shock's own move of the same pair (an `fx:EURUSD=+10`
+shock with `--fx-move EURUSD=+2` moves EURUSD +12%), and is named in each scenario label. The output lists the FX
+moves of every scenario that has any. A total move of -100% or less is refused. Spots are held otherwise.
 
 Caps and swaptions in a blotter need vols: a `vol` column per trade, or `--swaption-vols` / `--cap-vols` files, or
 `--illustrative-vols` (labelled). Without them those trades are skipped with the reason. Hedges: `--hedge`
@@ -373,8 +447,9 @@ fixings and every curve's quotes. Blotter CSVs accept comma, semicolon, tab or b
 numbers are thousands separators only (`1,000,000`), and a decimal comma is refused with a message.
 
 Other tools: `tools/gen_golden.py` with `tools/golden/` (regenerate the QuantLib fixtures),
-`tools/compute_metrics.py` and `tools/download_spy_chains.py` (lab metrics and history),
-`tools/build_rates_snapshot.py` (bundled rates data; `tools/build_historical_shocks.py` is a shim that runs it),
+`tools/compute_metrics.py` (lab metrics; `--history` on the collected snapshots) and `tools/download_spy_chains.py`
+(one chain by hand), `tools/build_rates_snapshot.py` (bundled rates data and the ECB FX history;
+`tools/build_historical_shocks.py` is a shim that runs it),
 `tools/record_rates_fixtures.py` (parser fixtures), `tools/gen_fx_illustrative_quotes.py` and
 `tools/gen_rates_vol_illustrative.py` (print the ILLUSTRATIVE FX and rates vol quotes), `tools/keep_alive/` (the
 hosted app's wake-up check).
@@ -383,16 +458,17 @@ hosted app's wake-up check).
 
 ## Tests and validation
 
-Test run on this revision (code at cc1d231; the commits after it change only the README):
-`pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,446 tests from 71 files and took 17
+Test run on this revision (code at 7190bc5; the commit after it changes only the README and a docstring):
+`pytest -W error::DeprecationWarning -W error::RuntimeWarning` collects 1,527 tests from 79 files and took 20
 minutes here on 4 cores; run single files while iterating.
 
 | Environment | Result |
 |---|---|
-| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,446 passed, 0 skipped, 0 failed |
-| `pytest --nbmake notebooks` (Python 3.11.17, numpy 2.4.6, pandas 2.3.3, SciPy 1.17.1) | 3 passed |
-| `ruff check .` and `ruff format --check .` (ruff 0.17.1, the CI pin) | clean (208 files formatted) |
-| `mypy` (2.4.0, the CI pin, on the local versions above) | clean (no issues in 103 source files) |
+| Python 3.11.17 with the dev extra: numpy 1.26.4, pandas 2.1.4, SciPy 1.17.1, Streamlit 1.66.0, Plotly 7.1.0, yfinance 0.2.66, pyarrow 13.0.0 (older than the declared lower bound 14), QuantLib 1.44 (so the live QuantLib checks run); `-W error::DeprecationWarning -W error::RuntimeWarning` | 1,527 passed, 0 skipped, 0 failed |
+| `pytest --nbmake notebooks` (Python 3.11.17, numpy 2.4.6, pandas 2.3.3, SciPy 1.17.1; run on the previous revision, and the notebooks use none of the modules changed since) | 3 passed |
+| `ruff check .` and `ruff format --check .` (ruff 0.17.1, the CI pin) | clean (219 files formatted) |
+| `mypy` (2.4.0, the CI pin, on the local versions above) | clean (no issues in 105 source files) |
+| `actionlint` 1.7.12 on `.github/workflows/*` | clean |
 
 - **QuantLib golden fixtures.** `tools/gen_golden.py` with the modules in `tools/golden/` writes the 15 files
   `tests/golden/<area>.json` from QuantLib 1.44 (calendars, curves, multi-curve, swaps, caps/floors including
@@ -425,10 +501,15 @@ lower bound, same flags; **notebooks** with nbmake; and **docker**: builds the t
 cap, bond and scenario tests and a live-server check, run inside the image) and the runtime image, waits for the
 healthcheck and checks XSRF and CORS on the running container.
 
-Browser checks (not in CI), on this revision: every mode, tab and sub-tab was driven in Chromium with Playwright at
-390, 1280 and 1920 px (63 views), plus the timed runs under [Performance](#performance). No page exceptions, console
-errors, Streamlit exception blocks, error alerts or horizontal overflow; every chart declares zoom bounds; no text
-node below WCAG AA contrast.
+Browser checks (not in CI): on the previous revision every mode, tab and sub-tab was driven in Chromium with
+Playwright at 390, 1280 and 1920 px (63 views), plus the timed runs under [Performance](#performance). No page
+exceptions, console errors, Streamlit exception blocks, error alerts or horizontal overflow; every chart declares
+zoom bounds; no text node below WCAG AA contrast. On this revision the changed views were driven at 1280 and 390
+px (12 each). ANALYTICS > WALK-FORWARD VALIDATION was checked with Collected history in four states: not synced,
+a real SYNC NOW (the expected 404 message, 1.2 s), two real sessions (held back) and 12 SYNTHETIC sessions (run,
+22-23 s). Also checked were MARKET DATA loading a collected session and PRODUCTION CALIBRATION on it, and RATES >
+BOOK and RESEARCH > VAR on a euro book reported in USD with FX moving and held. They showed the same absence of
+exceptions, console or page errors, error alerts (apart from the intended sync failure) and horizontal overflow.
 
 ---
 
@@ -509,7 +590,8 @@ cookie that file uploads need.
 
 **Keep-alive**: `.github/workflows/keep-alive.yml` opens the Community Cloud app in headless Chrome every six hours,
 wakes it if it is asleep, and fails unless the sidebar heading NAVIGATION renders with no Streamlit exception. It
-makes no commits and does not ingest data.
+makes no commits and does not ingest data. Data collection is a separate workflow, `collect-data.yml` (see
+[Lab metrics](#lab-metrics-reproducible)), which commits only to the `data-snapshots` branch.
 
 ---
 
@@ -533,11 +615,24 @@ Data
 - The bundled ECB and BoE histories are daily only from 2026-08-19 (month ends before), so EUR/GBP RV and PCA in
   BUNDLED mode run on about 43 daily changes, with a warning, and the lab's curve walk-forward and realised vol
   need a longer step limit for them. LIVE mode or the CLI pulls more.
-- The bundled ECB FX snapshot holds 2026-10-16, 10-19 and 10-20 only; other valuation dates convert at the latest
-  day held before them (or at 2026-10-16 for an earlier date), with a warning naming that day; type the spots in
-  (ENTER RATES, or `--fx`) for a consistent conversion.
-- Walk-forward metrics on real data need daily snapshots collected from now on (see the lab section); only one
-  real SPY snapshot is bundled. The bundled Treasury curve ends 2026-10-19, one business day before it.
+- The bundled ECB FX history is daily from 2015-01-02 to 2026-10-21 (month ends and the replay episodes' windows
+  2008-2014). A later valuation date converts at 2026-10-21 unless LIVE (CACHED) or `derivx pull ecb-fx` extends
+  it, and an earlier one at its first day, each with a warning naming the day used. ECB reference rates are set
+  at about 14:15 CET, not at the US close, so a VaR day's FX move and its Treasury move are some hours apart. A
+  TARGET holiday (Good Friday, Easter Monday, 1 May, 25-26 December) has no fixing: its FX move is 0, and the next
+  scenario day carries both days' moves. A replay takes the ECB rates nearest its start and end dates; a pre-2015
+  window with no rate near both ends holds FX, and its source row says so (flag `held`).
+- Walk-forward metrics on real data wait for the collected history. Collection starts only when
+  `collect-data.yml` is on `main` (GitHub runs schedules from the default branch only), and the walk-forward needs
+  9 origin days (10 consecutive sessions at the 1-day horizon), so the first real result comes about two weeks
+  after the merge. A session the workflow misses (a GitHub outage, Yahoo failing every retry) cannot be filled in
+  later: Yahoo serves only the current chain. It shows as a missing trading day. Only one real SPY snapshot is
+  bundled. The bundled Treasury curve ends 2026-10-19; `compute_metrics.py --history` discounts sessions more than
+  7 days later at a flat rate unless `--with-cache` adds newer cached curves.
+- Stored chains keep expiries of 1 to 730 days and strikes 0.4 to 1.6 times spot (about 15-17% of SPY quotes
+  dropped on the two real days measured), and round Yahoo's implied vol to 5 decimals. The branch grows by about
+  37 MB a year per ticker in git. That is fine for SPY, but many tickers over many years would need another store
+  (release assets or object storage). Yahoo's terms of use apply to the collected files.
 - The NYSE calendar models full-day scheduled holidays only.
 
 Models
@@ -549,13 +644,16 @@ Models
 - Compounded caplets have no lookback, lockout or observation shift; term-rate (3M/6M) caps on an OIS curve are an
   approximation and say so. Collars are a CAP-FLOOR tab and library kind; in the BOOK a collar is a long cap plus a
   short floor.
-- VaR holds vols and FX constant and has no carry over the day; the delta+gamma method ignores cross-gammas (full
-  revaluation is a button, about 11 s for 500 scenarios).
+- VaR holds vols constant and has no carry over the day; the delta+gamma method ignores cross-gammas (full
+  revaluation is a button, about 11 s for 500 scenarios). FX moves only the converted totals. The delta-normal
+  check takes FX returns as risk factors with sensitivity equal to each position's value in the reporting
+  currency, and it leaves out the curve x FX cross term that the historical `ALL IN` row keeps.
 - Multi-currency: the UI prices one swap-curve currency plus USD Treasuries; a trade in another currency is
   skipped with a hint to use the CLI's `--conventions all`. FX spots are ECB reference rates (indicative, not
-  dealable) or typed in, and are held unless a scenario shocks them (no FX forward drift, FX carry or
-  cross-currency basis over a horizon). The converted VaR is the VaR of the converted P&L, not a sum of
-  per-currency VaRs.
+  dealable) or typed in. They move in VaR and in historical replay by the ECB rates of the same dates; otherwise
+  they are held unless a scenario shocks them (no FX forward drift, FX carry or cross-currency basis over a
+  horizon). With typed-in spots, the VaR still takes its FX moves from the ECB history. The converted VaR is the
+  VaR of the converted P&L, not a sum of per-currency VaRs.
 - FX and equity scenario grids shift a flat vol (sticky strike) and do not re-mark the smile; FX theta shrinks both
   times by one calendar day. SABR (beta = 1) cannot fit some RR/BF combinations; the misfit is reported. With the
   ATM-at-spot convention on high-carry pairs (JPY, CHF), the least-squares SABR fit can land in one of several
@@ -571,7 +669,11 @@ Models
 Platform
 - pandas 3 and numpy 2.5 are not supported yet (capped). mypy runs in CI with a lenient config (11 error codes
   off, an `attr-defined` baseline of 18 modules).
-- The GitHub workflows have not run on this revision (see [CI](#tests-and-validation)).
+- The GitHub workflows have not run on this revision (see [CI](#tests-and-validation)). `collect-data.yml` has
+  never run on GitHub. It passes actionlint 1.7.12 (its shell steps were not shellchecked), and its git steps
+  (orphan branch, merge, commit, rebuilt push) are tested against a local bare repository. The `data-snapshots`
+  branch appears with its first run on `main`; until then `derivx snapshots sync` and the lab's SYNC NOW report a
+  404.
 - Inputs survive mode switches, but the selected tab inside a page is not kept.
 - Yahoo rate-limits shared IPs; lab pulls back off and say so. Yahoo's terms of use govern its data.
 
@@ -607,20 +709,23 @@ src/derivx/
                  caplet stripping, swaptions and the vol cube, bonds, carry, RV, PCA, curve models, trade book,
                  curve.json, run manifests
   risk/          sensitivities, scenarios and P&L explain, historical replay, VaR / ES, multi-currency reporting
-  data/          option-chain schema and Yahoo fetcher, bundled samples, synthetic history, rates sources,
-                 cache and history store, a dependency-free .xlsx reader (BoE archives)
+  data/          option-chain schema and Yahoo fetcher, bundled samples, synthetic history, NYSE calendar,
+                 rates and ECB FX sources, cache and history store, the daily snapshot store, collector and
+                 sync (snapshots.py), a dependency-free .xlsx reader (BoE archives)
   surface/       implied-vol surface from SVI slices (calendar checks, total-variance interpolation)
   calibration/   production SVI calibration;  models/  model comparison
   validation/    walk-forward, parameter stability, curve forecasts, rates vol history, realised vs implied,
                  manifests
   ui/            Streamlit app: streamlit_app.py (shell), pricer_page.py, fx_page.py, rates_*.py,
-                 analytics_lab.py and lab_*.py, state.py, theme.py, plot_limits.py
+                 analytics_lab.py and lab_*.py (lab_history.py: the collected history), state.py, theme.py,
+                 plot_limits.py
   cli.py         the derivx command line
+.github/workflows/  ci.yaml, keep-alive.yml, collect-data.yml (daily chains to the data-snapshots branch)
 tests/           pytest suite; golden/ (QuantLib fixtures), fixtures/ (recorded downloads)
 tools/           gen_golden.py + golden/, compute_metrics.py, download_spy_chains.py, build_rates_snapshot.py
                  (+ the build_historical_shocks.py shim), record_rates_fixtures.py,
                  gen_fx_illustrative_quotes.py, gen_rates_vol_illustrative.py, keep_alive/
-data/examples/   the bundled data (see Data sources)
+data/examples/   the bundled data (see Data sources); the collected chains live on the data-snapshots branch
 docs/            metrics/ (reproducible lab metrics) and screenshots/
 notebooks/       01 SVI, 02 SABR, 03 rates (executed)
 ```
