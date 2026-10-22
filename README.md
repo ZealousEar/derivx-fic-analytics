@@ -8,7 +8,7 @@
 fixed-income, FX and equity derivatives analytics
 ```
 
-# DerivX
+# DerivX v2
 
 DerivX is a Python package and Streamlit application for pricing, risk, market-data research and model validation across rates, FX and equity options.
 

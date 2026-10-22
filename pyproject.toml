@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "derivx"
-version = "0.1.0"
+version = "2.0.0"
 description = "Derivatives analytics platform (FIC): BS, SVI/SABR, term structure, Black IR, DV01/PV01"
 readme = "README.md"
 requires-python = ">=3.10"

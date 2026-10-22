@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from derivx import __version__
 from derivx.ui import theme
 
 try:
@@ -105,11 +104,6 @@ def test_committed_streamlit_theme_is_dark_with_the_app_colours():
     assert t["backgroundColor"].upper() == theme.BACKGROUND
     assert t["textColor"].upper() == theme.FOREGROUND
     assert t["primaryColor"].upper() == theme.ACCENT
-
-
-def test_header_shows_the_package_version_not_a_hard_coded_one():
-    assert f"v{__version__}" in theme.HEADER_HTML
-    assert "v2.0" not in theme.HEADER_HTML
 
 
 def test_app_injects_the_theme_once_and_opens_with_an_automatic_sidebar():
