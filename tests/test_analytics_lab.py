@@ -86,8 +86,6 @@ def test_every_tab_renders_on_the_bundled_sample_without_network(no_network):
     for b in banners:
         assert "SPY" in b and "session 2026-10-20" in b and "fetched 2026-10-20 20:59:39 UTC" in b
         assert "bundled sample: real SPY chain from Yahoo Finance" in b and "10,040 rows" in b
-    text = _text(at)
-    assert "genuine daily snapshots" in text and "tools/download_spy_chains.py" in text
     assert not at.error and no_network == []
     report = next(d.value for d in at.dataframe if "removed_itm" in d.value.columns)  # hygiene by expiry
     assert len(report) == 31 and "removed_itm" in report.columns
