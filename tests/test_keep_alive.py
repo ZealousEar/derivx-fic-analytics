@@ -28,8 +28,7 @@ APP = Snapshot(
     APP_URL,
     (
         "",
-        "/ NAVIGATION\n\n[ EQUITY ]\n\n[ FX ]\n\n[ RATES ]\n\n[ ANALYTICS ]\n\n"
-        "/ EQUITY PARAMS\nDERIVX\nv2.0.0",
+        "/ NAVIGATION\n\n[ EQUITY ]\n\n[ FX ]\n\n[ RATES ]\n\n[ ANALYTICS ]\n\n/ EQUITY PARAMS\nDERIVX\nv2.0.0",
     ),
 )
 WRAPPER_ONLY = Snapshot(APP_URL, ("Hosted with Streamlit\n\nCreated by zealousear",))
